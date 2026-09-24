@@ -21,10 +21,9 @@ import (
 	"github.com/dnr/styx/common/cdig"
 	"github.com/dnr/styx/common/resolve"
 	"github.com/dnr/styx/pb"
-	"github.com/multiformats/go-multihash"
-	"github.com/nix-community/go-nix/pkg/hash"
 	"github.com/nix-community/go-nix/pkg/nar"
 	"github.com/nix-community/go-nix/pkg/nixbase32"
+	"github.com/nix-community/go-nix/pkg/nixhash"
 	"github.com/nix-community/go-nix/pkg/storepath"
 	"google.golang.org/protobuf/proto"
 )
@@ -139,7 +138,8 @@ func (b *ManifestBuilder) BuildFromTarball(
 	}
 
 	// set up to hash nar
-	narHasher, _ := hash.New(multihash.SHA2_256)
+	narHasher := sha256.New()
+	narCounter := &countWriter{w: narHasher}
 
 	// TODO: make args configurable again (hashed in manifest cache key)
 	args := &BuildArgs{
@@ -147,7 +147,7 @@ func (b *ManifestBuilder) BuildFromTarball(
 		ShardTotal:      shardTotal,
 		ShardIndex:      shardIndex,
 	}
-	manifest, err := b.buildFromNar(ctx, args, io.TeeReader(narOut, narHasher))
+	manifest, err := b.buildFromNar(ctx, args, io.TeeReader(narOut, narCounter))
 	if err != nil {
 		return nil, fmt.Errorf("%w: manifest generation error: %w", ErrInternal, err)
 	}
@@ -160,11 +160,12 @@ func (b *ManifestBuilder) BuildFromTarball(
 	}
 
 	// turn tar hash into store path hash using nix's fod algorithm
-	innerHash := hex.EncodeToString(narHasher.Digest())
+	narHash := nixhash.MustNewHash(nixhash.SHA256, narHasher.Sum(nil))
+	innerHash := hex.EncodeToString(narHash.Digest())
 	fpHasher := sha256.New()
 	// "source" is specific to nar hashing method. we don't support flat here yet.
 	fmt.Fprintf(fpHasher, "source:sha256:%s:%s:%s", innerHash, storepath.StoreDir, rr.StorePathName)
-	cmpHash := hash.CompressHash(fpHasher.Sum(nil), storepath.PathHashSize)
+	cmpHash := nixhash.CompressHash(fpHasher.Sum(nil), storepath.PathHashSize)
 	sph := nixbase32.EncodeToString(cmpHash)
 
 	log.Println("manifest tarball", upstream, "->", rr.Url, "built manifest", sph)
@@ -182,10 +183,10 @@ func (b *ManifestBuilder) BuildFromTarball(
 		StorePath:   storepath.StoreDir + "/" + sph + "-" + rr.StorePathName,
 		Url:         "nar/dummy.nar",
 		Compression: "none",
-		FileHash:    narHasher.NixString(),
-		FileSize:    int64(narHasher.BytesWritten()),
-		NarHash:     narHasher.NixString(),
-		NarSize:     int64(narHasher.BytesWritten()),
+		FileHash:    narHash.Format(nixhash.NixBase32, true),
+		FileSize:    int64(narCounter.c),
+		NarHash:     narHash.Format(nixhash.NixBase32, true),
+		NarSize:     int64(narCounter.c),
 	}
 	manifest.Meta = &pb.ManifestMeta{
 		GenericTarballOriginal: upstream,

@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	_ "crypto/sha1" // for narinfo NarHash
 	"crypto/sha256"
+	_ "crypto/sha512" // for narinfo NarHash
 	"errors"
 	"fmt"
 	"io"
@@ -19,10 +21,10 @@ import (
 	"time"
 
 	"github.com/DataDog/zstd"
-	"github.com/nix-community/go-nix/pkg/hash"
 	"github.com/nix-community/go-nix/pkg/nar"
 	"github.com/nix-community/go-nix/pkg/narinfo"
 	"github.com/nix-community/go-nix/pkg/narinfo/signature"
+	"github.com/nix-community/go-nix/pkg/nixhash"
 	"golang.org/x/sync/semaphore"
 	"google.golang.org/protobuf/proto"
 
@@ -272,10 +274,11 @@ func (b *ManifestBuilder) BuildFromNar(
 
 	// set up to hash nar
 
-	narHasher, err := hash.New(ni.NarHash.HashType)
-	if err != nil {
-		return nil, fmt.Errorf("%w: invalid NarHashType: %w", ErrReq, err)
+	narHashFunc := ni.NarHash.Algo().Func()
+	if !narHashFunc.Available() {
+		return nil, fmt.Errorf("%w: unsupported NarHash algorithm %s", ErrReq, ni.NarHash.Algo())
 	}
+	narHasher := narHashFunc.New()
 
 	// TODO: make args configurable again (hashed in manifest cache key)
 	args := &BuildArgs{
@@ -290,7 +293,7 @@ func (b *ManifestBuilder) BuildFromNar(
 
 	// verify nar hash
 
-	if narHasher.SRIString() != ni.NarHash.SRIString() {
+	if !bytes.Equal(narHasher.Sum(nil), ni.NarHash.Digest()) {
 		return nil, fmt.Errorf("%w: nar hash mismatch", ErrReq)
 	}
 
@@ -327,9 +330,9 @@ func (b *ManifestBuilder) BuildFromNar(
 		StorePath:   ni.StorePath,
 		Url:         ni.URL,
 		Compression: ni.Compression,
-		FileHash:    ni.FileHash.NixString(),
+		FileHash:    ni.FileHash.Format(nixhash.NixBase32, true),
 		FileSize:    int64(ni.FileSize),
-		NarHash:     ni.NarHash.NixString(),
+		NarHash:     ni.NarHash.Format(nixhash.NixBase32, true),
 		NarSize:     int64(ni.NarSize),
 		References:  ni.References,
 		Deriver:     ni.Deriver,

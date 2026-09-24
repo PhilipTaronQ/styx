@@ -15,7 +15,7 @@ import (
 	"sort"
 
 	"github.com/lunixbochs/struc"
-	"github.com/nix-community/go-nix/pkg/hash"
+	"github.com/nix-community/go-nix/pkg/nixhash"
 	"golang.org/x/exp/slices"
 	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/proto"
@@ -470,7 +470,7 @@ func (b *Builder) BuildFromManifestWithSlab(
 	}
 
 	var narhash []byte
-	if h, err := hash.ParseNixBase32(m.Meta.GetNarinfo().GetNarHash()); err == nil {
+	if h, err := nixhash.ParseNixBase32(m.Meta.GetNarinfo().GetNarHash()); err == nil {
 		narhash = h.Digest()
 	}
 	if len(narhash) == 0 {
