@@ -124,6 +124,9 @@ with lib;
               "--public_socket="
             ]
           );
+          # The cache directory holds the db, the slabs and the root-only socket.
+          CacheDirectory = "styx";
+          CacheDirectoryMode = "0700";
           SyslogIdentifier = "styx";
           Type = "notify";
           NotifyAccess = "all";

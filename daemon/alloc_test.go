@@ -17,21 +17,6 @@ import (
 
 const slabTestStorePath = "qa22bifihaxyvn6q2a6w9m0nklqrk9wh-opusfile-0.12"
 
-// newSlabTestServer returns a server with a database and nothing else: no devnode, no slabs
-// open, not initialized.
-func newSlabTestServer(t *testing.T) *Server {
-	t.Helper()
-	s := NewServer(Config{
-		CachePath:       t.TempDir(),
-		CacheDomain:     "slabtest",
-		ErofsBlockShift: 12,
-		Workers:         1,
-	})
-	require.NoError(t, s.openDb())
-	t.Cleanup(func() { s.db.Close() })
-	return s
-}
-
 func slabTestSph(t *testing.T) Sph {
 	sph, _, _, err := ParseSphAndName(slabTestStorePath)
 	require.NoError(t, err)
@@ -77,7 +62,7 @@ func setSlabSequence(t *testing.T, s *Server, id uint16, seq uint64) {
 // A batch that runs off the end of a slab has to leave that slab's sequence where it stopped,
 // or the next batch hands out the same addresses again.
 func TestAllocateBatchSlabRollover(t *testing.T) {
-	s := newSlabTestServer(t)
+	s := newTestServer(t, 1, false)
 	limit := uint64(slabBytes >> s.blockShift)
 	setSlabSequence(t, s, 0, limit-20)
 
@@ -102,7 +87,7 @@ func TestAllocateBatchSlabRollover(t *testing.T) {
 // Same for vaporize's two-phase allocation, and the second phase has to record each chunk in
 // the slab it was reserved in.
 func TestPreallocateBatchSlabRollover(t *testing.T) {
-	s := newSlabTestServer(t)
+	s := newTestServer(t, 1, false)
 	limit := uint64(slabBytes >> s.blockShift)
 	setSlabSequence(t, s, 0, limit-20)
 
@@ -135,7 +120,7 @@ func TestPreallocateBatchSlabRollover(t *testing.T) {
 }
 
 func TestAllocateBatchRejectsZeroBlocks(t *testing.T) {
-	s := newSlabTestServer(t)
+	s := newTestServer(t, 1, false)
 	ctx := withAllocateCtx(context.Background(), slabTestSph(t), false)
 	_, err := s.AllocateBatch(ctx, []uint16{16, 0}, []cdig.CDig{testDigest(1), testDigest(2)})
 	require.ErrorContains(t, err, "zero-block")
@@ -147,7 +132,7 @@ func TestAllocateBatchRejectsZeroBlocks(t *testing.T) {
 // size is an exact multiple of its chunk size needs a full chunk for its last chunk, or the
 // next new chunk gets the same slab address and takes over its address key.
 func TestBuildExactMultipleFileGetsOwnSlabSpace(t *testing.T) {
-	s := newSlabTestServer(t)
+	s := newTestServer(t, 1, false)
 	cs := shift.DefaultChunkShift
 	ca := bytes.Repeat([]byte{'a'}, int(cs.Size()))
 	cb := bytes.Repeat([]byte{'b'}, int(cs.Size()))

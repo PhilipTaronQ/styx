@@ -30,7 +30,7 @@ type repairEnv struct {
 }
 
 func newRepairEnv(t *testing.T) *repairEnv {
-	s := newSlabTestServer(t)
+	s := newTestServer(t, 1, false)
 	p := s.slabDataPath(0)
 	require.NoError(t, os.MkdirAll(filepath.Dir(p), 0o755))
 	f, err := os.Create(p)

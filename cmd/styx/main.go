@@ -237,6 +237,15 @@ func withRepairReq(c *cobra.Command) *daemon.RepairReq {
 	return &req
 }
 
+// Waits for SIGTERM (or ctx to be done), then calls stop. The default SIGTERM action is
+// restored first, so that another SIGTERM kills the process if stop hangs.
+func stopOnSigterm(ctx context.Context, stop func()) {
+	sctx, cancel := signal.NotifyContext(ctx, syscall.SIGTERM)
+	<-sctx.Done()
+	cancel()
+	stop()
+}
+
 func main() {
 	if os.Getenv("NOTIFY_SOCKET") != "" || os.Getenv("AWS_LAMBDA_RUNTIME_API") != "" {
 		// running in systemd or on lambda
@@ -258,10 +267,7 @@ func main() {
 				if err := s.Start(); err != nil {
 					return err
 				}
-				sctx, cancel := signal.NotifyContext(ctx, syscall.SIGTERM)
-				defer cancel()
-				<-sctx.Done()
-				s.Stop(false)
+				stopOnSigterm(ctx, func() { s.Stop(false) })
 				return nil
 			},
 		),

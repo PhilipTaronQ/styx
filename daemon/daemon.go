@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -99,6 +100,11 @@ type (
 
 		shutdownChan chan struct{}
 		shutdownWait sync.WaitGroup
+		// canceled by Stop, to end work (like kernel reads) that would outlive the daemon
+		lifeCtx    context.Context
+		lifeCancel context.CancelFunc
+		// eventfd that Stop writes to wake cachefilesServer's poll, or -1
+		wakeFd int32
 	}
 
 	// fields that are only known after init
@@ -117,7 +123,8 @@ type (
 		slabId uint16
 
 		// for store images
-		imageData []byte // data from manifester to be written
+		imageData []byte        // data from manifester to be written
+		mountCtx  *mountContext // holds another reference to imageData
 	}
 
 	slabFds struct {
@@ -148,6 +155,12 @@ var errAlreadyMountedElsewhere = errors.New("already mounted on another mountpoi
 // init stuff
 
 func NewServer(cfg Config) *Server {
+	lifeCtx, lifeCancel := context.WithCancel(context.Background())
+	wakeFd, err := unix.Eventfd(0, unix.EFD_CLOEXEC|unix.EFD_NONBLOCK)
+	if err != nil {
+		log.Println("eventfd error, Stop will wait for the cachefiles poll timeout:", err)
+		wakeFd = -1 // poll ignores negative fds
+	}
 	return &Server{
 		cfg:             &cfg,
 		blockShift:      shift.Shift(cfg.ErofsBlockShift),
@@ -165,6 +178,9 @@ func NewServer(cfg Config) *Server {
 		diffSem:         semaphore.NewWeighted(int64(cfg.Workers)),
 		remanifestCache: *common.NewSimpleSyncMap[string, *remanifestCacheEntry](),
 		shutdownChan:    make(chan struct{}),
+		lifeCtx:         lifeCtx,
+		lifeCancel:      lifeCancel,
+		wakeFd:          int32(wakeFd),
 	}
 }
 
@@ -361,6 +377,8 @@ func (s *Server) openDevNode() (int, error) {
 	return fd, nil
 }
 
+var errRestoreFailed = errors.New("cachefiles 'restore' failed")
+
 func (s *Server) setupDevNode() error {
 	fd, err := s.cfg.FdStore.GetFd(savedFdName)
 	if err == nil {
@@ -369,7 +387,7 @@ func (s *Server) setupDevNode() error {
 			unix.Close(fd)
 			// instead of trying to recover, just let systemd restart the process
 			// and next time we won't have a saved fd.
-			return fmt.Errorf("cachefiles 'restore' failed: %w", err)
+			return fmt.Errorf("%w: %w", errRestoreFailed, err)
 		}
 		s.devnode.Store(int32(fd))
 		log.Println("restored cachefiles device")
@@ -426,16 +444,17 @@ func (s *Server) startSocketServer() error {
 	mux.HandleFunc("/pprof/profile", pprof.Profile)
 	mux.HandleFunc("/pprof/symbol", pprof.Symbol)
 	mux.HandleFunc("/pprof/trace", pprof.Trace)
-	err := s.runSocketServer(filepath.Join(s.cfg.CachePath, Socket), mux)
+	// this socket can mount anything anywhere, so it's for root only
+	err := s.runSocketServer(filepath.Join(s.cfg.CachePath, Socket), mux, 0o600)
 	if err != nil {
 		return err
 	}
 
 	if s.cfg.PublicSock != "" {
 		mux := http.NewServeMux()
-		mux.HandleFunc(TarballPath, jsonmw(s.handleTarballReq))
+		mux.HandleFunc(TarballPath, jsonmw(s.handlePublicTarballReq))
 		mux.HandleFunc(DebugPath, jsonmw(s.handleDebugReq))
-		err := s.runSocketServer(s.cfg.PublicSock, mux)
+		err := s.runSocketServer(s.cfg.PublicSock, mux, 0o777)
 		if err != nil {
 			return err
 		}
@@ -444,17 +463,20 @@ func (s *Server) startSocketServer() error {
 	return nil
 }
 
-func (s *Server) runSocketServer(socketPath string, mux http.Handler) error {
+func (s *Server) runSocketServer(socketPath string, mux http.Handler, mode os.FileMode) error {
 	os.Remove(socketPath)
 	l, err := net.ListenUnix("unix", &net.UnixAddr{Net: "unix", Name: socketPath})
 	if err != nil {
 		return fmt.Errorf("failed to listen on unix socket %s: %w", socketPath, err)
 	}
-	_ = os.Chmod(socketPath, 0o777)
+	if err = os.Chmod(socketPath, mode); err != nil {
+		l.Close()
+		return fmt.Errorf("failed to chmod unix socket %s: %w", socketPath, err)
+	}
 	s.shutdownWait.Add(1)
 	go func() {
 		defer s.shutdownWait.Done()
-		srv := &http.Server{Handler: mux}
+		srv := newHttpServer(mux)
 		go srv.Serve(l)
 		<-s.shutdownChan
 		log.Printf("stopping http server")
@@ -462,6 +484,23 @@ func (s *Server) runSocketServer(socketPath string, mux http.Handler) error {
 	}()
 	return nil
 }
+
+// There's no ReadTimeout or WriteTimeout: mount, materialize and gc requests can take
+// minutes, and net/http cancels the request context once ReadTimeout passes. jsonmw
+// limits reading the body instead.
+func newHttpServer(h http.Handler) *http.Server {
+	return &http.Server{
+		Handler:           h,
+		ReadHeaderTimeout: 30 * time.Second,
+		IdleTimeout:       5 * time.Minute,
+	}
+}
+
+const (
+	// far more than the styx cli (bounded by the size of its arguments) or nix sends
+	maxRequestBytes    = 16 << 20
+	requestBodyTimeout = time.Minute
+)
 
 type errWithStatus struct {
 	error
@@ -494,9 +533,21 @@ func jsonmw[reqT, resT any](f func(context.Context, *reqT) (*resT, error)) func(
 		w.Header().Set(common.CTHdr, common.CTJson)
 		wEnc := json.NewEncoder(w)
 
+		// limit the body's size and the time to read it. the deadline is cleared once
+		// it's read, so it doesn't apply to the handler.
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
+		rc := http.NewResponseController(w)
+		_ = rc.SetReadDeadline(time.Now().Add(requestBodyTimeout))
 		var req reqT
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			w.WriteHeader(http.StatusBadRequest)
+		err := json.NewDecoder(r.Body).Decode(&req)
+		_ = rc.SetReadDeadline(time.Time{})
+		if err != nil {
+			var mbErr *http.MaxBytesError
+			if errors.As(err, &mbErr) {
+				w.WriteHeader(http.StatusRequestEntityTooLarge)
+			} else {
+				w.WriteHeader(http.StatusBadRequest)
+			}
 			wEnc.Encode(nil)
 			return
 		}
@@ -658,7 +709,10 @@ func (s *Server) tryMount(ctx context.Context, req *MountReq, haveImageSize int6
 	var mountErr error
 	opts := fmt.Sprintf("domain_id=%s,fsid=%s", s.cfg.CacheDomain, sphStr)
 
-	if mountCtx.imageData != nil {
+	mountCtx.lock.Lock()
+	newImage := mountCtx.imageData != nil
+	mountCtx.lock.Unlock()
+	if newImage {
 		// first mount somewhere private, then unmount to force cachefiles to flush the image to disk.
 		// this is gross, there should be a better way to control cachefiles flushing.
 		firstMp := filepath.Join(s.cfg.CachePath, "initial", sphStr)
@@ -666,6 +720,10 @@ func (s *Server) tryMount(ctx context.Context, req *MountReq, haveImageSize int6
 		mountErr = unix.Mount("none", firstMp, "erofs", 0, opts)
 		_ = unix.Unmount(firstMp, 0)
 		_ = os.Remove(firstMp)
+		// the image is written now, so the real mount mustn't get another copy
+		mountCtx.lock.Lock()
+		mountCtx.imageData = nil
+		mountCtx.lock.Unlock()
 	}
 
 	if mountErr == nil {
@@ -826,7 +884,10 @@ func (s *Server) Start() error {
 		// nothing was changed, try again next time
 		log.Print(err)
 	}
-	if err := s.setupDevNode(); err != nil {
+	if err := s.setupDevNode(); errors.Is(err, errRestoreFailed) {
+		// exit so that systemd restarts us, without the saved devnode
+		return err
+	} else if err != nil {
 		log.Println("on-demand features disabled:", err)
 		// don't abort, support manifest only
 	}
@@ -836,6 +897,8 @@ func (s *Server) Start() error {
 	if err := s.startFakeCacheServer(); err != nil {
 		return err
 	}
+	s.shutdownWait.Add(1)
+	go s.pruneFakeCacheLoop()
 	go s.pruneRecentCaches()
 	if s.ondemand() {
 		go s.cachefilesServer()
@@ -865,8 +928,19 @@ func (s *Server) Stop(closeDevnode bool) {
 
 	// signal to cachefiles server and workers to stop
 	fd := s.devnode.Swap(0)
+	// end reads waiting on the network, and wake the cachefiles server's poll
+	s.lifeCancel()
+	if s.wakeFd >= 0 {
+		var one [8]byte
+		binary.NativeEndian.PutUint64(one[:], 1)
+		_, _ = unix.Write(int(s.wakeFd), one[:])
+	}
 	// wait for workers to stop
 	s.shutdownWait.Wait()
+	if s.wakeFd >= 0 {
+		_ = unix.Close(int(s.wakeFd))
+		s.wakeFd = -1
+	}
 	// close fds of open objects
 	s.closeAllFds()
 	// maybe close devnode too
@@ -880,35 +954,128 @@ func (s *Server) Stop(closeDevnode bool) {
 	log.Print("daemon shutdown done")
 }
 
+// Closes the fds of open objects, and of slabs that have no object: the manifest slab,
+// the slab outside on-demand mode, and slab images mounted before the slab was opened.
 func (s *Server) closeAllFds() {
 	s.stateLock.Lock()
 	defer s.stateLock.Unlock()
-	for _, state := range s.cacheState {
-		var fds slabFds
-		switch state.tp {
-		case typeSlab, typeManifestSlab:
-			fds = s.readfdBySlab[state.slabId]
+	fds := make(map[int]struct{})
+	add := func(fd int) {
+		if fd > 0 {
+			fds[fd] = struct{}{}
 		}
-		s.closeState(state, fds)
 	}
+	var slabIds []uint16
+	for _, state := range s.cacheState {
+		add(int(state.writeFd))
+		if state.tp == typeSlab {
+			slabIds = append(slabIds, state.slabId)
+		}
+	}
+	for _, state := range s.stateBySlab {
+		add(int(state.writeFd))
+	}
+	for _, sfds := range s.readfdBySlab {
+		add(sfds.readFd)
+		add(sfds.cacheFd)
+	}
+	for fd := range fds {
+		_ = unix.Close(fd)
+	}
+	for _, id := range slabIds {
+		s.unmountSlabImage(id)
+	}
+	clear(s.cacheState)
+	clear(s.stateBySlab)
+	clear(s.readfdBySlab)
+}
+
+// Unbounded FIFO of cachefiles messages, so that queueing one never blocks.
+type msgQueue struct {
+	lock  sync.Mutex
+	msgs  [][]byte
+	ready chan struct{}
+}
+
+func newMsgQueue() *msgQueue {
+	return &msgQueue{ready: make(chan struct{}, 1)}
+}
+
+func (q *msgQueue) push(msg []byte) {
+	q.lock.Lock()
+	q.msgs = append(q.msgs, msg)
+	q.lock.Unlock()
+	select {
+	case q.ready <- struct{}{}:
+	default:
+	}
+}
+
+// Returns the next message, waiting for one if needed, or false once ctx is done.
+func (q *msgQueue) pop(ctx context.Context) ([]byte, bool) {
+	for ctx.Err() == nil {
+		q.lock.Lock()
+		if len(q.msgs) > 0 {
+			msg := q.msgs[0]
+			q.msgs[0] = nil
+			q.msgs = q.msgs[1:]
+			q.lock.Unlock()
+			return msg, true
+		}
+		q.lock.Unlock()
+		select {
+		case <-q.ready:
+		case <-ctx.Done():
+		}
+	}
+	return nil, false
+}
+
+func isReadMsg(msg []byte) bool {
+	return len(msg) >= 8 && binary.LittleEndian.Uint32(msg[4:8]) == CACHEFILES_OP_READ
 }
 
 func (s *Server) cachefilesServer() {
 	s.shutdownWait.Add(1)
 	defer s.shutdownWait.Done()
 
-	wchan := make(chan []byte)
-	for i := 0; i < s.cfg.Workers; i++ {
+	// OPEN and CLOSE are handled by one goroutine in the order we read them, so a CLOSE
+	// for an old object can't overtake the OPEN for its replacement. They never wait on
+	// the network. Each READ gets a goroutine, with at most cfg.Workers running, so reads
+	// waiting on the network hold up neither OPEN and CLOSE nor reading the devnode (the
+	// kernel lets umount(2) return once we've read its CLOSE).
+	// When stopping, messages not yet handled are dropped. The kernel keeps them, and
+	// sends them again to a daemon that restores the devnode.
+	ctl := newMsgQueue()
+	s.shutdownWait.Add(1)
+	go func() {
+		defer s.shutdownWait.Done()
+		for {
+			msg, ok := ctl.pop(s.lifeCtx)
+			if !ok {
+				return
+			}
+			s.handleMessage(msg)
+		}
+	}()
+	readSem := semaphore.NewWeighted(int64(s.cfg.Workers))
+	dispatch := func(msg []byte) {
+		if !isReadMsg(msg) {
+			ctl.push(msg)
+			return
+		}
 		s.shutdownWait.Add(1)
 		go func() {
 			defer s.shutdownWait.Done()
-			for msg := range wchan {
-				s.handleMessage(msg)
+			if readSem.Acquire(s.lifeCtx, 1) != nil {
+				return
 			}
+			defer readSem.Release(1)
+			s.handleMessage(msg)
 		}()
 	}
 
-	fds := make([]unix.PollFd, 1)
+	fds := make([]unix.PollFd, 2)
 	errors := 0
 	for {
 		if errors > 10 {
@@ -920,9 +1087,11 @@ func (s *Server) cachefilesServer() {
 			break
 		}
 		fds[0] = unix.PollFd{Fd: fd, Events: unix.POLLIN}
+		// closing the devnode doesn't interrupt the poll, so Stop writes to wakeFd
+		fds[1] = unix.PollFd{Fd: s.wakeFd, Events: unix.POLLIN}
 		timeout := 3600 * 1000
 		if s.cfg.IsTesting {
-			// use smaller timeout since we can't interrupt this poll (even by closing the fd)
+			// in case wakeFd couldn't be created
 			timeout = 500
 		}
 		n, err := unix.Poll(fds, timeout)
@@ -931,7 +1100,8 @@ func (s *Server) cachefilesServer() {
 			errors++
 			continue
 		}
-		if n != 1 {
+		if n == 0 || fds[1].Revents != 0 {
+			// timed out, or woken by Stop (which cleared devnode first)
 			continue
 		}
 		if fds[0].Revents&unix.POLLNVAL != 0 {
@@ -957,12 +1127,9 @@ func (s *Server) cachefilesServer() {
 			}
 			readAfterPoll = true
 			errors = 0
-			wchan <- buf[:n]
+			dispatch(buf[:n])
 		}
 	}
-
-	// log.Print("stopping workers")
-	close(wchan)
 }
 
 func (s *Server) handleMessage(buf []byte) (retErr error) {
@@ -1108,6 +1275,7 @@ func (s *Server) handleOpenImage(msgId, objectId, fd, flags uint32, cookie strin
 		writeFd:   fd,
 		tp:        typeImage,
 		imageData: imageData,
+		mountCtx:  mountCtx,
 	}
 	s.cacheState[objectId] = state
 	return imageSize, nil
@@ -1122,12 +1290,13 @@ func (s *Server) handleClose(msgId, objectId uint32) error {
 		log.Println("missing state for close")
 		return nil
 	}
-	if state.tp == typeSlab {
-		delete(s.stateBySlab, state.slabId)
-	}
+	// If the kernel has already opened this slab again (as it does when mountSlabImage
+	// remounts), this CLOSE is for the old object, and the new object's state and the
+	// slab image fds must stay.
+	current := state.tp == typeSlab && s.stateBySlab[state.slabId] == state
 	var fds slabFds
-	switch state.tp {
-	case typeSlab, typeManifestSlab:
+	if current {
+		delete(s.stateBySlab, state.slabId)
 		fds = s.readfdBySlab[state.slabId]
 		delete(s.readfdBySlab, state.slabId)
 	}
@@ -1136,6 +1305,9 @@ func (s *Server) handleClose(msgId, objectId uint32) error {
 
 	// do rest of cleanup outside lock
 	s.closeState(state, fds)
+	if current {
+		s.unmountSlabImage(state.slabId)
+	}
 	return nil
 }
 
@@ -1149,10 +1321,11 @@ func (s *Server) closeState(state *openFileState, slabFds slabFds) {
 	for _, fd := range fds {
 		_ = unix.Close(fd)
 	}
-	if state.tp == typeSlab {
-		mp := filepath.Join(s.cfg.CachePath, slabImagePrefix+strconv.Itoa(int(state.slabId)))
-		_ = unix.Unmount(mp, 0)
-	}
+}
+
+func (s *Server) unmountSlabImage(slabId uint16) {
+	mp := filepath.Join(s.cfg.CachePath, slabImagePrefix+strconv.Itoa(int(slabId)))
+	_ = unix.Unmount(mp, 0)
 }
 
 func (s *Server) handleRead(msgId, objectId uint32, ln, off uint64) (retErr error) {
@@ -1165,6 +1338,11 @@ func (s *Server) handleRead(msgId, objectId uint32, ln, off uint64) (retErr erro
 	}
 
 	defer func() {
+		if retErr != nil && s.lifeCtx.Err() != nil {
+			// Stopping: leave the request with the kernel. A daemon that restores the
+			// devnode gets it again, and closing the devnode fails it.
+			return
+		}
 		_, _, e1 := unix.Syscall(unix.SYS_IOCTL, uintptr(state.writeFd), CACHEFILES_IOC_READ_COMPLETE, uintptr(msgId))
 		if e1 != 0 && retErr == nil {
 			retErr = fmt.Errorf("ioctl error %d", e1)
@@ -1187,16 +1365,26 @@ func (s *Server) handleRead(msgId, objectId uint32, ln, off uint64) (retErr erro
 }
 
 func (s *Server) handleReadImage(state *openFileState, _, _ uint64) error {
-	if state.imageData == nil {
+	s.stateLock.Lock()
+	imageData := state.imageData
+	s.stateLock.Unlock()
+	if imageData == nil {
 		return errors.New("got read request when already written image")
 	}
 	// always write whole thing
 	// TODO: does this have to be page-aligned?
-	_, err := unix.Pwrite(int(state.writeFd), state.imageData, 0)
-	if err != nil {
+	if err := pwriteFull(int(state.writeFd), imageData, 0); err != nil {
 		return err
 	}
+	// the image is in the backing file now, so drop both references to it
+	s.stateLock.Lock()
 	state.imageData = nil
+	s.stateLock.Unlock()
+	if mctx := state.mountCtx; mctx != nil {
+		mctx.lock.Lock()
+		mctx.imageData = nil
+		mctx.lock.Unlock()
+	}
 	return nil
 }
 
@@ -1210,9 +1398,24 @@ func (s *Server) handleReadSlabImage(state *openFileState, ln, off uint64) error
 	defer s.chunkPool.Put(buf)
 
 	b := buf[:ln]
-	erofs.SlabImageRead(devid, slabBytes, s.blockShift, off, b)
-	_, err := unix.Pwrite(int(state.writeFd), b, int64(off))
-	return err
+	if err := erofs.SlabImageRead(devid, slabBytes, s.blockShift, off, b); err != nil {
+		return err
+	}
+	return pwriteFull(int(state.writeFd), b, int64(off))
+}
+
+// Like pwrite, but writes all of b or fails.
+func pwriteFull(fd int, b []byte, off int64) error {
+	for len(b) > 0 {
+		n, err := unix.Pwrite(fd, b, off)
+		if err != nil {
+			return err
+		} else if n <= 0 {
+			return io.ErrShortWrite
+		}
+		b, off = b[n:], off+int64(n)
+	}
+	return nil
 }
 
 func (s *Server) handleReadSlab(state *openFileState, ln, off uint64) (retErr error) {
@@ -1286,8 +1489,41 @@ func (s *Server) handleReadSlab(state *openFileState, ln, off uint64) (retErr er
 		log.Println("missing sph references for", slabId, addr, digest.String())
 	}
 
-	ctx := context.Background()
+	// The read ends at a deadline or when the daemon stops. ctx isn't canceled when this
+	// returns: requestChunk may start diff ops for other chunks too, and they use it.
+	ctx, cancel := context.WithTimeout(s.lifeCtx, slabReadTimeout)
+	_ = cancel // released at the deadline
 	return s.requestChunk(ctx, erofs.SlabLoc{SlabId: slabId, Addr: addr}, digest, sphps)
+}
+
+// Returns dups of the slabs' cache fds, for use without stateLock (a CLOSE could close
+// the originals, and the numbers be reused). The caller must close them.
+func (s *Server) dupCacheFds() map[uint16]slabFds {
+	s.stateLock.Lock()
+	defer s.stateLock.Unlock()
+	out := make(map[uint16]slabFds, len(s.readfdBySlab))
+	for id, fds := range s.readfdBySlab {
+		if fds.cacheFd > 0 {
+			if dfd, err := dupFd(fds.cacheFd); err == nil {
+				out[id] = slabFds{cacheFd: dfd}
+			}
+		}
+	}
+	return out
+}
+
+// Like dupCacheFds for one slab.
+func (s *Server) dupCacheFd(slabId uint16) (int, error) {
+	s.stateLock.Lock()
+	defer s.stateLock.Unlock()
+	if cfd := s.readfdBySlab[slabId].cacheFd; cfd > 0 {
+		return dupFd(cfd)
+	}
+	return 0, errCachefdNotFound
+}
+
+func dupFd(fd int) (int, error) {
+	return unix.FcntlInt(uintptr(fd), unix.F_DUPFD_CLOEXEC, 0)
 }
 
 func (s *Server) mountSlabImage(slabId uint16) error {
@@ -1388,6 +1624,9 @@ func (s *Server) openSlabBackingFile(slabId uint16) (int, error) {
 
 const (
 	slabBytes = 1 << 40
+
+	// how long a kernel read of a slab may wait for its chunk
+	slabReadTimeout = 5 * time.Minute
 )
 
 func slabKey(id uint16) []byte {

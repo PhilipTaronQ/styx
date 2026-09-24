@@ -4,7 +4,6 @@ import (
 	"archive/tar"
 	"bytes"
 	"encoding/binary"
-	"encoding/json"
 	"maps"
 	"net"
 	"net/http"
@@ -21,7 +20,6 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/dnr/styx/common/cdig"
-	"github.com/dnr/styx/common/client"
 	"github.com/dnr/styx/daemon"
 )
 
@@ -68,28 +66,22 @@ func (tb *testBase) serveExtraTarball(name string, files map[string][]byte, link
 	return tb.upstreamUrl + "extra/" + name
 }
 
-// rawCall makes a request and returns the status and raw body, without asserting success.
-func (tb *testBase) rawCall(path string, req any) (int, string) {
-	var raw json.RawMessage
-	code, err := client.NewClient(filepath.Join(tb.cachedir, "styx.sock")).Call(path, req, &raw)
-	if err != nil && code == 0 {
-		tb.t.Fatalf("call %s: %v", path, err)
-	}
-	return code, string(raw)
-}
-
 // mountExtraTarball runs "styx tarball" on url and mounts the result.
 func (tb *testBase) mountExtraTarball(url string) (storePath, mp string) {
 	tr := tb.tarball(url)
 	storePath = tr.StorePathHash + "-" + tr.StorePathName
 	mp = tb.t.TempDir()
-	tb.t.Cleanup(func() { _ = unix.Unmount(mp, 0) })
-	code, body := tb.rawCall(daemon.MountPath, daemon.MountReq{
+	tb.t.Cleanup(func() {
+		// like tb.mount's cleanup (collect doesn't hash these, they have no narinfo)
+		tb.collect()
+		_ = unix.Unmount(mp, 0)
+	})
+	var res daemon.Status
+	tb.call(daemon.MountPath, daemon.MountReq{
 		Upstream:   "http://localhost:7444", // daemon.fakeCacheBind
 		StorePath:  storePath,
 		MountPoint: mp,
-	})
-	require.Equal(tb.t, http.StatusOK, code, "mount %s: %s", storePath, body)
+	}, &res)
 	return storePath, mp
 }
 

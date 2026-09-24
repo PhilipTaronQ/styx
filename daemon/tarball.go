@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"errors"
@@ -50,13 +51,62 @@ func (s *Server) startFakeCacheServer() (err error) {
 	s.shutdownWait.Add(1)
 	go func() {
 		defer s.shutdownWait.Done()
-		srv := &http.Server{Handler: mux}
+		srv := newHttpServer(mux)
 		go srv.Serve(l)
 		<-s.shutdownChan
 		log.Printf("stopping fake cache server")
 		srv.Close()
 	}()
 	return nil
+}
+
+const (
+	fakeCacheExpiry     = 90 * 24 * time.Hour
+	fakeCachePruneEvery = 24 * time.Hour
+)
+
+func (s *Server) pruneFakeCacheLoop() {
+	defer s.shutdownWait.Done()
+	t := time.NewTicker(fakeCachePruneEvery)
+	defer t.Stop()
+	for {
+		if err := s.pruneFakeCache(time.Now()); err != nil {
+			log.Println("error pruning fake cache:", err)
+		}
+		select {
+		case <-t.C:
+		case <-s.shutdownChan:
+			return
+		}
+	}
+}
+
+// Deletes fake narinfo that no tarball request has refreshed in fakeCacheExpiry, unless we
+// still have an image for it (remanifesting it needs the narinfo).
+func (s *Server) pruneFakeCache(now time.Time) error {
+	return s.db.Update(func(tx *bbolt.Tx) error {
+		fb, ib := tx.Bucket(fakeCacheBucket), tx.Bucket(imageBucket)
+		var del [][]byte
+		cur := fb.Cursor()
+		for k, v := cur.First(); k != nil; k, v = cur.Next() {
+			var data pb.FakeCacheData
+			if err := proto.Unmarshal(v, &data); err != nil {
+				continue
+			} else if now.Sub(time.Unix(data.Updated, 0)) < fakeCacheExpiry || ib.Get(k) != nil {
+				continue
+			}
+			del = append(del, bytes.Clone(k))
+		}
+		for _, k := range del {
+			if err := fb.Delete(k); err != nil {
+				return err
+			}
+		}
+		if len(del) > 0 {
+			log.Println("pruned", len(del), "fake narinfo entries")
+		}
+		return nil
+	})
 }
 
 func (s *Server) getFakeCacheInfo(w http.ResponseWriter, r *http.Request) {
@@ -86,6 +136,13 @@ func (s *Server) getFakeNarinfo(w http.ResponseWriter, r *http.Request) {
 }
 
 // request handler
+
+// Tarball requests from the public socket can't ask for shards: each shard downloads the
+// whole tarball.
+func (s *Server) handlePublicTarballReq(ctx context.Context, r *TarballReq) (*TarballResp, error) {
+	r.Shards = 0
+	return s.handleTarballReq(ctx, r)
+}
 
 func (s *Server) handleTarballReq(ctx context.Context, r *TarballReq) (*TarballResp, error) {
 	if s.p() == nil {
@@ -185,7 +242,7 @@ func (s *Server) handleTarballReq(ctx context.Context, r *TarballReq) (*TarballR
 	if err != nil {
 		return nil, err
 	}
-	// TODO: prune this cache once in a while
+	// pruneFakeCache prunes this
 	err = s.db.Update(func(tx *bbolt.Tx) error {
 		return tx.Bucket(fakeCacheBucket).Put([]byte(sph), b)
 	})
