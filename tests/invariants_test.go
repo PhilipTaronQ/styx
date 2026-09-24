@@ -23,7 +23,8 @@ import (
 // The db layout is copied from daemon/const.go, daemon/daemon.go and
 // daemon/catalog.go:
 //
-//	chunk:    digest -> slab u16 LE, addr u32 LE, then 10-byte sph prefixes
+//	chunk:    data chunk digest -> slab u16 LE, addr u32 LE, then 10-byte sph prefixes
+//	mchunk:   manifest chunk digest -> the same, in the manifest slab
 //	slab:     slab id u16 BE -> bucket of addr u32 BE -> digest,
 //	          and addr|1<<31 -> "" when the chunk is present
 //	image:    sph string -> pb.DbImage
@@ -141,14 +142,23 @@ func (tb *testBase) checkInvariants() {
 
 	_ = db.View(func(tx *bbolt.Tx) error {
 		cb := tx.Bucket([]byte("chunk"))
+		mcb := tx.Bucket([]byte("mchunk"))
 		slabroot := tx.Bucket([]byte("slab"))
 		ib := tx.Bucket([]byte("image"))
 		mb := tx.Bucket([]byte("manifest"))
 		cfb := tx.Bucket([]byte("catalogf"))
 		crb := tx.Bucket([]byte("catalogr"))
-		if cb == nil || slabroot == nil || ib == nil || mb == nil || cfb == nil || crb == nil {
+		if cb == nil || mcb == nil || slabroot == nil || ib == nil || mb == nil || cfb == nil || crb == nil {
 			bad("missing a top-level bucket")
 			return nil
+		}
+
+		// the bucket that maps digests to locs in this slab
+		bucketFor := func(slab uint16) *bbolt.Bucket {
+			if slab >= invManifestSlab {
+				return mcb
+			}
+			return cb
 		}
 
 		present := func(l invLoc) bool {
@@ -156,9 +166,10 @@ func (tb *testBase) checkInvariants() {
 			return invHas(sb, invAddrKey(l.addr|invPresentMask))
 		}
 
-		// read a chunk's bytes from its slab file and check them against the digest
-		readChunk := func(d cdig.CDig, size int64) ([]byte, error) {
-			v := cb.Get(d[:])
+		// read a chunk's bytes from its slab file and check them against the digest.
+		// kb is cb for a data chunk and mcb for a manifest chunk.
+		readChunk := func(kb *bbolt.Bucket, d cdig.CDig, size int64) ([]byte, error) {
+			v := kb.Get(d[:])
 			if v == nil {
 				return nil, fmt.Errorf("chunk %s has no chunk record", d)
 			}
@@ -181,35 +192,42 @@ func (tb *testBase) checkInvariants() {
 			return b, nil
 		}
 
-		// chunk -> slab
-		cur := cb.Cursor()
-		for k, v := cur.First(); k != nil; k, v = cur.Next() {
-			if len(k) != cdig.Bytes {
-				bad("chunk key %x has length %d", k, len(k))
-				continue
-			}
-			d := cdig.FromBytes(k)
-			if len(v) < 6 || (len(v)-6)%invSphPrefixBytes != 0 {
-				bad("chunk %s: loc value has length %d", d, len(v))
-				continue
-			}
-			if len(v) == 6 {
-				bad("chunk %s: no store path references (prefetch fails with 'missing sph references')", d)
-			}
-			l := invDecodeLoc(v)
-			sb := slabroot.Bucket(invSlabKey(l.slab))
-			if sb == nil {
-				bad("chunk %s: points at slab %d, which has no bucket", d, l.slab)
-				continue
-			}
-			if got := sb.Get(invAddrKey(l.addr)); !bytes.Equal(got, k) {
-				bad("chunk %s: slab %d addr %d holds %x, not this digest", d, l.slab, l.addr, got)
-			}
-			if l.addr < invReservedBlocks || uint64(l.addr) >= sb.Sequence() {
-				bad("chunk %s: addr %d outside allocated range [%d, %d) of slab %d",
-					d, l.addr, invReservedBlocks, sb.Sequence(), l.slab)
+		// chunk -> slab, for data chunks (chunk) and manifest chunks (mchunk)
+		checkChunks := func(name string, kb *bbolt.Bucket, manifest bool) {
+			cur := kb.Cursor()
+			for k, v := cur.First(); k != nil; k, v = cur.Next() {
+				if len(k) != cdig.Bytes {
+					bad("%s key %x has length %d", name, k, len(k))
+					continue
+				}
+				d := cdig.FromBytes(k)
+				if len(v) < 6 || (len(v)-6)%invSphPrefixBytes != 0 {
+					bad("%s %s: loc value has length %d", name, d, len(v))
+					continue
+				}
+				if len(v) == 6 {
+					bad("%s %s: no store path references (prefetch fails with 'missing sph references')", name, d)
+				}
+				l := invDecodeLoc(v)
+				if (l.slab >= invManifestSlab) != manifest {
+					bad("%s %s: in slab %d, the wrong kind of slab for this bucket", name, d, l.slab)
+				}
+				sb := slabroot.Bucket(invSlabKey(l.slab))
+				if sb == nil {
+					bad("%s %s: points at slab %d, which has no bucket", name, d, l.slab)
+					continue
+				}
+				if got := sb.Get(invAddrKey(l.addr)); !bytes.Equal(got, k) {
+					bad("%s %s: slab %d addr %d holds %x, not this digest", name, d, l.slab, l.addr, got)
+				}
+				if l.addr < invReservedBlocks || uint64(l.addr) >= sb.Sequence() {
+					bad("%s %s: addr %d outside allocated range [%d, %d) of slab %d",
+						name, d, l.addr, invReservedBlocks, sb.Sequence(), l.slab)
+				}
 			}
 		}
+		checkChunks("chunk", cb, false)
+		checkChunks("mchunk", mcb, true)
 
 		// slab -> chunk
 		scur := slabroot.Cursor()
@@ -237,7 +255,7 @@ func (tb *testBase) checkInvariants() {
 					bad("slab %d addr %d: value has length %d", id, addr, len(v))
 					continue
 				}
-				cv := cb.Get(v)
+				cv := bucketFor(id).Get(v)
 				if cv == nil {
 					bad("slab %d addr %d: chunk %s has no chunk record", id, addr, cdig.FromBytes(v))
 					continue
@@ -295,10 +313,10 @@ func (tb *testBase) checkInvariants() {
 				var buf bytes.Buffer
 				ok := true
 				for i, md := range mdigs {
-					if cv := cb.Get(md[:]); len(cv) >= 6 && kept && !invHasSphPrefix(cv, msph) {
+					if cv := mcb.Get(md[:]); len(cv) >= 6 && kept && !invHasSphPrefix(cv, msph) {
 						bad("image %s: manifest chunk %s doesn't reference the manifest sph", sphStr, md)
 					}
-					b, err := readChunk(md, cs.FileChunkSize(ent.Size, i == len(mdigs)-1))
+					b, err := readChunk(mcb, md, cs.FileChunkSize(ent.Size, i == len(mdigs)-1))
 					if err != nil {
 						if kept {
 							bad("image %s (%s): manifest chunk %d/%d: %v", sphStr, img.MountState, i, len(mdigs), err)
@@ -336,7 +354,7 @@ func (tb *testBase) checkInvariants() {
 						continue
 					}
 					checked[d] = true
-					if _, err := readChunk(d, cs.FileChunkSize(e.Size, i == len(ds)-1)); err != nil {
+					if _, err := readChunk(cb, d, cs.FileChunkSize(e.Size, i == len(ds)-1)); err != nil {
 						bad("image %s: %s chunk %d: %v", sphStr, e.Path, i, err)
 					}
 				}
