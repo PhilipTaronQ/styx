@@ -906,18 +906,88 @@ func (s *Server) closeAllFds() {
 	}
 }
 
+// Unbounded FIFO of cachefiles messages, so that queueing one never blocks.
+type msgQueue struct {
+	lock  sync.Mutex
+	msgs  [][]byte
+	ready chan struct{}
+}
+
+func newMsgQueue() *msgQueue {
+	return &msgQueue{ready: make(chan struct{}, 1)}
+}
+
+func (q *msgQueue) push(msg []byte) {
+	q.lock.Lock()
+	q.msgs = append(q.msgs, msg)
+	q.lock.Unlock()
+	select {
+	case q.ready <- struct{}{}:
+	default:
+	}
+}
+
+// Returns the next message, waiting for one if needed, or false once ctx is done.
+func (q *msgQueue) pop(ctx context.Context) ([]byte, bool) {
+	for ctx.Err() == nil {
+		q.lock.Lock()
+		if len(q.msgs) > 0 {
+			msg := q.msgs[0]
+			q.msgs[0] = nil
+			q.msgs = q.msgs[1:]
+			q.lock.Unlock()
+			return msg, true
+		}
+		q.lock.Unlock()
+		select {
+		case <-q.ready:
+		case <-ctx.Done():
+		}
+	}
+	return nil, false
+}
+
+func isReadMsg(msg []byte) bool {
+	return len(msg) >= 8 && binary.LittleEndian.Uint32(msg[4:8]) == CACHEFILES_OP_READ
+}
+
 func (s *Server) cachefilesServer() {
 	s.shutdownWait.Add(1)
 	defer s.shutdownWait.Done()
 
-	wchan := make(chan []byte)
-	for i := 0; i < s.cfg.Workers; i++ {
+	// OPEN and CLOSE are handled by one goroutine in the order we read them, so a CLOSE
+	// for an old object can't overtake the OPEN for its replacement. They never wait on
+	// the network. Each READ gets a goroutine, with at most cfg.Workers running, so reads
+	// waiting on the network hold up neither OPEN and CLOSE nor reading the devnode (the
+	// kernel lets umount(2) return once we've read its CLOSE).
+	// When stopping, messages not yet handled are dropped. The kernel keeps them, and
+	// sends them again to a daemon that restores the devnode.
+	ctl := newMsgQueue()
+	s.shutdownWait.Add(1)
+	go func() {
+		defer s.shutdownWait.Done()
+		for {
+			msg, ok := ctl.pop(s.lifeCtx)
+			if !ok {
+				return
+			}
+			s.handleMessage(msg)
+		}
+	}()
+	readSem := semaphore.NewWeighted(int64(s.cfg.Workers))
+	dispatch := func(msg []byte) {
+		if !isReadMsg(msg) {
+			ctl.push(msg)
+			return
+		}
 		s.shutdownWait.Add(1)
 		go func() {
 			defer s.shutdownWait.Done()
-			for msg := range wchan {
-				s.handleMessage(msg)
+			if readSem.Acquire(s.lifeCtx, 1) != nil {
+				return
 			}
+			defer readSem.Release(1)
+			s.handleMessage(msg)
 		}()
 	}
 
@@ -973,12 +1043,9 @@ func (s *Server) cachefilesServer() {
 			}
 			readAfterPoll = true
 			errors = 0
-			wchan <- buf[:n]
+			dispatch(buf[:n])
 		}
 	}
-
-	// log.Print("stopping workers")
-	close(wchan)
 }
 
 func (s *Server) handleMessage(buf []byte) (retErr error) {
