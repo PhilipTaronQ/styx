@@ -53,9 +53,6 @@ const (
 	// TODO: promote to an error when a failed mount records MountError and gc
 	// skips images with no manifest (tryMount returns before the imageTx).
 	bugFailedMount = "failed mount leaves an image with no manifest"
-	// TODO: promote to an error when Stop closes the manifest slab fd
-	// (closeAllFds only walks cacheState).
-	bugManifestFd = "manifest slab fd is never closed"
 )
 
 type invLoc struct {
@@ -431,8 +428,7 @@ func (tb *testBase) testFds() map[string]string {
 	return out
 }
 
-// checkLeaks reports mounts and fds the test left behind. Both are errors,
-// except the manifest slab fd, which Stop never closes (bugManifestFd).
+// checkLeaks reports mounts and fds the test left behind as errors.
 func (tb *testBase) checkLeaks() {
 	t := tb.t
 	root := filepath.Dir(tb.basetmpdir) + "/"
@@ -446,10 +442,6 @@ func (tb *testBase) checkLeaks() {
 	for fd, target := range tb.testFds() {
 		if tb.startFds[fd] == target {
 			continue // was open before this test started
-		}
-		if strings.HasSuffix(target, "/_manifests_"+strconv.Itoa(invManifestSlab)) {
-			t.Logf("leak warning: (known bug: %s) fd %s -> %s still open after the daemon stopped", bugManifestFd, fd, target)
-			continue
 		}
 		t.Errorf("leak: fd %s -> %s still open after the daemon stopped", fd, target)
 	}
