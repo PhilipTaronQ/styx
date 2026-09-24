@@ -24,7 +24,9 @@ import (
 	"github.com/nix-community/go-nix/pkg/nar"
 	"github.com/nix-community/go-nix/pkg/narinfo"
 	"github.com/nix-community/go-nix/pkg/narinfo/signature"
+	"github.com/nix-community/go-nix/pkg/nixbase32"
 	"github.com/nix-community/go-nix/pkg/nixhash"
+	"github.com/nix-community/go-nix/pkg/storepath"
 	"golang.org/x/sync/semaphore"
 	"google.golang.org/protobuf/proto"
 
@@ -175,6 +177,9 @@ func (b *ManifestBuilder) BuildFromNar(
 ) (*ManifestBuildRes, error) {
 	// get narinfo
 
+	if len(storePathHash) != nixbase32.EncodedLen(storepath.PathHashSize) || nixbase32.ValidateString(storePathHash) != nil {
+		return nil, fmt.Errorf("%w: invalid store path hash %q", ErrReq, storePathHash)
+	}
 	upstreamUrl, err := url.Parse(upstream)
 	if err != nil {
 		return nil, err
@@ -196,6 +201,15 @@ func (b *ManifestBuilder) BuildFromNar(
 	ni, err := narinfo.Parse(res.Body)
 	if err != nil {
 		return nil, fmt.Errorf("%w: narinfo parse for %s: %w", ErrReq, narinfoUrl, err)
+	}
+
+	// check the fields we use (Fingerprint dereferences NarHash)
+	if ni.NarHash == nil {
+		return nil, fmt.Errorf("%w: narinfo for %s has no NarHash", ErrReq, narinfoUrl)
+	} else if sp, err := storepath.FromAbsolutePath(ni.StorePath); err != nil {
+		return nil, fmt.Errorf("%w: narinfo for %s: %w", ErrReq, narinfoUrl, err)
+	} else if nixbase32.EncodeToString(sp.Digest) != storePathHash {
+		return nil, fmt.Errorf("%w: narinfo for %s has store path %s", ErrReq, narinfoUrl, ni.StorePath)
 	}
 
 	// verify signature
@@ -330,7 +344,6 @@ func (b *ManifestBuilder) BuildFromNar(
 		StorePath:   ni.StorePath,
 		Url:         ni.URL,
 		Compression: ni.Compression,
-		FileHash:    ni.FileHash.Format(nixhash.NixBase32, true),
 		FileSize:    int64(ni.FileSize),
 		NarHash:     ni.NarHash.Format(nixhash.NixBase32, true),
 		NarSize:     int64(ni.NarSize),
@@ -339,6 +352,9 @@ func (b *ManifestBuilder) BuildFromNar(
 		System:      ni.System,
 		Signatures:  make([]string, len(ni.Signatures)),
 		Ca:          ni.CA,
+	}
+	if ni.FileHash != nil { // optional, and not covered by the signature
+		nipb.FileHash = ni.FileHash.Format(nixhash.NixBase32, true)
 	}
 	for i, sig := range ni.Signatures {
 		nipb.Signatures[i] = sig.String()
