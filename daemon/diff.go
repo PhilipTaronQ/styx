@@ -901,7 +901,13 @@ func (s *Server) appendRemanifestReqs(reqs []MountReq, op reqOp) []MountReq {
 
 	_ = s.db.View(func(tx *bbolt.Tx) error {
 		ib := tx.Bucket(imageBucket)
+		crb := tx.Bucket(catalogRBucket)
 		for sph := range getSphsFromOp(tx) {
+			if strings.HasPrefix(string(crb.Get(sph[:])), isManifestPrefix) {
+				// manifest chunks are catalogued under the manifest sph. remanifest the image
+				// it belongs to (makeManifestSph is its own inverse).
+				sph = makeManifestSph(sph)
+			}
 			sphStr := sph.String()
 			if slices.ContainsFunc(reqs, func(r MountReq) bool { return r.StorePath == sphStr }) {
 				continue
