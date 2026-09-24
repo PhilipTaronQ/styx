@@ -297,8 +297,10 @@ func (s *Server) vaporizeFile(
 			if cfd == 0 {
 				return nil, errCachefdNotFound
 			}
+			// CopyFileRange advances the offsets it's given; keep roff for the fallback below
+			coff := roff
 			woff := int64(loc.Addr) << s.blockShift
-			rsize, err := unix.CopyFileRange(int(f.Fd()), &roff, cfd, &woff, int(size), 0)
+			rsize, err := unix.CopyFileRange(int(f.Fd()), &coff, cfd, &woff, int(size), 0)
 			if err == nil && rsize != int(size) {
 				err = io.ErrShortWrite
 			}
