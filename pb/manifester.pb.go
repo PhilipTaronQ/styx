@@ -193,7 +193,7 @@ const file_manifester_proto_rawDesc = "" +
 	"\x04reqs\x18\x02 \x01(\fR\x04reqs\x12,\n" +
 	"\x12expand_before_diff\x18\x03 \x01(\tR\x10expandBeforeDiff\"!\n" +
 	"\aLengths\x12\x16\n" +
-	"\x06length\x18\x01 \x03(\x03R\x06lengthB\x18Z\x16github.com/dnr/styx/pbb\x06proto3"
+	"\x06length\x18\x01 \x03(\x03R\x06lengthB!Z\x1fgithub.com/PhilipTaronQ/styx/pbb\x06proto3"
 
 var (
 	file_manifester_proto_rawDescOnce sync.Once

@@ -7,10 +7,10 @@ import (
 	"os"
 	"os/exec"
 
-	"github.com/dnr/styx/common"
-	"github.com/dnr/styx/common/client"
-	"github.com/dnr/styx/common/cobrautil"
-	"github.com/dnr/styx/daemon"
+	"github.com/PhilipTaronQ/styx/common"
+	"github.com/PhilipTaronQ/styx/common/client"
+	"github.com/PhilipTaronQ/styx/common/cobrautil"
+	"github.com/PhilipTaronQ/styx/daemon"
 	"github.com/nix-community/go-nix/pkg/storepath"
 	"github.com/spf13/cobra"
 )

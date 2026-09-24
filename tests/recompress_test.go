@@ -28,19 +28,23 @@ func TestRecompress(t *testing.T) {
 	// (no savings). check that we did the recompress thing.
 	require.Less(t, d2.Stats.DiffBytes, int64(10000))
 
-	require.Zero(t, d2.Stats.SingleErrs+d2.Stats.BatchErrs+d2.Stats.DiffErrs)
+	require.Zero(t, d2.Stats.TotalErrs())
 }
 
 func TestMultiRecompress(t *testing.T) {
 	tb := newTestBase(t)
 	tb.startAll()
 
-	_ = tb.materialize("z2waz77lsh4pxs0jxgmpf16s7a3g7b7v-openssl-3.0.13-man")
+	sp1 := "z2waz77lsh4pxs0jxgmpf16s7a3g7b7v-openssl-3.0.13-man"
+	mp1 := tb.materialize(sp1)
+	tb.requireNarHash(mp1, sp1)
 	d1 := tb.debug()
 	require.NotZero(t, d1.Stats.BatchReqs)
 	require.Zero(t, d1.Stats.SingleReqs+d1.Stats.DiffReqs)
 
-	_ = tb.materialize("xd96wmj058ky40aywv72z63vdw9yzzzb-openssl-3.0.12-man")
+	sp2 := "xd96wmj058ky40aywv72z63vdw9yzzzb-openssl-3.0.12-man"
+	mp2 := tb.materialize(sp2)
+	tb.requireNarHash(mp2, sp2)
 	d2 := tb.debug()
 	require.NotZero(t, d2.Stats.DiffReqs)
 	require.Greater(t, d2.Stats.DiffBytes, int64(0))
@@ -52,5 +56,5 @@ func TestMultiRecompress(t *testing.T) {
 	// check that we did it in a small number of total requests (this is the "multi" part)
 	require.Less(t, d2.Stats.DiffReqs, int64(15))
 
-	require.Zero(t, d2.Stats.SingleErrs+d2.Stats.BatchErrs+d2.Stats.DiffErrs)
+	require.Zero(t, d2.Stats.TotalErrs())
 }

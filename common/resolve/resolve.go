@@ -1,6 +1,7 @@
 package resolve
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -12,7 +13,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/dnr/styx/common"
+	"github.com/PhilipTaronQ/styx/common"
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/config"
 	"github.com/go-git/go-git/v5/storage/memory"
@@ -137,7 +138,9 @@ func resolveWithHander(ctx context.Context, h handler, input string, mustBeCommi
 	}, nil
 }
 
-func ResolveUrl(ctx context.Context, input string) (Result, error) {
+// ResolveUrl resolves input to a url that hopefully won't change. For urls that don't match a
+// forge pattern, that means following redirects, with client.
+func ResolveUrl(ctx context.Context, client *http.Client, input string) (Result, error) {
 	log.Println("resolving url", input)
 
 	// try forges
@@ -145,6 +148,8 @@ func ResolveUrl(ctx context.Context, input string) (Result, error) {
 		res, err := resolveWithHander(ctx, h, input, false)
 		if err == errNoMatch {
 			continue
+		} else if err != nil {
+			return Result{}, fmt.Errorf("using %s url pattern: %w", h.name, err)
 		}
 
 		// pass through again to check that it's idempotent
@@ -162,7 +167,7 @@ func ResolveUrl(ctx context.Context, input string) (Result, error) {
 	// follow http redirects (for nix channels, releases, etc.)
 	// TODO: actually do lockable tarball protocol here
 	log.Println("doing head request on", input)
-	res, err := common.RetryHttpRequest(ctx, http.MethodHead, input, "", nil)
+	res, err := common.RetryHttpRequestWithClient(ctx, client, http.MethodHead, input, "", nil)
 	if err != nil {
 		return Result{}, err
 	}
@@ -184,19 +189,25 @@ func ResolveUrl(ctx context.Context, input string) (Result, error) {
 
 var reNixExprs = regexp.MustCompile(`^https://releases\.nixos\.org/.*/(nix(os|pkgs)-\d\d\.\d\d(\.|pre)\d+).[a-z0-9]+/nixexprs\.tar`)
 
-func getSpNameFromUrl(url string) string {
+func getSpNameFromUrl(rawUrl string) string {
 	// hack: tweak name, e.g. we want
 	//   https://releases.nixos.org/nixos/25.11/nixos-25.11.1056.d9bc5c7dceb3/nixexprs.tar.xz
 	// to turn into "nixexprs-nixos-25.11.1056" for better diffing
-	if m := reNixExprs.FindStringSubmatch(url); m != nil {
+	if m := reNixExprs.FindStringSubmatch(rawUrl); m != nil {
 		return "nixexprs-" + m[1]
 	}
 
-	name := path.Base(url)
+	// use only the path: redirects often go to signed urls whose query strings change on
+	// every request and contain characters that aren't allowed in store path names.
+	p := rawUrl
+	if u, err := url.Parse(rawUrl); err == nil {
+		p = u.Path
+	}
+	name := path.Base(p)
 	name = strings.TrimSuffix(name, ".gz")
 	name = strings.TrimSuffix(name, ".xz")
 	name = strings.TrimSuffix(name, ".tar")
-	return name
+	return cmp.Or(sanitizeStorePathName(name), "source")
 }
 
 func sanitizeStorePathName(s string) string {

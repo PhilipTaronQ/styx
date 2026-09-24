@@ -32,5 +32,5 @@ func TestDiffChunks(t *testing.T) {
 	require.Zero(t, d3.Stats.BatchReqs-d2.Stats.BatchReqs)
 	require.NotZero(t, d3.Stats.DiffReqs-d2.Stats.DiffReqs)
 
-	require.Zero(t, d3.Stats.SingleErrs+d3.Stats.BatchErrs+d3.Stats.DiffErrs)
+	require.Zero(t, d3.Stats.TotalErrs())
 }

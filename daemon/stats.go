@@ -91,3 +91,9 @@ func (a Stats) Sub(b Stats) Stats {
 func (a Stats) TotalReqs() int64 {
 	return a.SingleReqs + a.BatchReqs + a.DiffReqs
 }
+
+// TotalErrs counts every kind of failed request, including the manifest and
+// slab read errors that the chunk request counters don't cover.
+func (a Stats) TotalErrs() int64 {
+	return a.ManifestErrs + a.SlabReadErrs + a.SingleErrs + a.BatchErrs + a.DiffErrs
+}

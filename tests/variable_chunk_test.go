@@ -5,7 +5,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/dnr/styx/common/shift"
+	"github.com/PhilipTaronQ/styx/common/shift"
 )
 
 func TestVariableChunk(t *testing.T) {

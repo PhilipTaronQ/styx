@@ -5,7 +5,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/dnr/styx/daemon"
+	"github.com/PhilipTaronQ/styx/daemon"
 )
 
 func TestChunkedManifest(t *testing.T) {

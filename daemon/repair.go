@@ -13,7 +13,7 @@ import (
 
 	"go.etcd.io/bbolt"
 
-	"github.com/dnr/styx/common"
+	"github.com/PhilipTaronQ/styx/common"
 )
 
 func (s *Server) handleRepairReq(ctx context.Context, r *RepairReq) (*Status, error) {
@@ -35,31 +35,36 @@ func (s *Server) handleRepairReq(ctx context.Context, r *RepairReq) (*Status, er
 
 func (s *Server) repairPresence(slab uint16, path string) {
 	blk := fmt.Sprintf("-b%d", s.blockShift.Size())
-	// TODO: use FIEMAP ioctl directly
-	out, err := exec.Command(common.FilefragBin, "-evs", blk, path).Output()
-	if err != nil {
-		return
-	}
 	re := regexp.MustCompile(`\s*\d+:\s*(\d+)\.\.\s*(\d+):.*`)
 
-	have := make(map[uint32]bool)
-	for _, l := range strings.Split(string(out), "\n") {
-		m := re.FindStringSubmatch(l)
-		if len(m) < 3 {
-			continue
-		}
-		start, err1 := strconv.Atoi(m[1])
-		end, err2 := strconv.Atoi(m[2])
-		if err1 != nil || err2 != nil {
-			continue
-		}
-		for i := start; i <= end; i++ {
-			have[uint32(i)] = true
-		}
-	}
-
+	// Read the block map inside the transaction. Otherwise a chunk written and recorded
+	// present in between would look missing from the map, and lose its present record.
 	s.db.Update(func(tx *bbolt.Tx) error {
 		sb := tx.Bucket(slabBucket).Bucket(slabKey(slab))
+		if sb == nil {
+			return nil
+		}
+
+		// TODO: use FIEMAP ioctl directly
+		out, err := exec.Command(common.FilefragBin, "-evs", blk, path).Output()
+		if err != nil {
+			return err
+		}
+		have := make(map[uint32]bool)
+		for _, l := range strings.Split(string(out), "\n") {
+			m := re.FindStringSubmatch(l)
+			if len(m) < 3 {
+				continue
+			}
+			start, err1 := strconv.Atoi(m[1])
+			end, err2 := strconv.Atoi(m[2])
+			if err1 != nil || err2 != nil {
+				continue
+			}
+			for i := start; i <= end; i++ {
+				have[uint32(i)] = true
+			}
+		}
 
 		var all []uint32
 		dbhave := make(map[uint32]bool)

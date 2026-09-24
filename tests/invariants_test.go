@@ -1,0 +1,443 @@
+package tests
+
+import (
+	"bytes"
+	"encoding/binary"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"go.etcd.io/bbolt"
+	"google.golang.org/protobuf/proto"
+
+	"github.com/PhilipTaronQ/styx/common/cdig"
+	"github.com/PhilipTaronQ/styx/daemon"
+	"github.com/PhilipTaronQ/styx/pb"
+)
+
+// End-of-test checks, run from cleanup after the daemon has stopped.
+//
+// The db layout is copied from daemon/const.go, daemon/daemon.go and
+// daemon/catalog.go:
+//
+//	chunk:    data chunk digest -> slab u16 LE, addr u32 LE, then 10-byte sph prefixes
+//	mchunk:   manifest chunk digest -> the same, in the manifest slab
+//	slab:     slab id u16 BE -> bucket of addr u32 BE -> digest,
+//	          and addr|1<<31 -> "" when the chunk is present
+//	image:    sph string -> pb.DbImage
+//	manifest: sph string -> pb.SignedMessage
+//	catalogf: name \0 sph -> ""   (name has "M/" prefix for manifests)
+//	catalogr: sph -> name
+const (
+	invPresentMask    = 1 << 31
+	invReservedBlocks = 4
+	invManifestSlab   = 10000
+	invSphPrefixBytes = 10
+	invManifestPrefix = "M/"
+	invMaxReports     = 40
+)
+
+type invLoc struct {
+	slab uint16
+	addr uint32
+}
+
+func invSlabKey(id uint16) []byte { return binary.BigEndian.AppendUint16(nil, id) }
+func invAddrKey(a uint32) []byte  { return binary.BigEndian.AppendUint32(nil, a) }
+
+func invDecodeLoc(v []byte) invLoc {
+	return invLoc{slab: binary.LittleEndian.Uint16(v), addr: binary.LittleEndian.Uint32(v[2:])}
+}
+
+// Get returns nil for a key stored with a nil value in some cases, so check
+// existence with a cursor.
+func invHas(b *bbolt.Bucket, k []byte) bool {
+	if b == nil {
+		return false
+	}
+	ck, _ := b.Cursor().Seek(k)
+	return ck != nil && bytes.Equal(ck, k)
+}
+
+func invHasSphPrefix(loc []byte, sph daemon.Sph) bool {
+	for rest := loc[6:]; len(rest) >= invSphPrefixBytes; rest = rest[invSphPrefixBytes:] {
+		if bytes.Equal(rest[:invSphPrefixBytes], sph[:invSphPrefixBytes]) {
+			return true
+		}
+	}
+	return false
+}
+
+func (tb *testBase) invSlabFile(files map[uint16]*os.File, id uint16) *os.File {
+	if f, ok := files[id]; ok {
+		return f
+	}
+	var p string
+	if id == invManifestSlab {
+		p = filepath.Join(tb.cachedir, "_manifests_"+strconv.Itoa(int(id)))
+	} else {
+		pat := filepath.Join(tb.cachedir, "cache", "Ierofs,"+tb.tag, "@*", "D_slab_"+strconv.Itoa(int(id)))
+		if m, _ := filepath.Glob(pat); len(m) == 1 {
+			p = m[0]
+		}
+	}
+	var f *os.File
+	if p != "" {
+		f, _ = os.Open(p)
+	}
+	files[id] = f
+	return f
+}
+
+// checkInvariants opens styx.bolt read-only and checks that the buckets agree
+// with each other and with the slab files. Violations are test errors.
+func (tb *testBase) checkInvariants() {
+	t := tb.t
+	dbPath := filepath.Join(tb.cachedir, "styx.bolt")
+	if _, err := os.Stat(dbPath); err != nil {
+		return
+	}
+	db, err := bbolt.Open(dbPath, 0o600, &bbolt.Options{ReadOnly: true, Timeout: 5 * time.Second})
+	if err != nil {
+		t.Errorf("invariant: open %s: %v", dbPath, err)
+		return
+	}
+	defer db.Close()
+
+	var errs []string
+	bad := func(format string, a ...any) { errs = append(errs, fmt.Sprintf(format, a...)) }
+
+	files := make(map[uint16]*os.File)
+	defer func() {
+		for _, f := range files {
+			if f != nil {
+				f.Close()
+			}
+		}
+	}()
+	checked := make(map[cdig.CDig]bool)
+
+	_ = db.View(func(tx *bbolt.Tx) error {
+		cb := tx.Bucket([]byte("chunk"))
+		mcb := tx.Bucket([]byte("mchunk"))
+		slabroot := tx.Bucket([]byte("slab"))
+		ib := tx.Bucket([]byte("image"))
+		mb := tx.Bucket([]byte("manifest"))
+		cfb := tx.Bucket([]byte("catalogf"))
+		crb := tx.Bucket([]byte("catalogr"))
+		if cb == nil || mcb == nil || slabroot == nil || ib == nil || mb == nil || cfb == nil || crb == nil {
+			bad("missing a top-level bucket")
+			return nil
+		}
+
+		// the bucket that maps digests to locs in this slab
+		bucketFor := func(slab uint16) *bbolt.Bucket {
+			if slab >= invManifestSlab {
+				return mcb
+			}
+			return cb
+		}
+
+		present := func(l invLoc) bool {
+			sb := slabroot.Bucket(invSlabKey(l.slab))
+			return invHas(sb, invAddrKey(l.addr|invPresentMask))
+		}
+
+		// read a chunk's bytes from its slab file and check them against the digest.
+		// kb is cb for a data chunk and mcb for a manifest chunk.
+		readChunk := func(kb *bbolt.Bucket, d cdig.CDig, size int64) ([]byte, error) {
+			v := kb.Get(d[:])
+			if v == nil {
+				return nil, fmt.Errorf("chunk %s has no chunk record", d)
+			}
+			l := invDecodeLoc(v)
+			if !present(l) {
+				return nil, fmt.Errorf("chunk %s at %d/%d is not marked present", d, l.slab, l.addr)
+			}
+			f := tb.invSlabFile(files, l.slab)
+			if f == nil {
+				return nil, fmt.Errorf("chunk %s: no backing file for slab %d", d, l.slab)
+			}
+			b := make([]byte, size)
+			if _, err := f.ReadAt(b, int64(l.addr)<<blockShift); err != nil {
+				return nil, fmt.Errorf("chunk %s: read %d bytes at %d/%d: %w", d, size, l.slab, l.addr, err)
+			}
+			if err := d.Check(b); err != nil {
+				return nil, fmt.Errorf("chunk %s at %d/%d (%d bytes) is marked present but its bytes don't match: %w",
+					d, l.slab, l.addr, size, err)
+			}
+			return b, nil
+		}
+
+		// chunk -> slab, for data chunks (chunk) and manifest chunks (mchunk)
+		checkChunks := func(name string, kb *bbolt.Bucket, manifest bool) {
+			cur := kb.Cursor()
+			for k, v := cur.First(); k != nil; k, v = cur.Next() {
+				if len(k) != cdig.Bytes {
+					bad("%s key %x has length %d", name, k, len(k))
+					continue
+				}
+				d := cdig.FromBytes(k)
+				if len(v) < 6 || (len(v)-6)%invSphPrefixBytes != 0 {
+					bad("%s %s: loc value has length %d", name, d, len(v))
+					continue
+				}
+				if len(v) == 6 {
+					bad("%s %s: no store path references (prefetch fails with 'missing sph references')", name, d)
+				}
+				l := invDecodeLoc(v)
+				if (l.slab >= invManifestSlab) != manifest {
+					bad("%s %s: in slab %d, the wrong kind of slab for this bucket", name, d, l.slab)
+				}
+				sb := slabroot.Bucket(invSlabKey(l.slab))
+				if sb == nil {
+					bad("%s %s: points at slab %d, which has no bucket", name, d, l.slab)
+					continue
+				}
+				if got := sb.Get(invAddrKey(l.addr)); !bytes.Equal(got, k) {
+					bad("%s %s: slab %d addr %d holds %x, not this digest", name, d, l.slab, l.addr, got)
+				}
+				if l.addr < invReservedBlocks || uint64(l.addr) >= sb.Sequence() {
+					bad("%s %s: addr %d outside allocated range [%d, %d) of slab %d",
+						name, d, l.addr, invReservedBlocks, sb.Sequence(), l.slab)
+				}
+			}
+		}
+		checkChunks("chunk", cb, false)
+		checkChunks("mchunk", mcb, true)
+
+		// slab -> chunk
+		scur := slabroot.Cursor()
+		for sk, sv := scur.First(); sk != nil; sk, sv = scur.Next() {
+			if sv != nil || len(sk) != 2 {
+				bad("slab root has non-bucket key %x", sk)
+				continue
+			}
+			id := binary.BigEndian.Uint16(sk)
+			sb := slabroot.Bucket(sk)
+			c := sb.Cursor()
+			for k, v := c.First(); k != nil; k, v = c.Next() {
+				if len(k) != 4 {
+					bad("slab %d: key %x has length %d", id, k, len(k))
+					continue
+				}
+				addr := binary.BigEndian.Uint32(k)
+				if addr&invPresentMask != 0 {
+					if !invHas(sb, invAddrKey(addr&^invPresentMask)) {
+						bad("slab %d: present marker for addr %d, which holds no chunk", id, addr&^invPresentMask)
+					}
+					continue
+				}
+				if len(v) != cdig.Bytes {
+					bad("slab %d addr %d: value has length %d", id, addr, len(v))
+					continue
+				}
+				cv := bucketFor(id).Get(v)
+				if cv == nil {
+					bad("slab %d addr %d: chunk %s has no chunk record", id, addr, cdig.FromBytes(v))
+					continue
+				}
+				if len(cv) >= 6 {
+					if l := invDecodeLoc(cv); l.slab != id || l.addr != addr {
+						bad("slab %d addr %d: chunk %s record points to %d/%d instead", id, addr, cdig.FromBytes(v), l.slab, l.addr)
+					}
+				}
+			}
+		}
+
+		// images -> manifests -> chunks
+		icur := ib.Cursor()
+		for k, v := icur.First(); k != nil; k, v = icur.Next() {
+			sphStr := string(k)
+			var img pb.DbImage
+			if err := proto.Unmarshal(v, &img); err != nil {
+				bad("image %s: unmarshal: %v", sphStr, err)
+				continue
+			}
+			sph, _, err := daemon.ParseSph(sphStr)
+			if err != nil {
+				bad("image key %q is not a store path hash", sphStr)
+				continue
+			}
+			// gc with the default flags deletes Unmounted images and traces the
+			// manifests of everything else, so those manifests must be readable.
+			kept := img.MountState != pb.MountState_Unmounted
+			mv := mb.Get(k)
+			if mv == nil {
+				switch {
+				case !kept:
+				case img.MountState == pb.MountState_MountError || img.MountState == pb.MountState_Unknown:
+					// a mount that failed before it had the manifest; gc keeps the record
+				case img.MountState == pb.MountState_Requested:
+					// the daemon has stopped, so no mount is in progress: a mount that
+					// fails records MountError
+					bad("image %s (%s) is still Requested with no manifest after the daemon stopped",
+						sphStr, img.StorePath)
+				default:
+					bad("image %s (%s, %s) has no manifest; gc keeps %s images and needs their manifests",
+						sphStr, img.StorePath, img.MountState, img.MountState)
+				}
+				continue
+			}
+			var sm pb.SignedMessage
+			if err := proto.Unmarshal(mv, &sm); err != nil || sm.Msg == nil {
+				bad("image %s: manifest envelope doesn't unmarshal: %v", sphStr, err)
+				continue
+			}
+			ent := sm.Msg
+			data := ent.InlineData
+			if len(data) == 0 {
+				mdigs := cdig.FromSliceAlias(ent.Digests)
+				cs := ent.ChunkShiftDef()
+				msph := sph
+				msph[0] ^= 1 // makeManifestSph
+				var buf bytes.Buffer
+				ok := true
+				for i, md := range mdigs {
+					if cv := mcb.Get(md[:]); len(cv) >= 6 && kept && !invHasSphPrefix(cv, msph) {
+						bad("image %s: manifest chunk %s doesn't reference the manifest sph", sphStr, md)
+					}
+					b, err := readChunk(mcb, md, cs.FileChunkSize(ent.Size, i == len(mdigs)-1))
+					if err != nil {
+						if kept {
+							bad("image %s (%s): manifest chunk %d/%d: %v", sphStr, img.MountState, i, len(mdigs), err)
+						}
+						ok = false
+						break
+					}
+					buf.Write(b)
+				}
+				if !ok {
+					continue
+				}
+				data = buf.Bytes()
+			}
+			var m pb.Manifest
+			if err := proto.Unmarshal(data, &m); err != nil {
+				bad("image %s: manifest doesn't unmarshal: %v", sphStr, err)
+				continue
+			}
+			for _, e := range m.Entries {
+				ds := cdig.FromSliceAlias(e.Digests)
+				cs := e.ChunkShiftDef()
+				for i, d := range ds {
+					cv := cb.Get(d[:])
+					if cv == nil {
+						if kept {
+							bad("image %s (%s): %s chunk %d has no chunk record", sphStr, img.MountState, e.Path, i)
+						}
+						continue
+					}
+					if kept && len(cv) >= 6 && !invHasSphPrefix(cv, sph) {
+						bad("image %s: %s chunk %d (%s) doesn't reference the image", sphStr, e.Path, i, d)
+					}
+					if checked[d] || len(cv) < 6 || !present(invDecodeLoc(cv)) {
+						continue
+					}
+					checked[d] = true
+					if _, err := readChunk(cb, d, cs.FileChunkSize(e.Size, i == len(ds)-1)); err != nil {
+						bad("image %s: %s chunk %d: %v", sphStr, e.Path, i, err)
+					}
+				}
+			}
+		}
+
+		// manifests -> images
+		mcur := mb.Cursor()
+		for k, _ := mcur.First(); k != nil; k, _ = mcur.Next() {
+			if ib.Get(k) == nil {
+				bad("manifest %s has no image record", k)
+			}
+		}
+
+		// catalog forward <-> reverse, and catalog -> images
+		fcur := cfb.Cursor()
+		for k, _ := fcur.First(); k != nil; k, _ = fcur.Next() {
+			name, h, ok := bytes.Cut(k, []byte{0})
+			if !ok || len(h) != len(daemon.Sph{}) {
+				bad("catalogf key %q is malformed", k)
+				continue
+			}
+			isph := daemon.SphFromBytes(h)
+			if bytes.HasPrefix(name, []byte(invManifestPrefix)) {
+				isph[0] ^= 1
+			}
+			rv := crb.Get(h)
+			noImage := ib.Get([]byte(isph.String())) == nil
+			switch {
+			case rv == nil && noImage:
+				// gc deleted the image and its catalogr entry but not this
+				bad("catalogf %q -> %s outlived its image and catalogr entry", name, isph.String())
+			case !bytes.Equal(rv, name):
+				bad("catalogf %q: catalogr has %q", name, rv)
+			case noImage:
+				bad("catalog entry %q -> %s has no image record", name, isph.String())
+			}
+		}
+		rcur := crb.Cursor()
+		for k, v := rcur.First(); k != nil; k, v = rcur.Next() {
+			fk := append(append(bytes.Clone(v), 0), k...)
+			if !invHas(cfb, fk) {
+				bad("catalogr %x -> %q has no catalogf entry", k, v)
+			}
+		}
+
+		if gb := tx.Bucket([]byte("gcstate")); gb != nil {
+			if k, _ := gb.Cursor().First(); k != nil {
+				bad("gcstate still has unfinished punch records")
+			}
+		}
+		return nil
+	})
+
+	for i, e := range errs {
+		if i == invMaxReports {
+			t.Errorf("invariant violated: ... %d more", len(errs)-i)
+			break
+		}
+		t.Error("invariant violated:", e)
+	}
+}
+
+// fds of this process that point into the test's temp dirs, at the devnode, or
+// at cachefiles object fds (anon inodes)
+func (tb *testBase) testFds() map[string]string {
+	out := make(map[string]string)
+	ents, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		return out
+	}
+	root := filepath.Dir(tb.basetmpdir) + "/"
+	for _, ent := range ents {
+		target, err := os.Readlink(filepath.Join("/proc/self/fd", ent.Name()))
+		if err != nil {
+			continue
+		}
+		if strings.HasPrefix(target, root) || target == devnode || strings.Contains(target, "cachefiles") {
+			out[ent.Name()] = target
+		}
+	}
+	return out
+}
+
+// checkLeaks reports mounts and fds the test left behind as errors.
+func (tb *testBase) checkLeaks() {
+	t := tb.t
+	root := filepath.Dir(tb.basetmpdir) + "/"
+	if b, err := os.ReadFile("/proc/self/mountinfo"); err == nil {
+		for _, line := range strings.Split(string(b), "\n") {
+			if f := strings.Fields(line); len(f) > 4 && strings.HasPrefix(f[4], root) {
+				t.Errorf("leak: mount left at %s (%s)", f[4], line)
+			}
+		}
+	}
+	for fd, target := range tb.testFds() {
+		if tb.startFds[fd] == target {
+			continue // was open before this test started
+		}
+		t.Errorf("leak: fd %s -> %s still open after the daemon stopped", fd, target)
+	}
+}

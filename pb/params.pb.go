@@ -257,7 +257,7 @@ const file_params_proto_rawDesc = "" +
 	"\x06params\x18\x01 \x01(\v2\x10.pb.GlobalParamsR\x06params\x12\x1b\n" +
 	"\x03msg\x18\x02 \x01(\v2\t.pb.EntryR\x03msg\x12\x15\n" +
 	"\x06key_id\x18\x03 \x03(\tR\x05keyId\x12\x1c\n" +
-	"\tsignature\x18\x04 \x03(\fR\tsignatureB\x18Z\x16github.com/dnr/styx/pbb\x06proto3"
+	"\tsignature\x18\x04 \x03(\fR\tsignatureB!Z\x1fgithub.com/PhilipTaronQ/styx/pbb\x06proto3"
 
 var (
 	file_params_proto_rawDescOnce sync.Once

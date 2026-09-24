@@ -1,11 +1,13 @@
 package tests
 
 import (
+	"flag"
 	"math/rand"
 	"testing"
+	"time"
 
-	"github.com/dnr/styx/daemon"
-	"github.com/dnr/styx/pb"
+	"github.com/PhilipTaronQ/styx/daemon"
+	"github.com/PhilipTaronQ/styx/pb"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 )
@@ -14,20 +16,27 @@ var gcUnmounted = map[pb.MountState]bool{
 	pb.MountState_Unmounted: true,
 }
 
+var gcSharedSeed = flag.Int64("gcshared.seed", 0, "seed for TestGcShared (0 picks one)")
+
 func TestGc(t *testing.T) {
 	tb := newTestBase(t)
 	tb.startAll()
 
-	mp1 := tb.mount("xpq4yhadyhazkcsggmqd7rsgvxb3kjy4-gnugrep-3.11")
-	tb.nixHash(mp1)
-	mp2 := tb.mount("qa22bifihaxyvn6q2a6w9m0nklqrk9wh-opusfile-0.12")
-	tb.nixHash(mp2)
-	mp3 := tb.mount("8vyj9c6g424mz0v3kvzkskhvzhwj6288-bash-interactive-5.2-p15-man")
-	tb.nixHash(mp3)
-	mp4 := tb.mount("xd96wmj058ky40aywv72z63vdw9yzzzb-openssl-3.0.12-man")
-	tb.nixHash(mp4)
-	mp5 := tb.mount("3a7xq2qhxw2r7naqmc53akmx7yvz0mkf-less-is-more.patch")
-	tb.nixHash(mp5)
+	sp1 := "xpq4yhadyhazkcsggmqd7rsgvxb3kjy4-gnugrep-3.11"
+	sp2 := "qa22bifihaxyvn6q2a6w9m0nklqrk9wh-opusfile-0.12"
+	sp3 := "8vyj9c6g424mz0v3kvzkskhvzhwj6288-bash-interactive-5.2-p15-man"
+	sp4 := "xd96wmj058ky40aywv72z63vdw9yzzzb-openssl-3.0.12-man"
+	sp5 := "3a7xq2qhxw2r7naqmc53akmx7yvz0mkf-less-is-more.patch"
+	mp1 := tb.mount(sp1)
+	tb.requireNarHash(mp1, sp1)
+	mp2 := tb.mount(sp2)
+	tb.requireNarHash(mp2, sp2)
+	mp3 := tb.mount(sp3)
+	tb.requireNarHash(mp3, sp3)
+	mp4 := tb.mount(sp4)
+	tb.requireNarHash(mp4, sp4)
+	mp5 := tb.mount(sp5)
+	tb.requireNarHash(mp5, sp5)
 
 	// unmount 2 and 4
 	tb.umount("qa22bifihaxyvn6q2a6w9m0nklqrk9wh")
@@ -55,15 +64,23 @@ func TestGc(t *testing.T) {
 
 	// re-read remaining ones
 	d1 := tb.debug()
-	tb.nixHash(mp1)
-	tb.nixHash(mp3)
-	tb.nixHash(mp5)
+	tb.requireNarHash(mp1, sp1)
+	tb.requireNarHash(mp3, sp3)
+	tb.requireNarHash(mp5, sp5)
 	d2 := tb.debug()
 	require.Zero(t, d2.Stats.Sub(d1.Stats).TotalReqs())
+	require.Zero(t, d2.Stats.Sub(d1.Stats).TotalErrs())
 }
 
 // randomized test
 func TestGcShared(t *testing.T) {
+	seed := *gcSharedSeed
+	if seed == 0 {
+		seed = time.Now().UnixNano()
+	}
+	t.Logf("seed %d (rerun with -gcshared.seed=%d)", seed, seed)
+	rnd := rand.New(rand.NewSource(seed))
+
 	tb := newTestBase(t)
 	tb.startAll()
 
@@ -79,23 +96,22 @@ func TestGcShared(t *testing.T) {
 	}
 	// mount all
 	mps := make([]string, len(fetch))
-	for _, j := range rand.Perm(len(mps)) {
+	for _, j := range rnd.Perm(len(mps)) {
 		mps[j] = tb.mount(fetch[j])
 	}
 	// read all (different order)
-	for _, j := range rand.Perm(len(mps)) {
-		tb.nixHash(mps[j])
+	for _, j := range rnd.Perm(len(mps)) {
+		tb.requireNarHash(mps[j], fetch[j])
 	}
 	// unmount half
-	var remaining []string
-	for i, j := range rand.Perm(len(mps)) {
+	var remaining []int
+	for i, j := range rnd.Perm(len(mps)) {
 		if i < len(mps)/2 {
 			tb.umount(fetch[j])
 		} else {
-			remaining = append(remaining, mps[j])
+			remaining = append(remaining, j)
 		}
 	}
-	mps = remaining
 
 	gc := tb.gc(daemon.GcReq{GcByState: gcUnmounted})
 	t.Log("gc:", gc)
@@ -106,10 +122,11 @@ func TestGcShared(t *testing.T) {
 
 	// re-read remaining ones
 	d1 := tb.debug()
-	for _, mp := range mps {
-		tb.nixHash(mp)
+	for _, j := range remaining {
+		tb.requireNarHash(mps[j], fetch[j])
 	}
 	d2 := tb.debug()
 	// no errors, no requests
 	require.Zero(t, d2.Stats.Sub(d1.Stats).TotalReqs())
+	require.Zero(t, d2.Stats.Sub(d1.Stats).TotalErrs())
 }

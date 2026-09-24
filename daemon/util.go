@@ -7,9 +7,9 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"github.com/dnr/styx/common/cdig"
-	"github.com/dnr/styx/erofs"
-	"github.com/dnr/styx/pb"
+	"github.com/PhilipTaronQ/styx/common/cdig"
+	"github.com/PhilipTaronQ/styx/erofs"
+	"github.com/PhilipTaronQ/styx/pb"
 )
 
 func verifyParams(p *pb.GlobalParams) error {

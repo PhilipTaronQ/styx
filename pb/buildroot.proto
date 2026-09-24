@@ -1,7 +1,7 @@
 syntax = "proto3";
 
 package pb;
-option go_package = "github.com/dnr/styx/pb";
+option go_package = "github.com/PhilipTaronQ/styx/pb";
 
 message BuildRoot {
   BuildRootMeta meta = 10;

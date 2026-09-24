@@ -12,13 +12,13 @@ import (
 	"github.com/nix-community/go-nix/pkg/narinfo/signature"
 	"github.com/spf13/cobra"
 
-	"github.com/dnr/styx/common"
-	"github.com/dnr/styx/common/client"
-	"github.com/dnr/styx/common/cobrautil"
-	"github.com/dnr/styx/common/systemd"
-	"github.com/dnr/styx/daemon"
-	"github.com/dnr/styx/manifester"
-	"github.com/dnr/styx/pb"
+	"github.com/PhilipTaronQ/styx/common"
+	"github.com/PhilipTaronQ/styx/common/client"
+	"github.com/PhilipTaronQ/styx/common/cobrautil"
+	"github.com/PhilipTaronQ/styx/common/systemd"
+	"github.com/PhilipTaronQ/styx/daemon"
+	"github.com/PhilipTaronQ/styx/manifester"
+	"github.com/PhilipTaronQ/styx/pb"
 )
 
 func withChunkStoreWrite(c *cobra.Command) cobrautil.RunEC {
@@ -44,6 +44,21 @@ func withManifestBuilder(c *cobra.Command) cobrautil.RunE {
 	pubkeys := c.Flags().StringArray("nix_pubkey",
 		[]string{"cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="},
 		"verify narinfo with this public key")
+	c.Flags().StringArrayVar(&mbcfg.AllowedUpstreams, "allowed_upstream",
+		[]string{
+			"cache.nixos.org",
+			"releases.nixos.org",
+			"channels.nixos.org",
+			"github.com",
+			// redirects are checked too: github archives and release downloads go here
+			"codeload.github.com",
+			"objects.githubusercontent.com",
+			"release-assets.githubusercontent.com",
+			"gitlab.com",
+			"bitbucket.org",
+			"codeberg.org",
+			"git.sr.ht",
+		}, "allowed upstream binary caches or tarball sources, and hosts they may redirect to")
 
 	return cobrautil.Chain(
 		withChunkStoreWrite(c),
@@ -109,17 +124,6 @@ func withManifesterConfig(c *cobra.Command) *manifester.Config {
 	var cfg manifester.Config
 
 	c.Flags().StringVar(&cfg.Bind, "bind", ":7420", "address to listen on")
-	c.Flags().StringArrayVar(&cfg.AllowedUpstreams, "allowed_upstream",
-		[]string{
-			"cache.nixos.org",
-			"releases.nixos.org",
-			"channels.nixos.org",
-			"github.com",
-			"gitlab.com",
-			"bitbucket.org",
-			"codeberg.org",
-			"git.sr.ht",
-		}, "allowed upstream binary caches or tarball sources")
 	c.Flags().IntVar(&cfg.ChunkDiffZstdLevel, "chunk_diff_zstd_level", 3, "encoder level for chunk diffs")
 	c.Flags().IntVar(&cfg.ChunkDiffParallel, "chunk_diff_parallel", 60, "parallelism for loading chunks for diff")
 
@@ -237,6 +241,15 @@ func withRepairReq(c *cobra.Command) *daemon.RepairReq {
 	return &req
 }
 
+// Waits for SIGTERM (or ctx to be done), then calls stop. The default SIGTERM action is
+// restored first, so that another SIGTERM kills the process if stop hangs.
+func stopOnSigterm(ctx context.Context, stop func()) {
+	sctx, cancel := signal.NotifyContext(ctx, syscall.SIGTERM)
+	<-sctx.Done()
+	cancel()
+	stop()
+}
+
 func main() {
 	if os.Getenv("NOTIFY_SOCKET") != "" || os.Getenv("AWS_LAMBDA_RUNTIME_API") != "" {
 		// running in systemd or on lambda
@@ -258,10 +271,7 @@ func main() {
 				if err := s.Start(); err != nil {
 					return err
 				}
-				sctx, cancel := signal.NotifyContext(ctx, syscall.SIGTERM)
-				defer cancel()
-				<-sctx.Done()
-				s.Stop(false)
+				stopOnSigterm(ctx, func() { s.Stop(false) })
 				return nil
 			},
 		),

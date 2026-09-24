@@ -1,5 +1,5 @@
 diff --git a/src/libstore/build/substitution-goal.cc b/src/libstore/build/substitution-goal.cc
-index 9027349..6f86533 100644
+index 9027349..7fb87ed 100644
 --- a/src/libstore/build/substitution-goal.cc
 +++ b/src/libstore/build/substitution-goal.cc
 @@ -6,6 +6,9 @@
@@ -29,16 +29,18 @@ index 9027349..6f86533 100644
                         maybeWaker = worker.getCrossThreadWaker(),
                         maybeWorkerStore = worker.store.weak_from_this()]() mutable {
          try {
-@@ -227,15 +231,41 @@ Goal::Co PathSubstitutionGoal::tryToRun(
+@@ -227,15 +231,43 @@ Goal::Co PathSubstitutionGoal::tryToRun(
              if (!workerStore)
                  return;
  
-+            /* Styx can provide paths from a binary cache to a local store. */
++            /* Styx can provide paths from a binary cache to a local store.
++               It can't repair a path, so repairs use regular substitution. */
 +            auto cacheSrc = sub.dynamic_pointer_cast<BinaryCacheStore>();
 +            auto localDst = std::dynamic_pointer_cast<LocalStore>(workerStore);
 +            auto sourceUri = sub->config.getReference().render(/*withParams=*/false);
-+            auto styxMode = (cacheSrc && localDst) ? canUseStyx(sourceUri, info->narSize, std::string(info->path.name()))
-+                                                   : StyxDisable;
++            auto styxMode = (cacheSrc && localDst && repair == NoRepair)
++                                ? canUseStyx(sourceUri, info->narSize, std::string(info->path.name()))
++                                : StyxDisable;
 +            auto checkSigs = sub->config.isTrusted ? NoCheckSigs : CheckSigs;
 +
              Activity act(
@@ -74,7 +76,7 @@ index 9027349..6f86533 100644
          } catch (...) {
              promise.set_exception(std::current_exception());
          }
-@@ -258,8 +288,9 @@ Goal::Co PathSubstitutionGoal::tryToRun(
+@@ -258,8 +290,9 @@ Goal::Co PathSubstitutionGoal::tryToRun(
      thr.join();
      worker.childTerminated(this);
  
@@ -85,7 +87,7 @@ index 9027349..6f86533 100644
      } catch (std::exception & e) {
          /* Cause the parent build to fail unless --fallback is given,
             or the substitute has disappeared. The latter case behaves
-@@ -281,7 +312,17 @@ Goal::Co PathSubstitutionGoal::tryToRun(
+@@ -281,7 +314,17 @@ Goal::Co PathSubstitutionGoal::tryToRun(
  
      worker.markContentsGood(storePath);
  
@@ -105,7 +107,7 @@ index 9027349..6f86533 100644
      maintainRunningSubstitutions.reset();
  
 diff --git a/src/libstore/gc.cc b/src/libstore/gc.cc
-index 8e997c8..a1ba117 100644
+index 8e997c8..9cff3bb 100644
 --- a/src/libstore/gc.cc
 +++ b/src/libstore/gc.cc
 @@ -12,6 +12,7 @@
@@ -116,21 +118,56 @@ index 8e997c8..a1ba117 100644
  
  #include "store-config-private.hh"
  
-@@ -559,6 +560,9 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
+@@ -557,6 +558,10 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
+             }
+         }
  
++        /* A styx mount is read-only, so it has to go first. */
++        if (!removeStyxMount(realPath.string(), std::string(baseName)))
++            return;
++
          printInfo("deleting '%1%'", path);
  
-+        if (isStyxMount(realPath.string()))
-+            deleteStyxMount(std::string(baseName));
-+
          results.paths.insert(path);
- 
-         uint64_t bytesFreed;
+@@ -713,6 +718,9 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
+             }
+         }
+         for (auto & path : topoSortPaths(visited)) {
++            /* Kept alive below, or referenced by a path that was. */
++            if (alive.contains(path))
++                continue;
+             if (!dead.insert(path).second)
+                 continue;
+             if (shouldDelete) {
+@@ -743,6 +751,15 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
+                     wakeup.notify_all();
+                 });
+                 try {
++                    /* Remove a styx mount before invalidating the path, so
++                       that a mount that can't be removed leaves it valid. */
++                    if (!removeStyxMount(
++                            (config->realStoreDir.get() / std::string(path.to_string())).string(),
++                            std::string(path.to_string()))) {
++                        dead.erase(path);
++                        markAlive(path);
++                        continue;
++                    }
+                     invalidatePathChecked(path);
+                     deleteFromStore(path.to_string(), true);
+                     referrersCache.erase(path);
 diff --git a/src/libstore/include/nix/store/globals.hh b/src/libstore/include/nix/store/globals.hh
-index 34eab7f..91d940a 100644
+index 34eab7f..bc42270 100644
 --- a/src/libstore/include/nix/store/globals.hh
 +++ b/src/libstore/include/nix/store/globals.hh
-@@ -421,6 +421,33 @@ public:
+@@ -9,6 +9,7 @@
+ #include "nix/store/build/derivation-builder.hh"
+ #include "nix/store/local-settings.hh"
+ #include "nix/store/store-reference.hh"
++#include "nix/store/styx.hh"
+ #include "nix/store/worker-settings.hh"
+ 
+ #include "nix/store/config.hh"
+@@ -421,6 +422,39 @@ public:
            Set it to 1 to warn on all paths.
          )"};
  
@@ -140,26 +177,32 @@ index 34eab7f..91d940a 100644
 +    Setting<uint64_t> styxMinSize{
 +        this, 64 * 1024, "styx-min-size", "Use Styx only for paths larger than this nar size."};
 +
-+    Setting<Strings> styxOndemand{
++    Setting<StyxPatterns> styxOndemand{
 +        this,
-+        Strings{},
++        StyxPatterns{},
 +        "styx-ondemand",
 +        "List of package name regexes to mount using Styx (empty means never use)"};
 +
-+    Setting<Strings> styxMaterialize{
++    Setting<StyxPatterns> styxMaterialize{
 +        this,
-+        Strings{},
++        StyxPatterns{},
 +        "styx-materialize",
 +        "List of package name regexes to materialize using Styx (empty means never use)"};
 +
-+    Setting<Strings> styxExclude{
++    Setting<StyxPatterns> styxExclude{
 +        this,
-+        Strings{},
++        StyxPatterns{},
 +        "styx-exclude",
 +        "List of package name regexes to deny using Styx (overrides styx-ondemand/materialize)"};
 +
 +    Setting<std::string> styxSockPath{
 +        this, "/var/cache/styx/styx.sock", "styx-sock-path", "Path to Styx socket."};
++
++    Setting<unsigned int> styxTimeout{
++        this,
++        300,
++        "styx-timeout",
++        "Seconds to wait for the Styx daemon to answer a request before falling back to regular substitution (0 means no limit)."};
 +
      /**
       * Get the options needed for profile directory functions.
@@ -192,15 +235,21 @@ index 3ccf0ad..7be7bb9 100644
    'worker-protocol-impl.hh',
 diff --git a/src/libstore/include/nix/store/styx.hh b/src/libstore/include/nix/store/styx.hh
 new file mode 100644
-index 0000000..0c3caf0
+index 0000000..ab7b439
 --- /dev/null
 +++ b/src/libstore/include/nix/store/styx.hh
-@@ -0,0 +1,22 @@
+@@ -0,0 +1,60 @@
 +#pragma once
 +///@file
 +
 +#include <cstdint>
++#include <regex>
 +#include <string>
++#include <vector>
++
++#include <nlohmann/json_fwd.hpp>
++
++#include "nix/util/configuration.hh"
 +
 +namespace nix {
 +
@@ -210,16 +259,48 @@ index 0000000..0c3caf0
 +    StyxMaterialize
 +} StyxMode;
 +
++/**
++ * A package name regex from a styx-* setting. It is compiled when the
++ * setting is set, so that an invalid regex is rejected there, like any
++ * other malformed setting, and matching doesn't compile it again.
++ */
++struct StyxPattern
++{
++    std::string source;
++    std::regex regex;
++};
++
++typedef std::vector<StyxPattern> StyxPatterns;
++
++void to_json(nlohmann::json & json, const StyxPattern & pattern);
++
++template<>
++struct BaseSetting<StyxPatterns>::trait
++{
++    static constexpr bool appendable = true;
++};
++
++NIX_DECLARE_CONFIG_SERIALISER(StyxPatterns)
++
++template<>
++void BaseSetting<StyxPatterns>::appendOrSet(StyxPatterns newValue, bool append);
++
 +StyxMode canUseStyx(const std::string storeUri, uint64_t narSize, std::string name);
 +void makeStyxMount(const std::string upstream, const std::string storePath, const std::string mountPoint, uint64_t narSize);
 +void makeStyxMaterialize(const std::string upstream, const std::string storePath, const std::string dest, uint64_t narSize);
 +bool isStyxMount(const std::string path);
 +void deleteStyxMount(const std::string path);
++/**
++ * Make sure there is no styx mount at `realPath`, for GC. Returns false if
++ * one is still there, and then the path must not be deleted or
++ * invalidated. Never throws, so that a failure can't abort GC.
++ */
++bool removeStyxMount(const std::string & realPath, const std::string & storePath);
 +void tryStyxGC();
 +
 +}  // namespace nix
 diff --git a/src/libstore/local-store.cc b/src/libstore/local-store.cc
-index 909f223..44ac6e3 100644
+index 909f223..b0bcbae 100644
 --- a/src/libstore/local-store.cc
 +++ b/src/libstore/local-store.cc
 @@ -17,6 +17,7 @@
@@ -230,7 +311,7 @@ index 909f223..44ac6e3 100644
  
  #include <algorithm>
  #include <cstring>
-@@ -1313,6 +1314,62 @@ StorePath LocalStore::addToStoreFromDump(
+@@ -1313,6 +1314,101 @@ StorePath LocalStore::addToStoreFromDump(
      return dstPath;
  }
  
@@ -256,7 +337,9 @@ index 909f223..44ac6e3 100644
 +        if (!isValidPathUncached(info.path)) {
 +            makeStyxMount(sourceUri, std::string(info.path.to_string()), realPath.string(), info.narSize);
 +            registerValidPath(info);
-+        }
++        } else
++            // We may have a negative cache entry for this path, so get rid of it.
++            invalidatePathInfoCacheFor(info.path);
 +
 +        outputLock.setDeletion(true);
 +    }
@@ -282,9 +365,46 @@ index 909f223..44ac6e3 100644
 +
 +        /* The path may have been created by another process in the meantime, so check again. */
 +        if (!isValidPathUncached(info.path)) {
-+            makeStyxMaterialize(sourceUri, std::string(info.path.to_string()), realPath.string(), info.narSize);
++            /* Materialize into a temporary directory and check the result
++               before moving it into place. The daemon writes into whatever
++               is at its destination, and may still be writing after we have
++               given up on it and fallen back to regular substitution. */
++            auto [tempDir, tempDirFd] = createTempDirInStore();
++            AutoDelete delTempDir(tempDir);
++            auto tempPath = tempDir / "x";
++
++            makeStyxMaterialize(sourceUri, std::string(info.path.to_string()), tempPath.string(), info.narSize);
++
++            HashSink narSink{info.narHash.algo};
++            dumpPath(tempPath, narSink);
++            auto narHash = narSink.finish();
++            if (narHash.hash != info.narHash)
++                throw Error(
++                    "hash mismatch materializing path '%s' with styx;\n  specified: %s\n  got:       %s",
++                    printStorePath(info.path),
++                    info.narHash.to_string(HashFormat::SRI, true),
++                    narHash.hash.to_string(HashFormat::SRI, true));
++            if (narHash.numBytesDigested != info.narSize)
++                throw Error(
++                    "size mismatch materializing path '%s' with styx;\n  specified: %s\n  got:       %s",
++                    printStorePath(info.path),
++                    info.narSize,
++                    narHash.numBytesDigested);
++
++            deletePath(realPath);
++            moveFile(tempPath, realPath);
++
++            canonicalisePathMetaData(realPath, {NIX_WHEN_SUPPORT_ACLS(config->getLocalSettings().ignoredAcls)});
++
++            if (config->getLocalSettings().fsyncStorePaths) {
++                recursiveSync(realPath);
++                syncParent(realPath);
++            }
++
 +            registerValidPath(info);
-+        }
++        } else
++            // We may have a negative cache entry for this path, so get rid of it.
++            invalidatePathInfoCacheFor(info.path);
 +
 +        outputLock.setDeletion(true);
 +    }
@@ -305,22 +425,52 @@ index c266f05..1456916 100644
    'uds-remote-store.cc',
    'worker-protocol-connection.cc',
    'worker-protocol.cc',
+diff --git a/src/libstore/optimise-store.cc b/src/libstore/optimise-store.cc
+index fa19b08..8c32232 100644
+--- a/src/libstore/optimise-store.cc
++++ b/src/libstore/optimise-store.cc
+@@ -4,6 +4,7 @@
+ #include "nix/store/posix-fs-canonicalise.hh"
+ #include "nix/util/source-accessor.hh"
+ #include "nix/util/file-system.hh"
++#include "nix/store/styx.hh"
+ 
+ #include <cstdlib>
+ #include <cstring>
+@@ -310,7 +311,11 @@ void LocalStore::optimiseStore(OptimiseStats & stats)
+         addTempRoot(i);
+         if (!isValidPath(i))
+             continue; /* path was GC'ed, probably */
+-        {
++        /* A styx mount is read-only and on another filesystem, and reading
++           it can fetch its whole contents. */
++        if (isStyxMount((config->realStoreDir.get() / i.to_string()).string()))
++            debug("skipping styx mount '%s'", printStorePath(i));
++        else {
+             Activity act(*logger, lvlTalkative, actUnknown, fmt("optimising path '%s'", printStorePath(i)));
+             optimisePath_(&act, stats, config->realStoreDir.get() / i.to_string(), inodeHash, NoRepair);
+         }
 diff --git a/src/libstore/styx.cc b/src/libstore/styx.cc
 new file mode 100644
-index 0000000..21c5ea7
+index 0000000..71256ca
 --- /dev/null
 +++ b/src/libstore/styx.cc
-@@ -0,0 +1,155 @@
+@@ -0,0 +1,239 @@
 +
 +#include "nix/util/error.hh"
 +#include "nix/util/file-system.hh"
 +#include "nix/store/globals.hh"
 +#include "nix/util/logging.hh"
++#include "nix/util/config-impl.hh"
++#include "nix/util/abstract-setting-to-json.hh"
 +#include "nix/store/styx.hh"
 +
++#include <algorithm>
 +#include <cerrno>
++#include <cstring>
 +#include <regex>
 +#include <map>
++#include <sys/mount.h>
 +#include <sys/stat.h>
 +#include <sys/vfs.h>
 +
@@ -349,8 +499,8 @@ index 0000000..21c5ea7
 +    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, postData.c_str());
 +    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, postData.size());
 +    // TODO: this doesn't seem to work for unix sockets?
-+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 1);
-+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 300);
++    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 1L);
++    curl_easy_setopt(curl, CURLOPT_TIMEOUT, (long) settings.styxTimeout.get());
 +
 +    std::string resData;
 +    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCallback);
@@ -359,12 +509,55 @@ index 0000000..21c5ea7
 +    CURLcode curlRes = curl_easy_perform(curl);
 +    curl_easy_cleanup(curl);
 +    if (curlRes != CURLE_OK) {
-+        throw Error("styx error: curl: %d", curlRes);
++        throw Error("styx request '%s' failed: %s", path, curl_easy_strerror(curlRes));
 +    }
 +    nlohmann::json res = nlohmann::json::parse(resData);
 +    if (!res.value("Success", false)) {
 +        throw Error(res.value("Error", "<missing>"));
 +    }
++}
++
++void to_json(nlohmann::json & json, const StyxPattern & pattern)
++{
++    json = pattern.source;
++}
++
++template<>
++StyxPatterns BaseSetting<StyxPatterns>::parse(const std::string & str) const
++{
++    StyxPatterns res;
++    for (auto & s : tokenizeString<Strings>(str)) {
++        try {
++            res.push_back({.source = s, .regex = std::regex(s)});
++        } catch (std::regex_error & e) {
++            throw UsageError("setting '%s' has invalid regex '%s': %s", name, s, e.what());
++        }
++    }
++    return res;
++}
++
++template<>
++std::string BaseSetting<StyxPatterns>::to_string() const
++{
++    Strings ss;
++    for (auto & p : value)
++        ss.push_back(p.source);
++    return concatStringsSep(" ", ss);
++}
++
++template<>
++void BaseSetting<StyxPatterns>::appendOrSet(StyxPatterns newValue, bool append)
++{
++    if (!append)
++        value.clear();
++    value.insert(value.end(), std::make_move_iterator(newValue.begin()), std::make_move_iterator(newValue.end()));
++}
++
++template class BaseSetting<StyxPatterns>;
++
++static bool matchesStyxPattern(const StyxPatterns & patterns, const std::string & name)
++{
++    return std::ranges::any_of(patterns, [&](auto & p) { return std::regex_match(name, p.regex); });
 +}
 +
 +StyxMode canUseStyx(const std::string storeUri, uint64_t narSize, std::string name) {
@@ -381,16 +574,12 @@ index 0000000..21c5ea7
 +        if (!useStyx || narSize < settings.styxMinSize)
 +            return StyxDisable;
 +    }
-+    // TODO: compile these only once
-+    for (auto & exc : settings.styxExclude.get())
-+        if (std::regex_match(name, std::regex(exc)))
-+            return StyxDisable;
-+    for (auto & inc : settings.styxOndemand.get())
-+        if (std::regex_match(name, std::regex(inc)))
-+            return StyxMount;
-+    for (auto & inc : settings.styxMaterialize.get())
-+        if (std::regex_match(name, std::regex(inc)))
-+            return StyxMaterialize;
++    if (matchesStyxPattern(settings.styxExclude.get(), name))
++        return StyxDisable;
++    if (matchesStyxPattern(settings.styxOndemand.get(), name))
++        return StyxMount;
++    if (matchesStyxPattern(settings.styxMaterialize.get(), name))
++        return StyxMaterialize;
 +    return StyxDisable;
 +}
 +
@@ -406,6 +595,11 @@ index 0000000..21c5ea7
 +        {"NarSize", narSize},
 +    };
 +    styxRequest("/mount", req);
++
++    // Check that the mount is really there before the caller registers
++    // the path as valid.
++    if (!isStyxMount(mountPoint))
++        throw Error("styx reported mounting '%s', but it is not mounted", mountPoint);
 +}
 +
 +
@@ -449,6 +643,41 @@ index 0000000..21c5ea7
 +    styxRequest("/umount", req);
 +    // note: this does not delete the mountpoint, but collectGarbage will do
 +    // that right after calling this
++}
++
++static bool stillStyxMount(const std::string & realPath)
++{
++    try {
++        return isStyxMount(realPath);
++    } catch (std::exception & e) {
++        printError("cannot check whether '%s' is a styx mount: %s", realPath, e.what());
++        return true;
++    }
++}
++
++bool removeStyxMount(const std::string & realPath, const std::string & storePath)
++{
++    if (!stillStyxMount(realPath))
++        return true;
++    try {
++        deleteStyxMount(storePath);
++    } catch (std::exception & e) {
++        warn("styx could not unmount '%s': %s", realPath, e.what());
++    }
++    if (!stillStyxMount(realPath))
++        return true;
++    // The daemon is down or has no record of this mount, so detach it
++    // ourselves, as the daemon would have. When the daemon restores its
++    // mounts, it forgets the ones whose mount point is gone.
++    if (umount2(realPath.c_str(), MNT_DETACH) == -1) {
++        printError("not deleting '%s': cannot unmount it: %s", realPath, strerror(errno));
++        return false;
++    }
++    if (stillStyxMount(realPath)) {
++        printError("not deleting '%s': it is still a styx mount", realPath);
++        return false;
++    }
++    return true;
 +}
 +
 +void tryStyxGC()

@@ -15,6 +15,17 @@ type (
 )
 
 func Start(ctx context.Context, cfg StartConfig) error {
+	// there's no default deployment to build from or copy to
+	for _, f := range []struct{ flag, val string }{
+		{"styx_repo", cfg.Args.StyxRepo.Repo},
+		{"copy_dest", cfg.Args.CopyDest},
+		{"manifest_upstream", cfg.Args.ManifestUpstream},
+	} {
+		if f.val == "" {
+			return fmt.Errorf("--%s is required", f.flag)
+		}
+	}
+
 	c, _, err := getTemporalClient(ctx, cfg.TemporalParams)
 	if err != nil {
 		return err

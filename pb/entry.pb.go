@@ -246,7 +246,7 @@ const file_entry_proto_rawDesc = "" +
 	"\aUNKNOWN\x10\x00\x12\v\n" +
 	"\aREGULAR\x10\x01\x12\r\n" +
 	"\tDIRECTORY\x10\x02\x12\v\n" +
-	"\aSYMLINK\x10\x03B\x18Z\x16github.com/dnr/styx/pbb\x06proto3"
+	"\aSYMLINK\x10\x03B!Z\x1fgithub.com/PhilipTaronQ/styx/pbb\x06proto3"
 
 var (
 	file_entry_proto_rawDescOnce sync.Once

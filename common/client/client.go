@@ -10,7 +10,7 @@ import (
 	"net/url"
 	"os"
 
-	"github.com/dnr/styx/common"
+	"github.com/PhilipTaronQ/styx/common"
 )
 
 // simple client for json requests/responses over http over unix socket
@@ -55,8 +55,14 @@ func (c *StyxClient) CallAndPrint(path string, req any) error {
 		fmt.Println("call error:", err)
 		return err
 	}
-	if status != http.StatusOK {
-		fmt.Println("status:", status)
+	if err := json.NewEncoder(os.Stdout).Encode(res); err != nil {
+		return err
 	}
-	return json.NewEncoder(os.Stdout).Encode(res)
+	if status != http.StatusOK {
+		// the daemon answers errors with a non-200 status and a Status body
+		m, _ := res.(map[string]any)
+		msg, _ := m["Error"].(string)
+		return common.NewHttpError(status, msg)
+	}
+	return nil
 }

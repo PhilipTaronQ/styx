@@ -19,7 +19,7 @@ rec {
   baseArgs = {
     pname = "styx";
     inherit version;
-    vendorHash = "sha256-bRZXwKD1TxYLAhL0gtvf88Py0pCykWFGcsMvSSOh8NA=";
+    vendorHash = "sha256-7Q4WFJfVoslJX2SVJ81DDFuEu74ilPY4NuJcfoGuOng=";
     src = pkgs.lib.sourceByRegex ./. [
       "^go\\.(mod|sum)$"
       "^(ci|cmd|common|daemon|erofs|manifester|pb|keys|tests)($|/.*)"
@@ -64,7 +64,7 @@ rec {
     consts: args:
     let
       # note: putting "-s -w" in ldflags only saves 3.6% of image size
-      ldflags = pkgs.lib.mapAttrsToList (k: v: "-X github.com/dnr/styx/${k}=${v}") consts;
+      ldflags = pkgs.lib.mapAttrsToList (k: v: "-X github.com/PhilipTaronQ/styx/${k}=${v}") consts;
     in
     buildGoModule (
       baseArgs
@@ -102,7 +102,24 @@ rec {
 
   # nixVersions.latest; bump together with patches/nix_*.patch
   patchedNix =
-    (pkgs.nixVersions.nixComponents_2_35.appendPatches [ ./patches/nix_2_35.patch ]).nix-everything;
+    ((pkgs.nixVersions.nixComponents_2_35.appendPatches [ ./patches/nix_2_35.patch ]).overrideScope
+      skipFlakyNixTests
+    ).nix-everything;
+
+  # A case in Nix's own functional tests that flakes in CI's sandbox, unrelated to the styx
+  # patch: build.sh's cancelled-builds case fails intermittently on x86_64 and aarch64 with
+  # "/cancelled-builds-fifo/fifo: No such file or directory": the fifo it passes through
+  # extra-sandbox-paths isn't visible to the builders in the sandbox. Only that block is
+  # turned off; the rest of build.sh still runs, in main/build and in ca/new-build-cmd,
+  # which sources it.
+  skipFlakyNixTests = final: prev: {
+    nix-functional-tests = prev.nix-functional-tests.overrideAttrs (old: {
+      postPatch = (old.postPatch or "") + ''
+        substituteInPlace build.sh \
+          --replace-fail 'if isDaemonNewer "2.34pre" && canUseSandbox; then' 'if false; then # skipped, see default.nix'
+      '';
+    });
+  };
 
   testdata =
     let
@@ -224,9 +241,4 @@ rec {
         mv bin opt/extensions
       '';
     };
-
-  # helper to initialize styx with "test-1" params
-  StyxInitTest1 = pkgs.writeShellScriptBin "StyxInitTest1" ''
-    styx init --params=https://styx-1.s3.amazonaws.com/params/test-1 --styx_pubkey=styx-test-1:bmMrKgN5yF3dGgOI67TZSfLts5IQHwdrOCZ7XHcaN+w=
-  '';
 }

@@ -1,2 +1,10 @@
 #!/bin/sh
-make charon && ./charon worker --temporal_params=keys/temporal-creds-charon.secret --worker --scale_group_name=charon-asg
+# Runs a light charon worker locally: bin/localworker [autoscaling group name]
+# With a group name, the worker also runs the scaler, which sets that group's
+# desired capacity to start and stop heavy workers. Without one it doesn't.
+if [ -n "$1" ]; then
+  scaler="--scale_group_name=$1"
+else
+  scaler="--scaler=false"
+fi
+make charon && ./charon worker --temporal_params=keys/temporal-creds-charon.secret --worker "$scaler"

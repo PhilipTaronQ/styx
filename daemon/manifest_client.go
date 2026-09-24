@@ -5,22 +5,23 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"path"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/DataDog/zstd"
 	"go.etcd.io/bbolt"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/dnr/styx/common"
-	"github.com/dnr/styx/common/cdig"
-	"github.com/dnr/styx/common/errgroup"
-	"github.com/dnr/styx/manifester"
-	"github.com/dnr/styx/pb"
+	"github.com/PhilipTaronQ/styx/common"
+	"github.com/PhilipTaronQ/styx/common/cdig"
+	"github.com/PhilipTaronQ/styx/common/errgroup"
+	"github.com/PhilipTaronQ/styx/common/shift"
+	"github.com/PhilipTaronQ/styx/manifester"
+	"github.com/PhilipTaronQ/styx/pb"
 )
 
 func (s *Server) getManifestAndBuildImage(ctx context.Context, req *MountReq) (*pb.Manifest, []byte, error) {
@@ -28,17 +29,6 @@ func (s *Server) getManifestAndBuildImage(ctx context.Context, req *MountReq) (*
 	sph, sphStr, spName, err := ParseSphAndName(req.StorePath)
 	if err != nil {
 		return nil, nil, err
-	}
-
-	// handle generic tarball manifests that are being substituted from our fake binary cache
-	if strings.Contains(req.Upstream, fakeCacheBind) {
-		data, err := s.getFakeCacheData(sphStr)
-		if err != nil {
-			return nil, nil, fmt.Errorf("couldn't find upstream for %s; re-run 'styx tarball'", sphStr)
-		}
-		nreq := *req
-		nreq.Upstream = data.Upstream
-		req = &nreq
 	}
 
 	// use a separate "sph" for the manifest itself (a single entry). only used if manifest is chunked.
@@ -102,6 +92,9 @@ func (s *Server) getManifestAndBuildImage(ctx context.Context, req *MountReq) (*
 		digests := cdig.FromSliceAlias(entry.Digests)
 		blocks := make([]uint16, 0, len(digests))
 		cshift := entry.ChunkShiftDef()
+		if cshift < s.blockShift || cshift > shift.MaxChunkShift {
+			return nil, nil, fmt.Errorf("chunked manifest has bad chunk shift %d", cshift)
+		}
 		blocks = common.AppendBlocksList(blocks, entry.Size, s.blockShift, cshift)
 
 		ctxForManifestChunks := withAllocateCtx(ctx, manifestSph, true)
@@ -157,18 +150,48 @@ func (s *Server) getManifestAndBuildImage(ctx context.Context, req *MountReq) (*
 	return &m, image.Bytes(), nil
 }
 
-func (s *Server) getManifestFromManifester(ctx context.Context, upstream, sph string, narSize int64) ([]byte, error) {
-	mReq := manifester.ManifestReq{
+func newManifestReq(upstream, sph string) manifester.ManifestReq {
+	return manifester.ManifestReq{
 		Upstream:      upstream,
 		StorePathHash: sph,
 		DigestAlgo:    cdig.Algo,
 		DigestBits:    int(cdig.Bits),
 		// SmallFileCutoff: s.cfg.SmallFileCutoff,
 	}
+}
+
+// manifestReqs returns the requests that look up the manifest for sph from upstream in the
+// manifest cache, and that build it. Tarball images are substituted from our fake binary
+// cache, which the manifester can't read. For those, it builds the tarball they came from
+// again, and caches the result as if it came from a binary cache at the tarball's url.
+func (s *Server) manifestReqs(upstream, sph string) (cacheReq, buildReq manifester.ManifestReq, err error) {
+	if !strings.Contains(upstream, fakeCacheBind) {
+		req := newManifestReq(upstream, sph)
+		return req, req, nil
+	}
+	data, err := s.getFakeCacheData(sph)
+	if err != nil {
+		return cacheReq, buildReq, fmt.Errorf("couldn't find upstream for %s; re-run 'styx tarball'", sph)
+	}
+	cacheReq = newManifestReq(data.Upstream, sph)
+	buildReq = manifester.ManifestReq{
+		Upstream:   data.Upstream,
+		BuildMode:  manifester.ModeGenericTarball,
+		DigestAlgo: cdig.Algo,
+		DigestBits: int(cdig.Bits),
+	}
+	return cacheReq, buildReq, nil
+}
+
+func (s *Server) getManifestFromManifester(ctx context.Context, upstream, sph string, narSize int64) ([]byte, error) {
+	cacheReq, buildReq, err := s.manifestReqs(upstream, sph)
+	if err != nil {
+		return nil, err
+	}
 
 	// check cache
 	s.stats.manifestCacheReqs.Add(1)
-	if b, err := s.p().mcread.Get(ctx, mReq.CacheKey(), nil); err == nil {
+	if b, err := s.p().mcread.Get(ctx, cacheReq.CacheKey(), nil); err == nil {
 		log.Printf("got manifest for %s from cache", sph)
 		s.stats.manifestCacheHits.Add(1)
 		return b, nil
@@ -177,14 +200,44 @@ func (s *Server) getManifestFromManifester(ctx context.Context, upstream, sph st
 	}
 
 	// not found cached, request it
+	return s.requestNewManifest(ctx, sph, buildReq, narSize)
+}
+
+// requestNewManifest asks the manifester to build the manifest for sph, without looking in the
+// manifest cache. The manifester uploads any chunks the chunk store is missing, so this is also
+// how we recover from missing chunks.
+func (s *Server) requestNewManifest(ctx context.Context, sph string, mReq manifester.ManifestReq, narSize int64) ([]byte, error) {
 	s.stats.manifestReqs.Add(1)
 	shards := s.calcShards(narSize)
 	b, err := s.getNewManifest(ctx, mReq, shards)
+	if err == nil && mReq.BuildMode == manifester.ModeGenericTarball {
+		err = checkTarballManifest(b, sph, mReq.Upstream)
+	}
 	if err != nil {
 		s.stats.manifestErrs.Add(1)
 		return nil, err
 	}
 	return b, nil
+}
+
+// checkTarballManifest checks that a manifest built from a tarball url is for sph. A tarball
+// image's store path is named for the tarball's contents, so if what's behind the url has
+// changed since 'styx tarball' was run on it, rebuilding it makes a manifest for some other
+// store path, and uploads that one's chunks instead of the image's. The signature is
+// checked where the manifest is used; this only compares it with what we asked for.
+func checkTarballManifest(envelope []byte, sph, url string) error {
+	var sm pb.SignedMessage
+	if err := proto.Unmarshal(envelope, &sm); err != nil {
+		return fmt.Errorf("tarball manifest for %s: %w", url, err)
+	}
+	storePath := strings.TrimPrefix(sm.GetMsg().GetPath(), common.ManifestContext+"/")
+	if _, got, err := ParseSph(storePath); err != nil {
+		return fmt.Errorf("tarball manifest for %s has bad store path %q: %w", url, storePath, err)
+	} else if got != sph {
+		return fmt.Errorf("the tarball at %s has changed since 'styx tarball' was run on it: it now "+
+			"builds %s, not %s, so the missing data of %s can't be recovered from it", url, storePath, sph, sph)
+	}
+	return nil
 }
 
 func (s *Server) getNewManifest(ctx context.Context, req manifester.ManifestReq, shards int) ([]byte, error) {
@@ -203,7 +256,10 @@ func (s *Server) getNewManifest(ctx context.Context, req manifester.ManifestReq,
 	log.Print(msg)
 	egCtx := errgroup.WithContext(ctx)
 
-	var shard0 []byte
+	// every shard has to succeed, and the one that finishes last caches the manifest and
+	// returns it (two may, if they finish together)
+	var manifestMu sync.Mutex
+	var manifest []byte
 	for i := range shards {
 		egCtx.Go(func() error {
 			thisReq := req
@@ -213,29 +269,32 @@ func (s *Server) getNewManifest(ctx context.Context, req manifester.ManifestReq,
 			if err != nil {
 				return err
 			}
-			res, err := common.RetryHttpRequest(egCtx, http.MethodPost, url, common.CTJson, reqBytes)
+			// no attempt timeout: building a manifest can take a while
+			maxBody := int64(zstd.CompressBound(manifester.MaxEnvelopeBytes))
+			b, hdr, err := common.RetryHttpRequestBody(egCtx, http.MethodPost, url, common.CTJson, reqBytes, maxBody, 0)
 			if err != nil {
 				return fmt.Errorf("manifester http error: %w", err)
 			}
-			defer res.Body.Close()
-			if i == 0 {
-				zr := zstd.NewReader(res.Body)
-				defer zr.Close() // frees the C decompression stream
-				if b, err := io.ReadAll(zr); err != nil {
-					return err
-				} else {
-					shard0 = b
-				}
-			} else {
-				io.Copy(io.Discard, res.Body)
+			if hdr.Get(manifester.ManifestHeader) == "" {
+				return nil // another shard caches and returns the manifest
+			}
+			b, err = common.DecompressLimit(b, manifester.MaxEnvelopeBytes)
+			if err != nil {
+				return fmt.Errorf("manifester response: %w", err)
+			}
+			manifestMu.Lock()
+			defer manifestMu.Unlock()
+			if manifest == nil {
+				manifest = b
 			}
 			return nil
 		})
 	}
 
-	err := egCtx.Wait()
-	if err != nil {
+	if err := egCtx.Wait(); err != nil {
 		return nil, err
+	} else if manifest == nil {
+		return nil, fmt.Errorf("manifester returned no manifest for %d shards", shards)
 	}
 	elapsed := time.Since(start)
 	msg = "got manifest for " + req.StorePathHash
@@ -247,7 +306,7 @@ func (s *Server) getNewManifest(ctx context.Context, req manifester.ManifestReq,
 		msg += fmt.Sprintf(" (%d shards)", shards)
 	}
 	log.Print(msg)
-	return shard0, nil
+	return manifest, nil
 }
 
 func (s *Server) calcShards(narSize int64) int {

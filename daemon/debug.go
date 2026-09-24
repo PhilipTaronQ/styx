@@ -8,9 +8,9 @@ import (
 	"go.etcd.io/bbolt"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/dnr/styx/common"
-	"github.com/dnr/styx/common/cdig"
-	"github.com/dnr/styx/pb"
+	"github.com/PhilipTaronQ/styx/common"
+	"github.com/PhilipTaronQ/styx/common/cdig"
+	"github.com/PhilipTaronQ/styx/pb"
 )
 
 func (s *Server) handleDebugReq(ctx context.Context, r *DebugReq) (*DebugResp, error) {
@@ -64,7 +64,7 @@ func (s *Server) handleDebugReq(ctx context.Context, r *DebugReq) (*DebugResp, e
 						chunkSize := cshift.FileChunkSize(ent.Size, i == len(digests)-1)
 						blocks := s.blockShift.Blocks(chunkSize)
 						tblocks += int(blocks)
-						if _, present := s.digestPresent(tx, dig); present {
+						if _, present := s.digestPresent(tx, dig, false); present {
 							ent.StatsPresentChunks++
 							ent.StatsPresentBlocks += int32(blocks)
 							pchunks += 1
@@ -145,10 +145,10 @@ func (s *Server) handleDebugReq(ctx context.Context, r *DebugReq) (*DebugResp, e
 		// chunks
 		if r.IncludeAllChunks || len(r.IncludeChunks) > 0 {
 			slabroot := tx.Bucket(slabBucket)
-			cb := tx.Bucket(chunkBucket)
 			res.Chunks = make(map[string]*DebugChunkInfo)
 
-			doChunk := func(k, v []byte) {
+			// manifest chunks are keyed with isManifestPrefix
+			doChunk := func(prefix string, k, v []byte) {
 				if len(k) < cdig.Bytes {
 					log.Println("too short chunk key in bucket", k)
 					return
@@ -161,23 +161,27 @@ func (s *Server) handleDebugReq(ctx context.Context, r *DebugReq) (*DebugResp, e
 					ci.StorePaths = append(ci.StorePaths, sph.String()+"-"+name)
 				}
 				ci.Present = slabroot.Bucket(slabKey(ci.Slab)).Get(addrKey(ci.Addr|presentMask)) != nil
-				res.Chunks[cdig.FromBytes(k).String()] = &ci
+				res.Chunks[prefix+cdig.FromBytes(k).String()] = &ci
 			}
 
-			if r.IncludeAllChunks {
-				cur := cb.Cursor()
-				for k, v := cur.First(); k != nil; k, v = cur.Next() {
-					doChunk(k, v)
+			for _, forManifest := range []bool{false, true} {
+				cb := chunkBucketFor(tx, forManifest)
+				var prefix string
+				if forManifest {
+					prefix = isManifestPrefix
 				}
-			} else {
-				for _, cstr := range r.IncludeChunks {
-					dig, err := cdig.FromBase64(cstr)
-					if err != nil {
-						log.Println("debug chunk parse error", cstr, err)
-					} else if v := cb.Get(dig[:]); v == nil {
-						log.Println("debug chunk missing", cstr)
-					} else {
-						doChunk(dig[:], v)
+				if r.IncludeAllChunks {
+					cur := cb.Cursor()
+					for k, v := cur.First(); k != nil; k, v = cur.Next() {
+						doChunk(prefix, k, v)
+					}
+				} else {
+					for _, cstr := range r.IncludeChunks {
+						if dig, err := cdig.FromBase64(cstr); err != nil {
+							log.Println("debug chunk parse error", cstr, err)
+						} else if v := cb.Get(dig[:]); v != nil {
+							doChunk(prefix, dig[:], v)
+						}
 					}
 				}
 			}
@@ -186,9 +190,11 @@ func (s *Server) handleDebugReq(ctx context.Context, r *DebugReq) (*DebugResp, e
 		// chunk sharing
 		if r.IncludeChunkSharing {
 			m := make(map[int]int)
-			cur := tx.Bucket(chunkBucket).Cursor()
-			for k, v := cur.First(); k != nil; k, v = cur.Next() {
-				m[(len(v)-6)/sphPrefixBytes]++
+			for _, forManifest := range []bool{false, true} {
+				cur := chunkBucketFor(tx, forManifest).Cursor()
+				for k, v := cur.First(); k != nil; k, v = cur.Next() {
+					m[(len(v)-6)/sphPrefixBytes]++
+				}
 			}
 			res.ChunkSharingDist = m
 		}

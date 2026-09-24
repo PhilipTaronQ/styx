@@ -137,6 +137,7 @@ func (s *Server) catalogFindBaseFromHashAndName(tx *bbolt.Tx, reqHash Sph, reqNa
 	var bestname string
 
 	// look at everything that matches up to the first dash
+	crb := tx.Bucket(catalogRBucket)
 	cur := tx.Bucket(catalogFBucket).Cursor()
 	for k, _ := cur.Seek(startb); k != nil && bytes.HasPrefix(k, startb); k, _ = cur.Next() {
 		name, hash, found := bytes.Cut(k, []byte{0})
@@ -144,7 +145,8 @@ func (s *Server) catalogFindBaseFromHashAndName(tx *bbolt.Tx, reqHash Sph, reqNa
 			continue // this is a bug
 		}
 		sph := SphFromBytes(hash)
-		if sph != reqHash && bytes.Count(name, []byte{'-'}) == numDashes {
+		// an entry with no reverse entry is stale: its image and manifest are gone
+		if sph != reqHash && bytes.Count(name, []byte{'-'}) == numDashes && crb.Get(hash) != nil {
 			// take last best instead of first since it's probably more recent
 			if match := matchLen(reqName, name); match >= bestmatch {
 				bestmatch = match

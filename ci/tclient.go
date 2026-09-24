@@ -17,9 +17,10 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
 
-	"github.com/dnr/styx/common"
+	"github.com/PhilipTaronQ/styx/common"
 )
 
+// getDataConverter returns a data converter that zstd-compresses payloads.
 func getDataConverter() converter.DataConverter {
 	return converter.NewCodecDataConverter(converter.GetDefaultDataConverter(), zstdcodec{})
 }
@@ -70,6 +71,8 @@ func getTemporalClient(ctx context.Context, paramSrc string) (client.Client, str
 	return c, namespace, err
 }
 
+// zstdcodec compresses each payload that compression shrinks, and marks it in its
+// metadata. Decode decompresses only the marked ones.
 type zstdcodec struct{}
 
 func (zstdcodec) Encode(payloads []*commonpb.Payload) ([]*commonpb.Payload, error) {
@@ -92,7 +95,7 @@ func (zstdcodec) Encode(payloads []*commonpb.Payload) ([]*commonpb.Payload, erro
 			np.Metadata = make(map[string][]byte)
 		}
 		np.Metadata["styx/cmp"] = []byte("zst")
-		payloads[i] = np
+		out[i] = np
 	}
 	return out, nil
 }
@@ -115,7 +118,7 @@ func (zstdcodec) Decode(payloads []*commonpb.Payload) ([]*commonpb.Payload, erro
 			Data:     d,
 		}
 		delete(np.Metadata, "styx/cmp")
-		payloads[i] = np
+		out[i] = np
 	}
 	return out, nil
 }

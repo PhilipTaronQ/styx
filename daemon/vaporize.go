@@ -16,12 +16,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/dnr/styx/common"
-	"github.com/dnr/styx/common/cdig"
-	"github.com/dnr/styx/common/shift"
-	"github.com/dnr/styx/erofs"
-	"github.com/dnr/styx/manifester"
-	"github.com/dnr/styx/pb"
+	"github.com/PhilipTaronQ/styx/common"
+	"github.com/PhilipTaronQ/styx/common/cdig"
+	"github.com/PhilipTaronQ/styx/common/shift"
+	"github.com/PhilipTaronQ/styx/erofs"
+	"github.com/PhilipTaronQ/styx/manifester"
+	"github.com/PhilipTaronQ/styx/pb"
 	"github.com/nix-community/go-nix/pkg/storepath"
 	"go.etcd.io/bbolt"
 	"golang.org/x/sys/unix"
@@ -46,6 +46,9 @@ func (s *Server) handleVaporizeReq(ctx context.Context, r *VaporizeReq) (*Status
 	if err != nil {
 		return nil, err
 	}
+	// No image or manifest refers to the chunks we commit until the end, so gc has to keep
+	// them by their store path until then.
+	defer s.holdForGc(sphStr)()
 	manifestSph := makeManifestSph(sph)
 	ctxForChunks := withAllocateCtx(ctx, sph, false)
 	ctxForManifestChunks := withAllocateCtx(ctx, manifestSph, true)
@@ -261,10 +264,11 @@ func (s *Server) vaporizeFile(
 
 	blocks := make([]uint16, 0, len(digests))
 	blocks = common.AppendBlocksList(blocks, size, s.blockShift, cshift)
-	locs, wasAllocated, err := s.preallocateBatch(ctx, blocks, digests)
+	locs, wasAllocated, release, err := s.preallocateBatch(ctx, blocks, digests)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 
 	present := make([]bool, len(locs))
 	s.db.View(func(tx *bbolt.Tx) error {
@@ -287,14 +291,15 @@ func (s *Server) vaporizeFile(
 		// also, if the loc was already allocated (but not present), then it's already linked
 		// to a digest. we can't take the risk of TOCTOU, so we have to read and write.
 		if !wasAllocated[i] && size == rounded && *tryClone {
-			s.stateLock.Lock()
-			cfd := s.readfdBySlab[loc.SlabId].cacheFd
-			s.stateLock.Unlock()
-			if cfd == 0 {
-				return nil, errCachefdNotFound
+			cfd, err := s.dupCacheFd(loc.SlabId)
+			if err != nil {
+				return nil, err
 			}
+			// CopyFileRange advances the offsets it's given; keep roff for the fallback below
+			coff := roff
 			woff := int64(loc.Addr) << s.blockShift
-			rsize, err := unix.CopyFileRange(int(f.Fd()), &roff, cfd, &woff, int(size), 0)
+			rsize, err := unix.CopyFileRange(int(f.Fd()), &coff, cfd, &woff, int(size), 0)
+			_ = unix.Close(cfd)
 			if err == nil && rsize != int(size) {
 				err = io.ErrShortWrite
 			}
@@ -349,58 +354,57 @@ func (s *Server) vaporizeFile(
 }
 
 // two-phase allocate to support vaporize
-// first reserve space but don't assocate with chunks
-func (s *Server) preallocateBatch(ctx context.Context, blocks []uint16, digests []cdig.CDig) ([]erofs.SlabLoc, []bool, error) {
-	_, forManifest, ok := fromAllocateCtx(ctx)
+// first reserve space but don't assocate with chunks.
+// the reserved space has no slab keys until commitPreallocated, so gc is told to leave it
+// alone until the caller calls release.
+func (s *Server) preallocateBatch(ctx context.Context, blocks []uint16, digests []cdig.CDig) (_ []erofs.SlabLoc, _ []bool, release func(), _ error) {
+	sph, forManifest, ok := fromAllocateCtx(ctx)
 	if !ok {
-		return nil, nil, errors.New("missing allocate context")
+		return nil, nil, nil, errors.New("missing allocate context")
 	}
 
 	n := len(blocks)
 	if n != len(digests) {
-		return nil, nil, errors.New("mismatched lengths")
+		return nil, nil, nil, errors.New("mismatched lengths")
 	}
 	out := make([]erofs.SlabLoc, n)
 	wasAllocated := make([]bool, n)
+	release = func() {}
 	err := s.db.Update(func(tx *bbolt.Tx) error {
-		cb, slabroot := tx.Bucket(chunkBucket), tx.Bucket(slabBucket)
-		var slabId uint16 = 0
-		if forManifest {
-			slabId = manifestSlabOffset
-		}
-		sb, err := slabroot.CreateBucketIfNotExists(slabKey(slabId))
+		cb := chunkBucketFor(tx, forManifest)
+		a, err := s.newSlabAllocator(tx.Bucket(slabBucket), firstSlab(forManifest))
 		if err != nil {
 			return err
 		}
-		// reserve some blocks for future purposes
-		seq := max(sb.Sequence(), reservedBlocks)
 
 		for i := range out {
 			digest := digests[i][:]
 			if loc := cb.Get(digest); loc == nil {
 				// allocate
-				if seq >= slabBytes>>s.blockShift {
-					slabId++
-					if sb, err = slabroot.CreateBucketIfNotExists(slabKey(slabId)); err != nil {
-						return err
-					}
-					seq = max(sb.Sequence(), reservedBlocks)
+				if out[i], _, err = a.alloc(blocks[i]); err != nil {
+					return fmt.Errorf("chunk %s: %w", digests[i], err)
 				}
-				addr := common.TruncU32(seq)
-				seq += uint64(blocks[i])
-				out[i] = erofs.SlabLoc{SlabId: slabId, Addr: addr}
 			} else {
 				out[i] = loadLoc(loc)
 				wasAllocated[i] = true
+				// tag it with our store path now, so gc keeps it while we work (see holdForGc)
+				if newLoc := appendSph(loc, sph); newLoc != nil {
+					if err := cb.Put(digest, newLoc); err != nil {
+						return err
+					}
+				}
 			}
 		}
 
-		return sb.SetSequence(seq)
+		// gc can't run until this commits, so it sees the reservation
+		release = s.reserveForGc(a.allocated())
+		return a.finish()
 	})
 	if err != nil {
-		return nil, nil, err
+		release()
+		return nil, nil, nil, err
 	}
-	return out, wasAllocated, nil
+	return out, wasAllocated, release, nil
 }
 
 // next (after caller has written/cloned), associate with chunks
@@ -413,16 +417,18 @@ func (s *Server) commitPreallocated(ctx context.Context, blocks []uint16, digest
 	if len(blocks) != len(digests) || len(blocks) != len(locs) || len(blocks) != len(wasAllocated) {
 		return errors.New("mismatched lengths")
 	}
+	// the data we copied in must be durable before we mark it present
+	synced := make(map[uint16]bool)
+	for i, loc := range locs {
+		if !wasAllocated[i] && !synced[loc.SlabId] {
+			if err := s.syncSlab(loc.SlabId); err != nil {
+				return err
+			}
+			synced[loc.SlabId] = true
+		}
+	}
 	return s.db.Update(func(tx *bbolt.Tx) error {
-		cb, slabroot := tx.Bucket(chunkBucket), tx.Bucket(slabBucket)
-		var slabId uint16 = 0
-		if forManifest {
-			slabId = manifestSlabOffset
-		}
-		sb, err := slabroot.CreateBucketIfNotExists(slabKey(slabId))
-		if err != nil {
-			return err
-		}
+		cb, slabroot := chunkBucketFor(tx, forManifest), tx.Bucket(slabBucket)
 
 		for i, loc := range locs {
 			digest := digests[i][:]
@@ -435,7 +441,11 @@ func (s *Server) commitPreallocated(ctx context.Context, blocks []uint16, digest
 				// clone or write into the space.
 				if !isAlloc {
 					// there's still no link from the digest to this space. create it, and mark
-					// it present also.
+					// it present also. the space may be in any slab preallocateBatch moved to.
+					sb := slabroot.Bucket(slabKey(loc.SlabId))
+					if sb == nil {
+						return fmt.Errorf("missing slab bucket %d", loc.SlabId)
+					}
 					if err := cb.Put(digest, locValue(loc.SlabId, loc.Addr, sph)); err != nil {
 						return err
 					} else if err = sb.Put(addrKey(loc.Addr), digest); err != nil {

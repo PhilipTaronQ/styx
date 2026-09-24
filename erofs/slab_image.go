@@ -6,8 +6,8 @@ import (
 	"errors"
 	"hash/crc32"
 
-	"github.com/dnr/styx/common"
-	"github.com/dnr/styx/common/shift"
+	"github.com/PhilipTaronQ/styx/common"
+	"github.com/PhilipTaronQ/styx/common/shift"
 	"golang.org/x/sys/unix"
 )
 

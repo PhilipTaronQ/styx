@@ -1,6 +1,6 @@
 package pb
 
-import "github.com/dnr/styx/common/shift"
+import "github.com/PhilipTaronQ/styx/common/shift"
 
 func (e *Entry) FileMode() int {
 	if e.Executable {

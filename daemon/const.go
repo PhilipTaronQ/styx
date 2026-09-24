@@ -16,7 +16,8 @@ const (
 
 var (
 	metaBucket      = []byte("meta")
-	chunkBucket     = []byte("chunk")
+	chunkBucket     = []byte("chunk")  // data chunk digest -> loc + sph prefixes
+	mchunkBucket    = []byte("mchunk") // manifest chunk digest -> loc + sph prefixes
 	slabBucket      = []byte("slab")
 	imageBucket     = []byte("image")
 	manifestBucket  = []byte("manifest")

@@ -13,12 +13,12 @@ import (
 	"github.com/spf13/cobra"
 	"google.golang.org/protobuf/encoding/protojson"
 
-	"github.com/dnr/styx/common"
-	"github.com/dnr/styx/common/cdig"
-	"github.com/dnr/styx/common/cobrautil"
-	"github.com/dnr/styx/daemon"
-	"github.com/dnr/styx/manifester"
-	"github.com/dnr/styx/pb"
+	"github.com/PhilipTaronQ/styx/common"
+	"github.com/PhilipTaronQ/styx/common/cdig"
+	"github.com/PhilipTaronQ/styx/common/cobrautil"
+	"github.com/PhilipTaronQ/styx/daemon"
+	"github.com/PhilipTaronQ/styx/manifester"
+	"github.com/PhilipTaronQ/styx/pb"
 )
 
 type (

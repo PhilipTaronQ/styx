@@ -3,7 +3,7 @@ package ci
 import (
 	"time"
 
-	"github.com/dnr/styx/manifester"
+	"github.com/PhilipTaronQ/styx/manifester"
 )
 
 const (
@@ -66,11 +66,16 @@ type (
 		FakeError     string
 		Names         []string
 		ManifestStats manifester.Stats
-		NewLastGC     int64  `json:",omitempty"`
-		GCSummary     string `json:",omitempty"`
 	}
 	buildErrDetails struct {
 		Logs string
+	}
+
+	gcReq struct{}
+	gcRes struct {
+		Time    int64  // unix seconds when GC started
+		Error   string `json:",omitempty"`
+		Summary string `json:",omitempty"`
 	}
 
 	notifyReq struct {

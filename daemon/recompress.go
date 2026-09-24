@@ -10,9 +10,9 @@ import (
 	"path"
 	"regexp"
 
-	"github.com/dnr/styx/common"
-	"github.com/dnr/styx/manifester"
-	"github.com/dnr/styx/pb"
+	"github.com/PhilipTaronQ/styx/common"
+	"github.com/PhilipTaronQ/styx/manifester"
+	"github.com/PhilipTaronQ/styx/pb"
 )
 
 var (

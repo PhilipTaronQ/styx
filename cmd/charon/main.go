@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"log/slog"
 	"time"
@@ -10,8 +9,8 @@ import (
 	axiom_slog_adapter "github.com/axiomhq/axiom-go/adapters/slog"
 	"github.com/spf13/cobra"
 
-	"github.com/dnr/styx/ci"
-	"github.com/dnr/styx/common/cobrautil"
+	"github.com/PhilipTaronQ/styx/ci"
+	"github.com/PhilipTaronQ/styx/common/cobrautil"
 )
 
 func withAxiomLogs(c *cobra.Command) cobrautil.RunEC {
@@ -62,21 +61,13 @@ func withStartConfig(c *cobra.Command) *ci.StartConfig {
 
 	c.Flags().StringVar(&cfg.TemporalParams, "temporal_params", "keys/temporal-creds-charon.secret", "source for temporal params")
 
-	// might use these:
 	c.Flags().StringVar(&cfg.Args.Channel, "nix_channel", "nixos-26.05", "nix channel to watch/build")
-	c.Flags().StringVar(&cfg.Args.StyxRepo.Branch, "styx_branch", "release", "branch of styx repo to watch/build")
-
-	// probably don't use these:
-	const bucket = "styx-1"
-	const subdir = "nixcache"
-	const region = "us-east-1"
-	const level = 9
-	defCopyDest := fmt.Sprintf("s3://%s/%s/?region=%s&compression=zstd&compression-level=%d", bucket, subdir, region, level)
-	// note missing region since it's us-east-1. also note trailing slash must be present to match cache key.
-	defUpstream := fmt.Sprintf("https://%s.s3.amazonaws.com/%s/", bucket, subdir)
-	c.Flags().StringVar(&cfg.Args.StyxRepo.Repo, "styx_repo", "https://github.com/dnr/styx/", "url of styx repo")
-	c.Flags().StringVar(&cfg.Args.CopyDest, "copy_dest", defCopyDest, "store path for copying built packages")
-	c.Flags().StringVar(&cfg.Args.ManifestUpstream, "manifest_upstream", defUpstream, "read-only url for dest store")
+	c.Flags().StringVar(&cfg.Args.StyxRepo.Branch, "styx_branch", "main", "branch of styx repo to watch/build")
+	c.Flags().StringVar(&cfg.Args.StyxRepo.Repo, "styx_repo", "", "url of styx repo, like https://github.com/<owner>/styx/ (required)")
+	c.Flags().StringVar(&cfg.Args.CopyDest, "copy_dest", "",
+		"store to copy built packages to, like s3://<bucket>/nixcache/?region=<region>&compression=zstd&compression-level=9 (required)")
+	c.Flags().StringVar(&cfg.Args.ManifestUpstream, "manifest_upstream", "",
+		"read-only url for copy_dest, like https://<bucket>.s3.amazonaws.com/nixcache/, with the trailing slash (required)")
 	c.Flags().StringVar(&cfg.Args.PublicCacheUpstream, "public_upstream", "https://cache.nixos.org/", "read-only url for public cache")
 
 	return &cfg
@@ -84,8 +75,9 @@ func withStartConfig(c *cobra.Command) *ci.StartConfig {
 
 func withGCConfig(c *cobra.Command) *ci.GCConfig {
 	var cfg ci.GCConfig
-	c.Flags().StringVar(&cfg.Bucket, "bucket", "styx-1", "s3 bucket")
+	c.Flags().StringVar(&cfg.Bucket, "bucket", "", "s3 bucket (required)")
 	c.Flags().DurationVar(&cfg.MaxAge, "max_age", 210*24*time.Hour, "gc age")
+	c.Flags().BoolVar(&cfg.DryRun, "dry_run", true, "only log what would be deleted; pass --dry_run=false to delete")
 	return &cfg
 }
 

@@ -16,7 +16,6 @@ with lib;
       enable = mkEnableOption "Styx storage manager for Nix";
       enablePatchedNix = mkEnableOption "Patched Nix for Styx";
       enableNixSettings = mkEnableOption "nix.conf settings for Styx";
-      enableStyxNixCache = mkEnableOption "binary cache for Styx and related packages";
       enableKernelOptions = mkEnableOption "required kernel config for Styx (erofs+cachefiles)";
       publicCommands = mkOption {
         default = true;
@@ -48,15 +47,6 @@ with lib;
       };
     })
 
-    (mkIf (cfg.enable || cfg.enableStyxNixCache) {
-      nix.settings = {
-        # Use binary cache to avoid rebuilds:
-        extra-substituters = [ "https://styx-1.s3.amazonaws.com/nixcache/" ];
-        extra-styx-substituters = [ "https://styx-1.s3.amazonaws.com/nixcache/" ];
-        extra-trusted-public-keys = [ "styx-nixcache-test-1:IbJB9NG5antB2WpE+aE5QzmXapT2yLQb8As/FRkbm3Q=" ];
-      };
-    })
-
     (mkIf (cfg.enable || cfg.enableKernelOptions) {
       # Need to turn on these kernel config options:
       assertions = [
@@ -82,10 +72,7 @@ with lib;
       system.nixos.tags = [ "styx" ];
 
       # expose cli
-      environment.systemPackages = [
-        cfg.package
-        styx.StyxInitTest1
-      ];
+      environment.systemPackages = [ cfg.package ];
 
       # main service
       systemd.services.styx = {
@@ -124,6 +111,9 @@ with lib;
               "--public_socket="
             ]
           );
+          # The cache directory holds the db, the slabs and the root-only socket.
+          CacheDirectory = "styx";
+          CacheDirectoryMode = "0700";
           SyslogIdentifier = "styx";
           Type = "notify";
           NotifyAccess = "all";

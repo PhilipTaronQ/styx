@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -27,13 +28,13 @@ import (
 	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/dnr/styx/common"
-	"github.com/dnr/styx/common/cdig"
-	"github.com/dnr/styx/common/shift"
-	"github.com/dnr/styx/common/systemd"
-	"github.com/dnr/styx/erofs"
-	"github.com/dnr/styx/manifester"
-	"github.com/dnr/styx/pb"
+	"github.com/PhilipTaronQ/styx/common"
+	"github.com/PhilipTaronQ/styx/common/cdig"
+	"github.com/PhilipTaronQ/styx/common/shift"
+	"github.com/PhilipTaronQ/styx/common/systemd"
+	"github.com/PhilipTaronQ/styx/erofs"
+	"github.com/PhilipTaronQ/styx/manifester"
+	"github.com/PhilipTaronQ/styx/pb"
 )
 
 const (
@@ -81,11 +82,18 @@ type (
 		// keeps track of locs that we know are present before we persist them
 		presentMap common.SimpleSyncMap[erofs.SlabLoc, struct{}]
 
+		// syncs slab data before we persist presence
+		slabSyncLock sync.Mutex
+		slabSyncers  map[uint16]*slabSyncer
+
 		// tracks reads for chunks that we should have, to detect bugs
 		readKnownMap common.SimpleSyncMap[erofs.SlabLoc, int]
 
 		// connect context for mount request to cachefiles request
 		mountCtxMap common.SimpleSyncMap[string, context.Context]
+
+		// what gc must leave alone for operations in progress
+		gcGuard gcGuard
 
 		// keeps track of pending diff/fetch state
 		// note: we open a read-only transaction inside of diffLock.
@@ -94,11 +102,17 @@ type (
 		diffMap     map[erofs.SlabLoc]reqOp
 		recentReads map[string]*recentRead
 		diffSem     *semaphore.Weighted
+		baseSem     *semaphore.Weighted // for diff ops reading bases, see startDiffOp
 
 		remanifestCache common.SimpleSyncMap[string, *remanifestCacheEntry]
 
 		shutdownChan chan struct{}
 		shutdownWait sync.WaitGroup
+		// canceled by Stop, to end work (like kernel reads) that would outlive the daemon
+		lifeCtx    context.Context
+		lifeCancel context.CancelFunc
+		// eventfd that Stop writes to wake cachefilesServer's poll, or -1
+		wakeFd int32
 	}
 
 	// fields that are only known after init
@@ -117,7 +131,8 @@ type (
 		slabId uint16
 
 		// for store images
-		imageData []byte // data from manifester to be written
+		imageData []byte        // data from manifester to be written
+		mountCtx  *mountContext // holds another reference to imageData
 	}
 
 	slabFds struct {
@@ -148,6 +163,12 @@ var errAlreadyMountedElsewhere = errors.New("already mounted on another mountpoi
 // init stuff
 
 func NewServer(cfg Config) *Server {
+	lifeCtx, lifeCancel := context.WithCancel(context.Background())
+	wakeFd, err := unix.Eventfd(0, unix.EFD_CLOEXEC|unix.EFD_NONBLOCK)
+	if err != nil {
+		log.Println("eventfd error, Stop will wait for the cachefiles poll timeout:", err)
+		wakeFd = -1 // poll ignores negative fds
+	}
 	return &Server{
 		cfg:             &cfg,
 		blockShift:      shift.Shift(cfg.ErofsBlockShift),
@@ -163,8 +184,12 @@ func NewServer(cfg Config) *Server {
 		diffMap:         make(map[erofs.SlabLoc]reqOp),
 		recentReads:     make(map[string]*recentRead),
 		diffSem:         semaphore.NewWeighted(int64(cfg.Workers)),
+		baseSem:         semaphore.NewWeighted(int64(cfg.Workers)),
 		remanifestCache: *common.NewSimpleSyncMap[string, *remanifestCacheEntry](),
 		shutdownChan:    make(chan struct{}),
+		lifeCtx:         lifeCtx,
+		lifeCancel:      lifeCancel,
+		wakeFd:          int32(wakeFd),
 	}
 }
 
@@ -189,6 +214,9 @@ func (s *Server) postInit(params *pb.DaemonParams, keys []signature.PublicKey) e
 	return nil
 }
 
+// for tests
+var renameFile = os.Rename
+
 func (s *Server) openDb() (err error) {
 	opts := bbolt.Options{
 		NoFreelistSync: true,
@@ -207,9 +235,17 @@ func (s *Server) openDb() (err error) {
 				if err := bbolt.Compact(newDb, oldDb, 4<<20); err == nil {
 					oldDb.Close()
 					newDb.Close()
-					if os.Rename(dbPath, cmpPath) == nil {
-						os.Rename(newPath, dbPath)
-						log.Println("compacted db, old file in", cmpPath)
+					if renameFile(dbPath, cmpPath) == nil {
+						if err := renameFile(newPath, dbPath); err != nil {
+							// put the old db back, or bbolt would create an empty one below
+							log.Println("compacted db rename error:", err)
+							if err := renameFile(cmpPath, dbPath); err != nil {
+								return fmt.Errorf("db compaction left no db; restore it from %s: %w", cmpPath, err)
+							}
+							_ = os.Remove(newPath)
+						} else {
+							log.Println("compacted db, old file in", cmpPath)
+						}
 					}
 				} else {
 					log.Println("bolt compact error:", err)
@@ -264,6 +300,8 @@ func (s *Server) openDb() (err error) {
 		if mb, err := tx.CreateBucketIfNotExists(metaBucket); err != nil {
 			return err
 		} else if _, err = tx.CreateBucketIfNotExists(chunkBucket); err != nil {
+			return err
+		} else if _, err = tx.CreateBucketIfNotExists(mchunkBucket); err != nil {
 			return err
 		} else if _, err = tx.CreateBucketIfNotExists(slabBucket); err != nil {
 			return err
@@ -361,6 +399,8 @@ func (s *Server) openDevNode() (int, error) {
 	return fd, nil
 }
 
+var errRestoreFailed = errors.New("cachefiles 'restore' failed")
+
 func (s *Server) setupDevNode() error {
 	fd, err := s.cfg.FdStore.GetFd(savedFdName)
 	if err == nil {
@@ -369,7 +409,7 @@ func (s *Server) setupDevNode() error {
 			unix.Close(fd)
 			// instead of trying to recover, just let systemd restart the process
 			// and next time we won't have a saved fd.
-			return fmt.Errorf("cachefiles 'restore' failed: %w", err)
+			return fmt.Errorf("%w: %w", errRestoreFailed, err)
 		}
 		s.devnode.Store(int32(fd))
 		log.Println("restored cachefiles device")
@@ -426,16 +466,17 @@ func (s *Server) startSocketServer() error {
 	mux.HandleFunc("/pprof/profile", pprof.Profile)
 	mux.HandleFunc("/pprof/symbol", pprof.Symbol)
 	mux.HandleFunc("/pprof/trace", pprof.Trace)
-	err := s.runSocketServer(filepath.Join(s.cfg.CachePath, Socket), mux)
+	// this socket can mount anything anywhere, so it's for root only
+	err := s.runSocketServer(filepath.Join(s.cfg.CachePath, Socket), mux, 0o600)
 	if err != nil {
 		return err
 	}
 
 	if s.cfg.PublicSock != "" {
 		mux := http.NewServeMux()
-		mux.HandleFunc(TarballPath, jsonmw(s.handleTarballReq))
+		mux.HandleFunc(TarballPath, jsonmw(s.handlePublicTarballReq))
 		mux.HandleFunc(DebugPath, jsonmw(s.handleDebugReq))
-		err := s.runSocketServer(s.cfg.PublicSock, mux)
+		err := s.runSocketServer(s.cfg.PublicSock, mux, 0o777)
 		if err != nil {
 			return err
 		}
@@ -444,17 +485,20 @@ func (s *Server) startSocketServer() error {
 	return nil
 }
 
-func (s *Server) runSocketServer(socketPath string, mux http.Handler) error {
+func (s *Server) runSocketServer(socketPath string, mux http.Handler, mode os.FileMode) error {
 	os.Remove(socketPath)
 	l, err := net.ListenUnix("unix", &net.UnixAddr{Net: "unix", Name: socketPath})
 	if err != nil {
 		return fmt.Errorf("failed to listen on unix socket %s: %w", socketPath, err)
 	}
-	_ = os.Chmod(socketPath, 0o777)
+	if err = os.Chmod(socketPath, mode); err != nil {
+		l.Close()
+		return fmt.Errorf("failed to chmod unix socket %s: %w", socketPath, err)
+	}
 	s.shutdownWait.Add(1)
 	go func() {
 		defer s.shutdownWait.Done()
-		srv := &http.Server{Handler: mux}
+		srv := newHttpServer(mux)
 		go srv.Serve(l)
 		<-s.shutdownChan
 		log.Printf("stopping http server")
@@ -462,6 +506,23 @@ func (s *Server) runSocketServer(socketPath string, mux http.Handler) error {
 	}()
 	return nil
 }
+
+// There's no ReadTimeout or WriteTimeout: mount, materialize and gc requests can take
+// minutes, and net/http cancels the request context once ReadTimeout passes. jsonmw
+// limits reading the body instead.
+func newHttpServer(h http.Handler) *http.Server {
+	return &http.Server{
+		Handler:           h,
+		ReadHeaderTimeout: 30 * time.Second,
+		IdleTimeout:       5 * time.Minute,
+	}
+}
+
+const (
+	// far more than the styx cli (bounded by the size of its arguments) or nix sends
+	maxRequestBytes    = 16 << 20
+	requestBodyTimeout = time.Minute
+)
 
 type errWithStatus struct {
 	error
@@ -494,9 +555,21 @@ func jsonmw[reqT, resT any](f func(context.Context, *reqT) (*resT, error)) func(
 		w.Header().Set(common.CTHdr, common.CTJson)
 		wEnc := json.NewEncoder(w)
 
+		// limit the body's size and the time to read it. the deadline is cleared once
+		// it's read, so it doesn't apply to the handler.
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
+		rc := http.NewResponseController(w)
+		_ = rc.SetReadDeadline(time.Now().Add(requestBodyTimeout))
 		var req reqT
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			w.WriteHeader(http.StatusBadRequest)
+		err := json.NewDecoder(r.Body).Decode(&req)
+		_ = rc.SetReadDeadline(time.Time{})
+		if err != nil {
+			var mbErr *http.MaxBytesError
+			if errors.As(err, &mbErr) {
+				w.WriteHeader(http.StatusRequestEntityTooLarge)
+			} else {
+				w.WriteHeader(http.StatusBadRequest)
+			}
 			wEnc.Encode(nil)
 			return
 		}
@@ -594,10 +667,22 @@ func (s *Server) handleMountReq(ctx context.Context, r *MountReq) (*Status, erro
 
 	common.NormalizeUpstream(&r.Upstream)
 
+	// Claim the mount before touching the record, so that a request rejected because
+	// another mount is in progress can't overwrite that mount's record.
+	ctx, done, err := s.startMount(ctx, sphStr)
+	if err != nil {
+		return nil, err
+	}
+	defer done()
+
+	// the record can still say mounted after the mount went away without us
+	// (unmounted by someone else, or not restored yet). then mount it again.
+	kernelMounted, _ := isErofsMount(r.MountPoint)
+
 	var haveImageSize int64
 	var haveIsBare bool
 	err = s.imageTx(sphStr, func(img *pb.DbImage) error {
-		if img.MountState == pb.MountState_Mounted {
+		if img.MountState == pb.MountState_Mounted && (kernelMounted || img.MountPoint != r.MountPoint) {
 			if img.MountPoint == r.MountPoint {
 				// nix thinks it's not mounted but it is. return success so nix can enter in db.
 				return errAlreadyMounted
@@ -625,16 +710,50 @@ func (s *Server) handleMountReq(ctx context.Context, r *MountReq) (*Status, erro
 	return nil, s.tryMount(ctx, r, haveImageSize, haveIsBare)
 }
 
-func (s *Server) tryMount(ctx context.Context, req *MountReq, haveImageSize int64, haveIsBare bool) error {
+// startMount claims the in-progress mount of sphStr and keeps gc away from it. The returned
+// context carries the mountContext that handleOpenImage reads; pass it to tryMount, and call
+// done when finished.
+func (s *Server) startMount(ctx context.Context, sphStr string) (context.Context, func(), error) {
+	ctx = withMountContext(ctx, &mountContext{})
+	if _, ok := s.mountCtxMap.GetOrPut(sphStr, ctx); ok {
+		return nil, nil, errors.New("another mount is in progress for this store path")
+	}
+	release := s.holdForGc(sphStr)
+	return ctx, func() {
+		release()
+		s.mountCtxMap.Delete(sphStr)
+	}, nil
+}
+
+// tryMount mounts req's image and records the result. ctx must come from startMount.
+func (s *Server) tryMount(ctx context.Context, req *MountReq, haveImageSize int64, haveIsBare bool) (retErr error) {
 	_, sphStr, _ := ParseSph(req.StorePath)
 
-	mountCtx := &mountContext{}
-	ctx = withMountContext(ctx, mountCtx)
-
-	if _, ok := s.mountCtxMap.GetOrPut(sphStr, ctx); ok {
-		return errors.New("another mount is in progress for this store path")
+	mountCtx, _ := fromMountCtx(ctx)
+	if mountCtx == nil {
+		return errors.New("tryMount without a mount context")
 	}
-	defer s.mountCtxMap.Delete(sphStr)
+
+	// Record the result however we return. A failure before mount(2), like a manifest the
+	// manifester can't build, must not leave the image Requested: gc keeps Requested images
+	// by default, and nothing else moves them on.
+	defer func() {
+		_ = s.imageTx(sphStr, func(img *pb.DbImage) error {
+			if retErr == nil {
+				img.MountState = pb.MountState_Mounted
+				img.LastMountError = ""
+				// if the mount succeeded then we must have written the image.
+				// record size here so we skip it next time.
+				img.ImageSize = mountCtx.imageSize
+				img.IsBare = mountCtx.isBare
+			} else {
+				img.MountState = pb.MountState_MountError
+				img.LastMountError = retErr.Error()
+				img.ImageSize = 0 // force refetch/rebuild
+			}
+			return nil
+		})
+	}()
 
 	if haveImageSize > 0 {
 		// if we have an image we can proceed right to mounting
@@ -658,7 +777,14 @@ func (s *Server) tryMount(ctx context.Context, req *MountReq, haveImageSize int6
 	var mountErr error
 	opts := fmt.Sprintf("domain_id=%s,fsid=%s", s.cfg.CacheDomain, sphStr)
 
-	if mountCtx.imageData != nil {
+	mountCtx.lock.Lock()
+	newImage := mountCtx.imageData != nil
+	mountCtx.lock.Unlock()
+	if newImage {
+		// A backing file left from an earlier image of this store path (gc'd, or failed to
+		// mount) would be reused if it has the same size, and the kernel would serve the old
+		// image. It's normally gone already; make sure.
+		s.cullImageFiles([]string{sphStr})
 		// first mount somewhere private, then unmount to force cachefiles to flush the image to disk.
 		// this is gross, there should be a better way to control cachefiles flushing.
 		firstMp := filepath.Join(s.cfg.CachePath, "initial", sphStr)
@@ -666,6 +792,10 @@ func (s *Server) tryMount(ctx context.Context, req *MountReq, haveImageSize int6
 		mountErr = unix.Mount("none", firstMp, "erofs", 0, opts)
 		_ = unix.Unmount(firstMp, 0)
 		_ = os.Remove(firstMp)
+		// the image is written now, so the real mount mustn't get another copy
+		mountCtx.lock.Lock()
+		mountCtx.imageData = nil
+		mountCtx.lock.Unlock()
 	}
 
 	if mountErr == nil {
@@ -696,22 +826,9 @@ func (s *Server) tryMount(ctx context.Context, req *MountReq, haveImageSize int6
 		}
 	}
 
-	_ = s.imageTx(sphStr, func(img *pb.DbImage) error {
-		if mountErr == nil {
-			img.MountState = pb.MountState_Mounted
-			img.LastMountError = ""
-			// if the mount succeeded then we must have written the image.
-			// record size here so we skip it next time.
-			img.ImageSize = mountCtx.imageSize
-			img.IsBare = mountCtx.isBare
-		} else {
-			img.MountState = pb.MountState_MountError
-			img.LastMountError = mountErr.Error()
-			img.ImageSize = 0 // force refetch/rebuild
-		}
-		return nil
-	})
-
+	if mountErr == nil && newImage {
+		s.syncImageFile(sphStr)
+	}
 	return mountErr
 }
 
@@ -744,6 +861,14 @@ func (s *Server) handleUmountReq(ctx context.Context, r *UmountReq) (*Status, er
 	}
 
 	umountErr := unix.Unmount(mp, unix.MNT_DETACH)
+	if umountErr == unix.EINVAL || umountErr == unix.ENOENT {
+		// Not a mount point (EINVAL) or gone (ENOENT): someone else unmounted it. If no
+		// erofs is there, the unmount we wanted has happened.
+		if mounted, err := isErofsMount(mp); err != nil || !mounted {
+			log.Printf("umount %s: %v, already unmounted", mp, umountErr)
+			umountErr = nil
+		}
+	}
 
 	if umountErr == nil {
 		_ = s.imageTx(sphStr, func(img *pb.DbImage) error {
@@ -785,20 +910,74 @@ func (s *Server) restoreMounts() {
 		return nil
 	})
 	for _, img := range toRestore {
+		if _, err := os.Lstat(img.MountPoint); errors.Is(err, os.ErrNotExist) {
+			// nix deleted the store path (e.g. GC while it wasn't mounted),
+			// so don't bring it back.
+			log.Print("restoring: ", img.StorePath, " mount point ", img.MountPoint, " is gone, marking unmounted")
+			_, sphStr, _ := ParseSph(img.StorePath)
+			_ = s.imageTx(sphStr, func(cur *pb.DbImage) error {
+				if cur.MountState != pb.MountState_Mounted || cur.MountPoint != img.MountPoint {
+					return errors.New("rollback")
+				}
+				cur.MountState = pb.MountState_Unmounted
+				cur.MountPoint = ""
+				return nil
+			})
+			continue
+		}
 		if mounted, err := isErofsMount(img.MountPoint); err == nil && mounted {
 			// log.Print("restoring: ", img.StorePath, " already mounted on ", img.MountPoint)
 			continue
 		}
-		err := s.tryMount(context.Background(), &MountReq{
-			StorePath:  img.StorePath,
-			MountPoint: img.MountPoint,
-			// the image has been written so we don't need upstream/narsize
-		}, img.ImageSize, img.IsBare)
-		if err == nil {
+		if err := s.restoreMount(img); err == nil {
 			log.Print("restoring: ", img.StorePath, " restored to ", img.MountPoint)
 		} else {
 			log.Print("restoring: ", img.StorePath, " error: ", err)
 		}
+	}
+}
+
+func (s *Server) restoreMount(img *pb.DbImage) error {
+	_, sphStr, err := ParseSph(img.StorePath)
+	if err != nil {
+		return err
+	}
+	ctx, done, err := s.startMount(context.Background(), sphStr)
+	if err != nil {
+		return err
+	}
+	defer done()
+	req := &MountReq{
+		StorePath:  img.StorePath,
+		MountPoint: img.MountPoint,
+		Upstream:   img.Upstream,
+		NarSize:    img.NarSize,
+	}
+	err = s.tryMount(ctx, req, img.ImageSize, img.IsBare)
+	if err != nil && img.Upstream != "" {
+		// ImageSize says the image was written, but its backing file can still be lost:
+		// cachefiles may cull it, or a crash may lose it before syncImageFile. Build it again.
+		log.Print("restoring: ", img.StorePath, " error: ", err, ", rebuilding image")
+		err = s.tryMount(ctx, req, 0, false)
+	}
+	return err
+}
+
+// syncImageFile makes the image just written to sphStr's backing file durable. tryMount
+// records ImageSize once mounted, and after that trusts the file to hold the image.
+// cachefiles creates a new object's file unlinked and links it into the cache when the
+// object is released, so only call this after the real mount: by then the first mount's
+// object is released, and the real mount opened the linked file. (The object's own fd
+// can't be synced.)
+func (s *Server) syncImageFile(sphStr string) {
+	p := filepath.Join(s.cfg.CachePath, fscachePath(s.cfg.CacheDomain, sphStr))
+	fd, err := unix.Open(p, unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	if err == nil {
+		err = unix.Fdatasync(fd)
+		_ = unix.Close(fd)
+	}
+	if err != nil {
+		log.Printf("sync image file for %s: %v", sphStr, err)
 	}
 }
 
@@ -814,7 +993,10 @@ func (s *Server) Start() error {
 	if err := s.setupManifestSlab(); err != nil {
 		return fmt.Errorf("error setting up manifest slab: %w", err)
 	}
-	if err := s.setupDevNode(); err != nil {
+	if err := s.setupDevNode(); errors.Is(err, errRestoreFailed) {
+		// exit so that systemd restarts us, without the saved devnode
+		return err
+	} else if err != nil {
 		log.Println("on-demand features disabled:", err)
 		// don't abort, support manifest only
 	}
@@ -824,6 +1006,8 @@ func (s *Server) Start() error {
 	if err := s.startFakeCacheServer(); err != nil {
 		return err
 	}
+	s.shutdownWait.Add(1)
+	go s.pruneFakeCacheLoop()
 	go s.pruneRecentCaches()
 	if s.ondemand() {
 		go s.cachefilesServer()
@@ -853,8 +1037,19 @@ func (s *Server) Stop(closeDevnode bool) {
 
 	// signal to cachefiles server and workers to stop
 	fd := s.devnode.Swap(0)
+	// end reads waiting on the network, and wake the cachefiles server's poll
+	s.lifeCancel()
+	if s.wakeFd >= 0 {
+		var one [8]byte
+		binary.NativeEndian.PutUint64(one[:], 1)
+		_, _ = unix.Write(int(s.wakeFd), one[:])
+	}
 	// wait for workers to stop
 	s.shutdownWait.Wait()
+	if s.wakeFd >= 0 {
+		_ = unix.Close(int(s.wakeFd))
+		s.wakeFd = -1
+	}
 	// close fds of open objects
 	s.closeAllFds()
 	// maybe close devnode too
@@ -868,35 +1063,128 @@ func (s *Server) Stop(closeDevnode bool) {
 	log.Print("daemon shutdown done")
 }
 
+// Closes the fds of open objects, and of slabs that have no object: the manifest slab,
+// the slab outside on-demand mode, and slab images mounted before the slab was opened.
 func (s *Server) closeAllFds() {
 	s.stateLock.Lock()
 	defer s.stateLock.Unlock()
-	for _, state := range s.cacheState {
-		var fds slabFds
-		switch state.tp {
-		case typeSlab, typeManifestSlab:
-			fds = s.readfdBySlab[state.slabId]
+	fds := make(map[int]struct{})
+	add := func(fd int) {
+		if fd > 0 {
+			fds[fd] = struct{}{}
 		}
-		s.closeState(state, fds)
 	}
+	var slabIds []uint16
+	for _, state := range s.cacheState {
+		add(int(state.writeFd))
+		if state.tp == typeSlab {
+			slabIds = append(slabIds, state.slabId)
+		}
+	}
+	for _, state := range s.stateBySlab {
+		add(int(state.writeFd))
+	}
+	for _, sfds := range s.readfdBySlab {
+		add(sfds.readFd)
+		add(sfds.cacheFd)
+	}
+	for fd := range fds {
+		_ = unix.Close(fd)
+	}
+	for _, id := range slabIds {
+		s.unmountSlabImage(id)
+	}
+	clear(s.cacheState)
+	clear(s.stateBySlab)
+	clear(s.readfdBySlab)
+}
+
+// Unbounded FIFO of cachefiles messages, so that queueing one never blocks.
+type msgQueue struct {
+	lock  sync.Mutex
+	msgs  [][]byte
+	ready chan struct{}
+}
+
+func newMsgQueue() *msgQueue {
+	return &msgQueue{ready: make(chan struct{}, 1)}
+}
+
+func (q *msgQueue) push(msg []byte) {
+	q.lock.Lock()
+	q.msgs = append(q.msgs, msg)
+	q.lock.Unlock()
+	select {
+	case q.ready <- struct{}{}:
+	default:
+	}
+}
+
+// Returns the next message, waiting for one if needed, or false once ctx is done.
+func (q *msgQueue) pop(ctx context.Context) ([]byte, bool) {
+	for ctx.Err() == nil {
+		q.lock.Lock()
+		if len(q.msgs) > 0 {
+			msg := q.msgs[0]
+			q.msgs[0] = nil
+			q.msgs = q.msgs[1:]
+			q.lock.Unlock()
+			return msg, true
+		}
+		q.lock.Unlock()
+		select {
+		case <-q.ready:
+		case <-ctx.Done():
+		}
+	}
+	return nil, false
+}
+
+func isReadMsg(msg []byte) bool {
+	return len(msg) >= 8 && binary.LittleEndian.Uint32(msg[4:8]) == CACHEFILES_OP_READ
 }
 
 func (s *Server) cachefilesServer() {
 	s.shutdownWait.Add(1)
 	defer s.shutdownWait.Done()
 
-	wchan := make(chan []byte)
-	for i := 0; i < s.cfg.Workers; i++ {
+	// OPEN and CLOSE are handled by one goroutine in the order we read them, so a CLOSE
+	// for an old object can't overtake the OPEN for its replacement. They never wait on
+	// the network. Each READ gets a goroutine, with at most cfg.Workers running, so reads
+	// waiting on the network hold up neither OPEN and CLOSE nor reading the devnode (the
+	// kernel lets umount(2) return once we've read its CLOSE).
+	// When stopping, messages not yet handled are dropped. The kernel keeps them, and
+	// sends them again to a daemon that restores the devnode.
+	ctl := newMsgQueue()
+	s.shutdownWait.Add(1)
+	go func() {
+		defer s.shutdownWait.Done()
+		for {
+			msg, ok := ctl.pop(s.lifeCtx)
+			if !ok {
+				return
+			}
+			s.handleMessage(msg)
+		}
+	}()
+	readSem := semaphore.NewWeighted(int64(s.cfg.Workers))
+	dispatch := func(msg []byte) {
+		if !isReadMsg(msg) {
+			ctl.push(msg)
+			return
+		}
 		s.shutdownWait.Add(1)
 		go func() {
 			defer s.shutdownWait.Done()
-			for msg := range wchan {
-				s.handleMessage(msg)
+			if readSem.Acquire(s.lifeCtx, 1) != nil {
+				return
 			}
+			defer readSem.Release(1)
+			s.handleMessage(msg)
 		}()
 	}
 
-	fds := make([]unix.PollFd, 1)
+	fds := make([]unix.PollFd, 2)
 	errors := 0
 	for {
 		if errors > 10 {
@@ -908,9 +1196,11 @@ func (s *Server) cachefilesServer() {
 			break
 		}
 		fds[0] = unix.PollFd{Fd: fd, Events: unix.POLLIN}
+		// closing the devnode doesn't interrupt the poll, so Stop writes to wakeFd
+		fds[1] = unix.PollFd{Fd: s.wakeFd, Events: unix.POLLIN}
 		timeout := 3600 * 1000
 		if s.cfg.IsTesting {
-			// use smaller timeout since we can't interrupt this poll (even by closing the fd)
+			// in case wakeFd couldn't be created
 			timeout = 500
 		}
 		n, err := unix.Poll(fds, timeout)
@@ -919,7 +1209,8 @@ func (s *Server) cachefilesServer() {
 			errors++
 			continue
 		}
-		if n != 1 {
+		if n == 0 || fds[1].Revents != 0 {
+			// timed out, or woken by Stop (which cleared devnode first)
 			continue
 		}
 		if fds[0].Revents&unix.POLLNVAL != 0 {
@@ -945,12 +1236,9 @@ func (s *Server) cachefilesServer() {
 			}
 			readAfterPoll = true
 			errors = 0
-			wchan <- buf[:n]
+			dispatch(buf[:n])
 		}
 	}
-
-	// log.Print("stopping workers")
-	close(wchan)
 }
 
 func (s *Server) handleMessage(buf []byte) (retErr error) {
@@ -1096,6 +1384,7 @@ func (s *Server) handleOpenImage(msgId, objectId, fd, flags uint32, cookie strin
 		writeFd:   fd,
 		tp:        typeImage,
 		imageData: imageData,
+		mountCtx:  mountCtx,
 	}
 	s.cacheState[objectId] = state
 	return imageSize, nil
@@ -1110,12 +1399,13 @@ func (s *Server) handleClose(msgId, objectId uint32) error {
 		log.Println("missing state for close")
 		return nil
 	}
-	if state.tp == typeSlab {
-		delete(s.stateBySlab, state.slabId)
-	}
+	// If the kernel has already opened this slab again (as it does when mountSlabImage
+	// remounts), this CLOSE is for the old object, and the new object's state and the
+	// slab image fds must stay.
+	current := state.tp == typeSlab && s.stateBySlab[state.slabId] == state
 	var fds slabFds
-	switch state.tp {
-	case typeSlab, typeManifestSlab:
+	if current {
+		delete(s.stateBySlab, state.slabId)
 		fds = s.readfdBySlab[state.slabId]
 		delete(s.readfdBySlab, state.slabId)
 	}
@@ -1124,6 +1414,9 @@ func (s *Server) handleClose(msgId, objectId uint32) error {
 
 	// do rest of cleanup outside lock
 	s.closeState(state, fds)
+	if current {
+		s.unmountSlabImage(state.slabId)
+	}
 	return nil
 }
 
@@ -1137,10 +1430,11 @@ func (s *Server) closeState(state *openFileState, slabFds slabFds) {
 	for _, fd := range fds {
 		_ = unix.Close(fd)
 	}
-	if state.tp == typeSlab {
-		mp := filepath.Join(s.cfg.CachePath, slabImagePrefix+strconv.Itoa(int(state.slabId)))
-		_ = unix.Unmount(mp, 0)
-	}
+}
+
+func (s *Server) unmountSlabImage(slabId uint16) {
+	mp := filepath.Join(s.cfg.CachePath, slabImagePrefix+strconv.Itoa(int(slabId)))
+	_ = unix.Unmount(mp, 0)
 }
 
 func (s *Server) handleRead(msgId, objectId uint32, ln, off uint64) (retErr error) {
@@ -1153,6 +1447,11 @@ func (s *Server) handleRead(msgId, objectId uint32, ln, off uint64) (retErr erro
 	}
 
 	defer func() {
+		if retErr != nil && s.lifeCtx.Err() != nil {
+			// Stopping: leave the request with the kernel. A daemon that restores the
+			// devnode gets it again, and closing the devnode fails it.
+			return
+		}
 		_, _, e1 := unix.Syscall(unix.SYS_IOCTL, uintptr(state.writeFd), CACHEFILES_IOC_READ_COMPLETE, uintptr(msgId))
 		if e1 != 0 && retErr == nil {
 			retErr = fmt.Errorf("ioctl error %d", e1)
@@ -1175,16 +1474,26 @@ func (s *Server) handleRead(msgId, objectId uint32, ln, off uint64) (retErr erro
 }
 
 func (s *Server) handleReadImage(state *openFileState, _, _ uint64) error {
-	if state.imageData == nil {
+	s.stateLock.Lock()
+	imageData := state.imageData
+	s.stateLock.Unlock()
+	if imageData == nil {
 		return errors.New("got read request when already written image")
 	}
 	// always write whole thing
 	// TODO: does this have to be page-aligned?
-	_, err := unix.Pwrite(int(state.writeFd), state.imageData, 0)
-	if err != nil {
+	if err := pwriteFull(int(state.writeFd), imageData, 0); err != nil {
 		return err
 	}
+	// the image is in the backing file now, so drop both references to it
+	s.stateLock.Lock()
 	state.imageData = nil
+	s.stateLock.Unlock()
+	if mctx := state.mountCtx; mctx != nil {
+		mctx.lock.Lock()
+		mctx.imageData = nil
+		mctx.lock.Unlock()
+	}
 	return nil
 }
 
@@ -1198,9 +1507,24 @@ func (s *Server) handleReadSlabImage(state *openFileState, ln, off uint64) error
 	defer s.chunkPool.Put(buf)
 
 	b := buf[:ln]
-	erofs.SlabImageRead(devid, slabBytes, s.blockShift, off, b)
-	_, err := unix.Pwrite(int(state.writeFd), b, int64(off))
-	return err
+	if err := erofs.SlabImageRead(devid, slabBytes, s.blockShift, off, b); err != nil {
+		return err
+	}
+	return pwriteFull(int(state.writeFd), b, int64(off))
+}
+
+// Like pwrite, but writes all of b or fails.
+func pwriteFull(fd int, b []byte, off int64) error {
+	for len(b) > 0 {
+		n, err := unix.Pwrite(fd, b, off)
+		if err != nil {
+			return err
+		} else if n <= 0 {
+			return io.ErrShortWrite
+		}
+		b, off = b[n:], off+int64(n)
+	}
+	return nil
 }
 
 func (s *Server) handleReadSlab(state *openFileState, ln, off uint64) (retErr error) {
@@ -1259,7 +1583,7 @@ func (s *Server) handleReadSlab(state *openFileState, ln, off uint64) (retErr er
 		}
 
 		// look up digest to get store paths
-		loc := tx.Bucket(chunkBucket).Get(v)
+		loc := chunkBucketFor(tx, isManifestSlab(slabId)).Get(v)
 		if loc == nil {
 			return errors.New("missing digest->loc reference")
 		}
@@ -1274,8 +1598,41 @@ func (s *Server) handleReadSlab(state *openFileState, ln, off uint64) (retErr er
 		log.Println("missing sph references for", slabId, addr, digest.String())
 	}
 
-	ctx := context.Background()
+	// The read ends at a deadline or when the daemon stops. ctx isn't canceled when this
+	// returns: requestChunk may start diff ops for other chunks too, and they use it.
+	ctx, cancel := context.WithTimeout(s.lifeCtx, slabReadTimeout)
+	_ = cancel // released at the deadline
 	return s.requestChunk(ctx, erofs.SlabLoc{SlabId: slabId, Addr: addr}, digest, sphps)
+}
+
+// Returns dups of the slabs' cache fds, for use without stateLock (a CLOSE could close
+// the originals, and the numbers be reused). The caller must close them.
+func (s *Server) dupCacheFds() map[uint16]slabFds {
+	s.stateLock.Lock()
+	defer s.stateLock.Unlock()
+	out := make(map[uint16]slabFds, len(s.readfdBySlab))
+	for id, fds := range s.readfdBySlab {
+		if fds.cacheFd > 0 {
+			if dfd, err := dupFd(fds.cacheFd); err == nil {
+				out[id] = slabFds{cacheFd: dfd}
+			}
+		}
+	}
+	return out
+}
+
+// Like dupCacheFds for one slab.
+func (s *Server) dupCacheFd(slabId uint16) (int, error) {
+	s.stateLock.Lock()
+	defer s.stateLock.Unlock()
+	if cfd := s.readfdBySlab[slabId].cacheFd; cfd > 0 {
+		return dupFd(cfd)
+	}
+	return 0, errCachefdNotFound
+}
+
+func dupFd(fd int) (int, error) {
+	return unix.FcntlInt(uintptr(fd), unix.F_DUPFD_CLOEXEC, 0)
 }
 
 func (s *Server) mountSlabImage(slabId uint16) error {
@@ -1376,6 +1733,15 @@ func (s *Server) openSlabBackingFile(slabId uint16) (int, error) {
 
 const (
 	slabBytes = 1 << 40
+
+	// How long a kernel read of a slab may wait for its chunk: the outer bound in the
+	// layers described at common.RetryBudget. A single chunk read gives up by itself within
+	// common.RetryBudget + manifester.ReadAttemptTimeout (3 minutes), and this leaves room
+	// for more, so it never cuts that short. What it does bound is everything the read waits
+	// on that has no bound of its own short of this: chunk diffs (streamed, so no attempt
+	// timeout) and remanifests (a shared request that gets remanifestTimeout, but a read
+	// stops waiting on it here). A read that hits it fails with EIO.
+	slabReadTimeout = 5 * time.Minute
 )
 
 func slabKey(id uint16) []byte {
@@ -1428,6 +1794,76 @@ func (s *Server) VerifyParams(blockShift shift.Shift) error {
 	return nil
 }
 
+// slabAllocator hands out slab space inside a write transaction. It moves on to the next slab
+// when a chunk doesn't fit in the current one, and saves each slab's sequence as it leaves it,
+// so a batch that crosses a slab boundary doesn't leave the old slab's sequence behind.
+type slabAllocator struct {
+	slabroot *bbolt.Bucket
+	sb       *bbolt.Bucket
+	slabId   uint16
+	seq      uint64
+	limit    uint64
+
+	start uint64      // sequence of the current slab when the allocator got to it
+	left  []slabRange // what it allocated in the slabs it moved on from
+}
+
+func (s *Server) newSlabAllocator(slabroot *bbolt.Bucket, slabId uint16) (*slabAllocator, error) {
+	a := &slabAllocator{slabroot: slabroot, slabId: slabId, limit: slabBytes >> s.blockShift}
+	return a, a.open()
+}
+
+func firstSlab(forManifest bool) uint16 {
+	if forManifest {
+		return manifestSlabOffset
+	}
+	return 0
+}
+
+func (a *slabAllocator) open() (err error) {
+	if a.sb, err = a.slabroot.CreateBucketIfNotExists(slabKey(a.slabId)); err != nil {
+		return err
+	}
+	// reserve some blocks for future purposes
+	a.seq = max(a.sb.Sequence(), reservedBlocks)
+	a.start = a.seq
+	return nil
+}
+
+// alloc reserves blocks and returns their location and the bucket of the slab they're in.
+func (a *slabAllocator) alloc(blocks uint16) (erofs.SlabLoc, *bbolt.Bucket, error) {
+	if blocks == 0 {
+		return erofs.SlabLoc{}, nil, errors.New("zero-block slab allocation")
+	}
+	for a.seq+uint64(blocks) > a.limit {
+		if err := a.sb.SetSequence(a.seq); err != nil {
+			return erofs.SlabLoc{}, nil, err
+		}
+		a.left = append(a.left, a.current())
+		a.slabId++
+		if err := a.open(); err != nil {
+			return erofs.SlabLoc{}, nil, err
+		}
+	}
+	loc := erofs.SlabLoc{SlabId: a.slabId, Addr: common.TruncU32(a.seq)}
+	a.seq += uint64(blocks)
+	return loc, a.sb, nil
+}
+
+// finish saves the sequence of the slab the allocator is in.
+func (a *slabAllocator) finish() error {
+	return a.sb.SetSequence(a.seq)
+}
+
+func (a *slabAllocator) current() slabRange {
+	return slabRange{a.slabId, common.TruncU32(a.start), common.TruncU32(a.seq)}
+}
+
+// allocated returns the space the allocator has handed out, one range per slab.
+func (a *slabAllocator) allocated() []slabRange {
+	return append(slices.Clip(a.left), a.current())
+}
+
 func (s *Server) AllocateBatch(ctx context.Context, blocks []uint16, digests []cdig.CDig) ([]erofs.SlabLoc, error) {
 	sph, forManifest, ok := fromAllocateCtx(ctx)
 	if !ok {
@@ -1440,37 +1876,26 @@ func (s *Server) AllocateBatch(ctx context.Context, blocks []uint16, digests []c
 	}
 	out := make([]erofs.SlabLoc, n)
 	err := s.db.Update(func(tx *bbolt.Tx) error {
-		cb, slabroot := tx.Bucket(chunkBucket), tx.Bucket(slabBucket)
-		var slabId uint16 = 0
-		if forManifest {
-			slabId = manifestSlabOffset
-		}
-		sb, err := slabroot.CreateBucketIfNotExists(slabKey(slabId))
+		cb := chunkBucketFor(tx, forManifest)
+		a, err := s.newSlabAllocator(tx.Bucket(slabBucket), firstSlab(forManifest))
 		if err != nil {
 			return err
 		}
-		// reserve some blocks for future purposes
-		seq := max(sb.Sequence(), reservedBlocks)
 
 		for i := range out {
 			digest := digests[i][:]
 			if loc := cb.Get(digest); loc == nil {
 				// allocate
-				if seq >= slabBytes>>s.blockShift {
-					slabId++
-					if sb, err = slabroot.CreateBucketIfNotExists(slabKey(slabId)); err != nil {
-						return err
-					}
-					seq = max(sb.Sequence(), reservedBlocks)
+				aloc, sb, err := a.alloc(blocks[i])
+				if err != nil {
+					return fmt.Errorf("chunk %s: %w", digests[i], err)
 				}
-				addr := common.TruncU32(seq)
-				seq += uint64(blocks[i])
-				if err := cb.Put(digest, locValue(slabId, addr, sph)); err != nil {
+				if err := cb.Put(digest, locValue(aloc.SlabId, aloc.Addr, sph)); err != nil {
 					return err
-				} else if err = sb.Put(addrKey(addr), digest); err != nil {
+				} else if err = sb.Put(addrKey(aloc.Addr), digest); err != nil {
 					return err
 				}
-				out[i] = erofs.SlabLoc{SlabId: slabId, Addr: addr}
+				out[i] = aloc
 			} else {
 				if newLoc := appendSph(loc, sph); newLoc != nil {
 					if err := cb.Put(digest, newLoc); err != nil {
@@ -1481,7 +1906,7 @@ func (s *Server) AllocateBatch(ctx context.Context, blocks []uint16, digests []c
 			}
 		}
 
-		return sb.SetSequence(seq)
+		return a.finish()
 	})
 	return common.ValOrErr(out, err)
 }
@@ -1490,10 +1915,27 @@ func (s *Server) SlabInfo(slabId uint16) (tag string, totalBlocks uint32) {
 	return slabPrefix + strconv.Itoa(int(slabId)), common.TruncU32(uint64(slabBytes) >> s.blockShift)
 }
 
+// chunkBucketFor returns the bucket that maps digests of data chunks, or of manifest chunks,
+// to their locs. They're kept apart so that a manifest chunk with the same bytes as a data
+// chunk still gets its own loc in the manifest slab, and vice versa. Manifest chunks are read
+// directly from the manifest slab file, sometimes under diffLock, while reads from data slabs
+// go through erofs, which calls back into the daemon for missing data. And erofs images can
+// only refer to data slabs.
+func chunkBucketFor(tx *bbolt.Tx, forManifest bool) *bbolt.Bucket {
+	if forManifest {
+		return tx.Bucket(mchunkBucket)
+	}
+	return tx.Bucket(chunkBucket)
+}
+
+func isManifestSlab(slabId uint16) bool {
+	return slabId >= manifestSlabOffset
+}
+
 // like AllocateBatch but only lookup
-func (s *Server) lookupLocs(tx *bbolt.Tx, digests []cdig.CDig) ([]erofs.SlabLoc, error) {
+func (s *Server) lookupLocs(tx *bbolt.Tx, digests []cdig.CDig, forManifest bool) ([]erofs.SlabLoc, error) {
 	out := make([]erofs.SlabLoc, len(digests))
-	cb := tx.Bucket(chunkBucket)
+	cb := chunkBucketFor(tx, forManifest)
 	for i := range out {
 		loc := cb.Get(digests[i][:])
 		if loc == nil {

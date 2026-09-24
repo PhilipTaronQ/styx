@@ -181,7 +181,7 @@ const file_narinfo_proto_rawDesc = "" +
 	"\n" +
 	"signatures\x18\v \x03(\tR\n" +
 	"signatures\x12\x0e\n" +
-	"\x02ca\x18\f \x01(\tR\x02caB\x18Z\x16github.com/dnr/styx/pbb\x06proto3"
+	"\x02ca\x18\f \x01(\tR\x02caB!Z\x1fgithub.com/PhilipTaronQ/styx/pbb\x06proto3"
 
 var (
 	file_narinfo_proto_rawDescOnce sync.Once

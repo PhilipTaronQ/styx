@@ -6,8 +6,8 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/dnr/styx/common/shift"
-	"github.com/dnr/styx/daemon"
+	"github.com/PhilipTaronQ/styx/common/shift"
+	"github.com/PhilipTaronQ/styx/daemon"
 )
 
 func TestRepeatedRead(t *testing.T) {

@@ -64,7 +64,7 @@ func FromBase64(s string) (dig CDig, err error) {
 	src := unsafe.Slice(unsafe.StringData(s), len(s))
 	var dst []byte
 	dst, err = base64.RawURLEncoding.AppendDecode(dig[:0:Bytes], src)
-	if err == nil && (&dst[0] != &dig[0] || len(dst) != Bytes) {
+	if err == nil && (len(dst) != Bytes || &dst[0] != &dig[0]) {
 		err = ErrInvalid
 	}
 	return
