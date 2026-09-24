@@ -60,6 +60,7 @@ type (
 		manifester service
 		daemon     *daemon.Server
 		fdstore    map[string]int
+		startFds   map[string]string // see checkLeaks
 	}
 )
 
@@ -105,6 +106,7 @@ func newTestBase(t *testing.T) *testBase {
 		upstreamUrl:  fmt.Sprintf("http://localhost:%d/", tdport),
 		fdstore:      make(map[string]int),
 	}
+	tb.startFds = tb.testFds()
 	t.Cleanup(tb.cleanup)
 	return tb
 }
@@ -124,6 +126,10 @@ func (tb *testBase) cleanup() {
 		tb.t.Log("stopping test data server")
 		tb.tdserver.Close()
 	}
+	// the daemon has closed styx.bolt and the mounts from tb.mount have been
+	// unmounted (their cleanups ran first)
+	tb.checkInvariants()
+	tb.checkLeaks()
 }
 
 // stopDaemon stops tb.daemon and clears it. If Stop doesn't return within
