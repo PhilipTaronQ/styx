@@ -568,8 +568,6 @@ func (db *dirbuilder) write(out io.Writer, bshift shift.Shift) {
 		remaining -= need
 	}
 	flush(true)
-
-	return
 }
 
 var _zeros = make([]byte, maxBlockSize)
