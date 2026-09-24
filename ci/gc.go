@@ -38,15 +38,21 @@ type (
 		s3      *s3.Client
 		bucket  string
 		age     time.Duration
-		lim     struct{ trace, chunk, list, del, batch int }
+		// Objects modified less than grace before now are never deleted.
+		grace time.Duration
+		lim   struct{ trace, chunk, list, del, batch int }
 
 		summaryMu    sync.Mutex // guards summary
-		toDelete     sync.Map
+		toDelete     sync.Map   // key -> size
 		delCount     atomic.Int64
 		delSize      atomic.Int64
 		totalCount   atomic.Int64
 		totalSize    atomic.Int64
+		recent       atomic.Int64 // unreachable but modified within grace
+		rescued      atomic.Int64 // condemned, then reached by a root written during gc
+		refreshed    atomic.Int64 // condemned, then deleted or modified before removal
 		delErrors    atomic.Int64
+		tracedRoots  sync.Map
 		traced       sync.Map
 		goodNi       sync.Map
 		goodNar      sync.Map
@@ -59,6 +65,12 @@ type (
 		MaxAge time.Duration
 	}
 )
+
+// gcGrace is how long an unreachable object is kept after it was last modified. A manifester
+// build that overlaps a GC writes its chunks and manifest before the root that keeps them, and
+// the chunk store refreshes old objects that it reuses (see manifester.RefreshAge), so the
+// objects such a build refers to are always newer than this.
+const gcGrace = 2 * manifester.RefreshAge
 
 func GCLocal(ctx context.Context, cfg GCConfig) error {
 	var sb strings.Builder
@@ -74,6 +86,7 @@ func GCLocal(ctx context.Context, cfg GCConfig) error {
 		s3:      s3,
 		bucket:  cfg.Bucket,
 		age:     cfg.MaxAge,
+		grace:   gcGrace,
 		lim: struct{ trace, chunk, list, del, batch int }{
 			trace: 10,
 			chunk: 3,
@@ -178,9 +191,15 @@ func (gc *gc) listPrefix(ctx context.Context, prefix string, f func(s3types.Obje
 	}
 }
 
+// run traces the build roots, lists the bucket, then lists the roots again and traces those
+// written since the first listing, by builds that overlap this GC: they may refer to old
+// objects that the list just condemned. Then it removes what's still unreachable.
 func (gc *gc) run(ctx context.Context) error {
 	start := time.Now()
-	if roots, err := gc.loadRoots(ctx); err != nil {
+	if gc.grace <= 0 {
+		return errors.New("gc grace window must be positive")
+	}
+	if roots, err := gc.loadRoots(ctx, true); err != nil {
 		gc.logln("gc loadRoots error:", err)
 		return err
 	} else if err := gc.trace(ctx, roots); err != nil {
@@ -188,6 +207,12 @@ func (gc *gc) run(ctx context.Context) error {
 		return err
 	} else if err := gc.list(ctx); err != nil {
 		gc.logln("gc list error:", err)
+		return err
+	} else if roots, err := gc.loadRoots(ctx, false); err != nil {
+		gc.logln("gc reload roots error:", err)
+		return err
+	} else if err := gc.trace(ctx, roots); err != nil {
+		gc.logln("gc trace new roots error:", err)
 		return err
 	} else if err := gc.remove(ctx); err != nil {
 		gc.logln("gc remove error:", err)
@@ -197,35 +222,86 @@ func (gc *gc) run(ctx context.Context) error {
 	return nil
 }
 
-func (gc *gc) del(path string, size int64) {
-	gc.toDelete.Store(path, struct{}{})
+// cutoff is the latest modification time of an object that GC may delete.
+func (gc *gc) cutoff() time.Time { return gc.now.Add(-gc.grace) }
+
+// classify reports whether the traced roots reach key, and whether key is a kind of object
+// that GC knows about.
+func (gc *gc) classify(key string) (live, known bool) {
+	has := func(m *sync.Map, k any) bool { _, ok := m.Load(k); return ok }
+	if strings.HasPrefix(key, manifester.BuildRootPath[1:]) {
+		return has(&gc.tracedRoots, path.Base(key)), true
+	} else if strings.HasPrefix(key, manifester.ManifestCachePath[1:]) {
+		return has(&gc.goodManifest, path.Base(key)), true
+	} else if key == "nixcache/nix-cache-info" {
+		return true, true
+	} else if rest, ok := strings.CutPrefix(key, "nixcache/nar/"); ok {
+		return has(&gc.goodNar, rest), true
+	} else if rest, ok := strings.CutSuffix(key, ".narinfo"); ok && strings.HasPrefix(rest, "nixcache/") {
+		return has(&gc.goodNi, strings.TrimPrefix(rest, "nixcache/")), true
+	} else if rest, ok := strings.CutPrefix(key, manifester.ChunkReadPath[1:]); ok {
+		b, err := base64.RawURLEncoding.DecodeString(rest)
+		if err != nil || len(b) != cdig.Bytes {
+			return false, false
+		}
+		return has(&gc.goodChunk, cdig.FromBytes(b)), true
+	}
+	return false, false
+}
+
+// consider condemns o if nothing reaches it and it's older than the grace window.
+func (gc *gc) consider(o s3types.Object) {
+	key, size := aws.ToString(o.Key), aws.ToInt64(o.Size)
+	gc.totalCount.Add(1)
+	gc.totalSize.Add(size)
+	live, known := gc.classify(key)
+	if !known {
+		gc.logln("unexpected file", key)
+	}
+	if live {
+		return
+	} else if o.LastModified == nil || !o.LastModified.Before(gc.cutoff()) {
+		gc.recent.Add(1)
+		return
+	}
+	gc.toDelete.Store(key, size)
 	gc.delCount.Add(1)
 	gc.delSize.Add(size)
 }
 
-func (gc *gc) loadRoots(ctx context.Context) ([]string, error) {
+func (gc *gc) logRoot(first bool, args ...any) {
+	if first {
+		gc.logln(args...)
+	}
+}
+
+// loadRoots lists build roots and returns the fresh ones that haven't been traced yet. On the
+// first call, it also condemns stale roots.
+func (gc *gc) loadRoots(ctx context.Context, first bool) ([]string, error) {
 	gc.stage("GC LOAD ROOTS")
 	var roots []string
 	err := gc.listPrefix(ctx, manifester.BuildRootPath[1:], func(o s3types.Object) error {
 		key := aws.ToString(o.Key)
-		gc.totalCount.Add(1)
-		gc.totalSize.Add(aws.ToInt64(o.Size))
 		base := path.Base(key)
 		parts := strings.Split(base, "@") // "build", time, relid, styx commit
-		keep := false
+		fresh := false
 		if len(parts) < 4 {
-			gc.logln("bad root key", base)
+			gc.logRoot(first, "bad root key", base)
 		} else if tm, err := time.Parse(time.RFC3339, parts[1]); err != nil {
-			gc.logln("bad root key", base, "time parse error", err)
+			gc.logRoot(first, "bad root key", base, "time parse error", err)
 		} else if gc.now.Sub(tm) > gc.age {
-			gc.logln("stale root", base)
+			gc.logRoot(first, "stale root", base)
 		} else {
-			log.Println("using root", base)
-			keep = true
-			roots = append(roots, base)
+			fresh = true
 		}
-		if !keep {
-			gc.del(key, aws.ToInt64(o.Size))
+		if fresh {
+			if _, loaded := gc.tracedRoots.LoadOrStore(base, true); !loaded {
+				log.Println("using root", base)
+				roots = append(roots, base)
+			}
+		}
+		if first {
+			gc.consider(o)
 		}
 		return nil
 	})
@@ -349,72 +425,18 @@ func (gc *gc) traceManifest(eg *errgroup.Group, mc string) error {
 
 func (gc *gc) list(ctx context.Context) error {
 	gc.stage("GC LIST")
+	prefixes := []string{"nixcache/", manifester.ManifestCachePath[1:]}
+	for _, pchar := range "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_" {
+		prefixes = append(prefixes, manifester.ChunkReadPath[1:]+string(pchar))
+	}
 	eg := errgroup.WithContext(ctx)
 	eg.SetLimit(cmp.Or(gc.lim.list, 5))
-	eg.Go(func() error {
-		var count, size int64
-		err := gc.listPrefix(eg, "nixcache/", func(o s3types.Object) error {
-			count++
-			key := aws.ToString(o.Key)
-			size += aws.ToInt64(o.Size)
-			if rest, ok := strings.CutPrefix(key, "nixcache/nar/"); ok {
-				if _, ok := gc.goodNar.Load(rest); !ok {
-					gc.del(key, aws.ToInt64(o.Size))
-				}
-			} else if rest, ok := strings.CutSuffix(key, ".narinfo"); ok {
-				rest = strings.TrimPrefix(rest, "nixcache/")
-				if _, ok := gc.goodNi.Load(rest); !ok {
-					gc.del(key, aws.ToInt64(o.Size))
-				}
-			} else if key == "nixcache/nix-cache-info" {
-				// leave
-			} else {
-				gc.logln("unexpected file in nix cache", key)
-				gc.del(key, aws.ToInt64(o.Size))
-			}
-			return nil
-		})
-		gc.totalCount.Add(count)
-		gc.totalSize.Add(size)
-		return err
-	})
-	eg.Go(func() error {
-		var count, size int64
-		err := gc.listPrefix(eg, manifester.ManifestCachePath[1:], func(o s3types.Object) error {
-			count++
-			key := aws.ToString(o.Key)
-			size += aws.ToInt64(o.Size)
-			if _, ok := gc.goodManifest.Load(path.Base(key)); !ok {
-				gc.del(key, aws.ToInt64(o.Size))
-			}
-			return nil
-		})
-		gc.totalCount.Add(count)
-		gc.totalSize.Add(size)
-		return err
-	})
-	for _, pchar := range "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_" {
-		pchar := pchar
+	for _, prefix := range prefixes {
 		eg.Go(func() error {
-			var count, size int64
-			err := gc.listPrefix(eg, manifester.ChunkReadPath[1:]+string(pchar), func(o s3types.Object) error {
-				count++
-				key := aws.ToString(o.Key)
-				size += aws.ToInt64(o.Size)
-				gc.totalCount.Add(1)
-				gc.totalSize.Add(aws.ToInt64(o.Size))
-				b, err := base64.RawURLEncoding.DecodeString(path.Base(key))
-				if err != nil || len(b) != cdig.Bytes {
-					gc.logln("unexpected file in chunk store", key)
-					gc.del(key, aws.ToInt64(o.Size))
-				} else if _, ok := gc.goodChunk.Load(cdig.FromBytes(b)); !ok {
-					gc.del(key, aws.ToInt64(o.Size))
-				}
+			return gc.listPrefix(eg, prefix, func(o s3types.Object) error {
+				gc.consider(o)
 				return nil
 			})
-			gc.totalCount.Add(count)
-			gc.totalSize.Add(size)
-			return err
 		})
 	}
 	return eg.Wait()
@@ -426,21 +448,30 @@ func (gc *gc) remove(ctx context.Context) error {
 	gc.logf("total : %9d objects, %14d bytes", gc.totalCount.Load(), gc.totalSize.Load())
 	gc.logf("remove: %9d objects, %14d bytes", gc.delCount.Load(), gc.delSize.Load())
 	gc.logf("keep  : %9d objects, %14d bytes", gc.totalCount.Load()-gc.delCount.Load(), gc.totalSize.Load()-gc.delSize.Load())
+	gc.logf("recent: %9d unreachable objects modified within %s", gc.recent.Load(), gc.grace)
+
+	var keys []string
+	gc.toDelete.Range(func(k, _ any) bool {
+		if live, _ := gc.classify(k.(string)); live {
+			gc.rescued.Add(1)
+		} else {
+			keys = append(keys, k.(string))
+		}
+		return true
+	})
+	slices.Sort(keys)
 
 	eg := errgroup.WithContext(ctx)
 	eg.SetLimit(cmp.Or(gc.lim.del, 20))
-	bsize := cmp.Or(gc.lim.batch, 100)
-	var batch []string
-	flush := func() {
-		if len(batch) == 0 {
-			return
-		}
-		del := makeBatchDelete(batch)
-		batch = batch[:0]
+	for batch := range slices.Chunk(keys, cmp.Or(gc.lim.batch, 100)) {
 		eg.Go(func() error {
+			batch, err := gc.recheck(eg, batch)
+			if err != nil || len(batch) == 0 {
+				return err
+			}
 			res, err := gc.s3.DeleteObjects(eg, &s3.DeleteObjectsInput{
 				Bucket: &gc.bucket,
-				Delete: del,
+				Delete: makeBatchDelete(batch),
 			})
 			if res != nil {
 				gc.delErrors.Add(int64(len(res.Errors)))
@@ -448,19 +479,55 @@ func (gc *gc) remove(ctx context.Context) error {
 			return err
 		})
 	}
-	gc.toDelete.Range(func(k, _ any) bool {
-		batch = append(batch, k.(string))
-		if len(batch) >= bsize {
-			flush()
-		}
-		return true
-	})
-	flush()
 	err := eg.Wait()
+	if n := gc.rescued.Load(); n > 0 {
+		gc.logf("kept %d objects reached by roots written during gc", n)
+	}
+	if n := gc.refreshed.Load(); n > 0 {
+		gc.logf("kept %d objects deleted or modified during gc", n)
+	}
 	if n := gc.delErrors.Load(); n > 0 {
 		gc.logf("delete errors: %d", n)
 	}
 	return err
+}
+
+// recheck returns the keys that still exist and are older than the grace window. The chunk
+// store refreshes old objects that it reuses, so this keeps objects that a build overlapping
+// this GC has started referring to since they were listed.
+func (gc *gc) recheck(ctx context.Context, keys []string) ([]string, error) {
+	del := make([]bool, len(keys))
+	eg := errgroup.WithContext(ctx)
+	eg.SetLimit(10)
+	for i, key := range keys {
+		eg.Go(func() error {
+			res, err := gc.s3.HeadObject(eg, &s3.HeadObjectInput{
+				Bucket: &gc.bucket,
+				Key:    &key,
+			})
+			if manifester.IsS3NotFound(err) {
+				gc.refreshed.Add(1)
+				return nil
+			} else if err != nil {
+				return err
+			} else if res.LastModified == nil || !res.LastModified.Before(gc.cutoff()) {
+				gc.refreshed.Add(1)
+				return nil
+			}
+			del[i] = true
+			return nil
+		})
+	}
+	if err := eg.Wait(); err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(keys))
+	for i, key := range keys {
+		if del[i] {
+			out = append(out, key)
+		}
+	}
+	return out, nil
 }
 
 func makeBatchDelete(keys []string) *s3types.Delete {

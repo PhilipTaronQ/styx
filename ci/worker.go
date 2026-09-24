@@ -780,6 +780,7 @@ func (a *heavyActivities) HeavyBuild(ctx context.Context, req *buildReq) (retBui
 		s3:      a.s3cli,
 		bucket:  a.cfg.CSWCfg.ChunkBucket,
 		age:     gcMaxAge,
+		grace:   gcGrace,
 	}
 
 	stage("WRITE ROOT")

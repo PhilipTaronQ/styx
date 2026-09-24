@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -278,6 +279,7 @@ func newTestGC(t *testing.T, f *fakeS3) (*gc, *strings.Builder) {
 		s3:      cli,
 		bucket:  "test-bucket",
 		age:     gcMaxAge,
+		grace:   gcGrace,
 	}, sb
 }
 
@@ -333,6 +335,132 @@ func testRootObj(t *testing.T, cacheKeys ...string) []byte {
 	})
 	require.NoError(t, err)
 	return b
+}
+
+// A manifester request that overlaps a GC run writes its chunks, then its manifest cache
+// entry, then its build root (manifester/build.go BuildFromNar). GC takes its snapshot of
+// build roots first and lists objects later. Here the chunk is uploaded after GC listed the
+// roots, and the manifest and root are written after GC listed manifest/, so the manifest
+// and root survive; the chunk must too, or every client that gets that manifest from the
+// cache fails to read the file.
+func TestGCKeepsObjectsWrittenDuringGC(t *testing.T) {
+	f := newFakeS3()
+	g, _ := newTestGC(t, f)
+
+	// a fresh CI root keeping one manifest and its chunk
+	keptDig := testDigest(1)
+	keptMan := testManifestKey("v1-kept")
+	f.putOld(testChunkKey(keptDig), []byte("kept chunk"))
+	f.putOld(keptMan, testManifestObj(t, keptDig))
+	f.put(testRootKey("build", g.now.Add(-time.Hour)), testRootObj(t, "v1-kept"))
+
+	// the concurrent manifester request
+	newDig := testDigest(2)
+	newMan := testManifestKey("v1-new")
+	newManData := testManifestObj(t, newDig)
+	newRoot := testRootKey("manifest", g.now.Add(time.Second))
+	newRootData := testRootObj(t, "v1-new")
+	var chunkOnce, manOnce sync.Once
+	f.afterList = func(prefix, token string) {
+		switch prefix {
+		case manifester.BuildRootPath[1:]:
+			chunkOnce.Do(func() { f.put(testChunkKey(newDig), []byte("new chunk")) })
+		case manifester.ManifestCachePath[1:]:
+			manOnce.Do(func() {
+				f.put(newMan, newManData)
+				f.put(newRoot, newRootData)
+			})
+		}
+	}
+
+	require.NoError(t, g.run(context.Background()))
+
+	require.True(t, f.has(testChunkKey(keptDig)), "chunk referenced by a fresh root was deleted")
+	require.True(t, f.has(keptMan), "manifest referenced by a fresh root was deleted")
+	require.True(t, f.has(newRoot))
+	require.True(t, f.has(newMan))
+	require.True(t, f.has(testChunkKey(newDig)),
+		"GC deleted a chunk uploaded after it started, while the manifest %s and root %s that reference it survived", newMan, newRoot)
+}
+
+// Unreachable objects are kept until they're older than the grace window.
+func TestGCKeepsRecentUnreachableObjects(t *testing.T) {
+	f := newFakeS3()
+	g, sb := newTestGC(t, f)
+	recent := testChunkKey(testDigest(1))
+	old := testChunkKey(testDigest(2))
+	f.putAt(recent, []byte("c"), g.now.Add(-gcGrace+time.Hour))
+	f.putAt(old, []byte("c"), g.now.Add(-gcGrace-time.Hour))
+
+	require.NoError(t, g.run(context.Background()))
+	t.Log(sb.String())
+	require.True(t, f.has(recent))
+	require.False(t, f.has(old))
+}
+
+// A build that overlaps GC can reuse an old cached manifest and old chunks that no root
+// reached when GC traced, and write a root for them after GC's first listing of roots.
+// GC lists the roots again before removing and keeps what the new roots reach.
+func TestGCKeepsObjectsReachedByRootsWrittenDuringGC(t *testing.T) {
+	f := newFakeS3()
+	g, sb := newTestGC(t, f)
+
+	dig := testDigest(1)
+	man := testManifestKey("v1-reused")
+	f.putOld(testChunkKey(dig), []byte("chunk"))
+	f.putOld(man, testManifestObj(t, dig))
+	root := testRootKey("manifest", g.now.Add(time.Second))
+	rootData := testRootObj(t, "v1-reused")
+	var once sync.Once
+	f.afterList = func(prefix, token string) {
+		if prefix == manifester.ManifestCachePath[1:] {
+			once.Do(func() { f.put(root, rootData) })
+		}
+	}
+
+	require.NoError(t, g.run(context.Background()))
+	t.Log(sb.String())
+	require.True(t, f.has(root))
+	require.True(t, f.has(man), "manifest reached by a root written during GC was deleted")
+	require.True(t, f.has(testChunkKey(dig)), "chunk reached by a root written during GC was deleted")
+}
+
+// A build that reuses an old chunk refreshes it (manifester.RefreshAge). If that happens
+// after GC's last listing of roots, GC can't know about the new referrer, but it rechecks
+// each object's modification time just before deleting it.
+func TestGCKeepsObjectsRefreshedDuringGC(t *testing.T) {
+	f := newFakeS3()
+	g, sb := newTestGC(t, f)
+
+	dig := testDigest(1)
+	chunk := testChunkKey(dig)
+	f.putOld(chunk, []byte("chunk"))
+	gone := testChunkKey(testDigest(2))
+	f.putOld(gone, []byte("chunk"))
+
+	man := testManifestKey("v1-new")
+	manData := testManifestObj(t, dig)
+	root := testRootKey("manifest", g.now.Add(time.Second))
+	rootData := testRootObj(t, "v1-new")
+	var rootLists atomic.Int32
+	f.afterList = func(prefix, token string) {
+		if prefix != manifester.BuildRootPath[1:] || token != "" {
+			return
+		}
+		if rootLists.Add(1) == 2 {
+			// the manifester refreshes the chunk it reuses, then writes the manifest and
+			// the root, after GC's second listing of roots
+			f.put(chunk, []byte("chunk"))
+			f.put(man, manData)
+			f.put(root, rootData)
+		}
+	}
+
+	require.NoError(t, g.run(context.Background()))
+	t.Log(sb.String())
+	require.Equal(t, int32(2), rootLists.Load())
+	require.True(t, f.has(chunk), "chunk refreshed during GC was deleted")
+	require.False(t, f.has(gone))
 }
 
 // remove() runs DeleteObjects batches concurrently and counts the per-key errors of each.
