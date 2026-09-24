@@ -18,6 +18,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 
+	"github.com/dnr/styx/common"
 	"github.com/dnr/styx/common/client"
 	"github.com/dnr/styx/daemon"
 	"github.com/dnr/styx/pb"
@@ -30,6 +31,25 @@ const (
 	// valid nixbase32, not in the test data
 	lcFakeSph = "1b9p07z77phvv2hf6gm9f28syp39f1ag"
 )
+
+// lcLargestFile returns the largest regular file under root, which should be chunked.
+func lcLargestFile(t *testing.T, root string) string {
+	var big string
+	var bigSize int64
+	require.NoError(t, filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.Type().IsRegular() {
+			if fi, err := d.Info(); err == nil && fi.Size() > bigSize {
+				big, bigSize = p, fi.Size()
+			}
+		}
+		return nil
+	}))
+	require.Greater(t, bigSize, int64(4096), "want a chunked file")
+	return big
+}
 
 // lcCall makes a request and returns the status and raw body, without asserting success.
 func (tb *testBase) lcCall(path string, req any) (int, string) {
@@ -210,20 +230,7 @@ func TestGcWhileDetachedMountInUse(t *testing.T) {
 	tb.startAll()
 
 	mp := tb.mount(lcOpusfile)
-	var big string
-	var bigSize int64
-	require.NoError(t, filepath.WalkDir(mp, func(p string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if d.Type().IsRegular() {
-			if fi, err := d.Info(); err == nil && fi.Size() > bigSize {
-				big, bigSize = p, fi.Size()
-			}
-		}
-		return nil
-	}))
-	require.Greater(t, bigSize, int64(4096), "want a chunked file")
+	big := lcLargestFile(t, mp)
 
 	f, err := os.Open(big)
 	require.NoError(t, err)
@@ -321,4 +328,106 @@ func TestGcDuringVaporize(t *testing.T) {
 	got, err := os.ReadFile(filepath.Join(dst, "big"))
 	require.NoError(t, err)
 	require.True(t, bytes.Equal(data, got), "materialized file differs from the vaporized source")
+}
+
+// Stands in for filefrag: runs it, and the first time, waits after it has the block map until
+// the test writes to the "go" fifo in dir, having signalled through the "ran" fifo.
+const lcFilefragWrapper = `#!/bin/sh
+out=$('%[1]s' "$@") || exit
+if [ ! -e '%[2]s/paused' ]; then
+	: > '%[2]s/paused'
+	echo ran > '%[2]s/ran'
+	read -r line < '%[2]s/go'
+fi
+printf '%%s\n' "$out"
+`
+
+// repairPresence compares the slab's block map from filefrag with the present records. It
+// used to run filefrag before its transaction, so a chunk written and recorded present in
+// between was missing from the map it acted on, and it deleted the chunk's present record.
+func TestRepairPresenceKeepsChunksWrittenDuringCheck(t *testing.T) {
+	tb := newTestBase(t)
+	tb.startAll()
+
+	mp := tb.mount(lcOpusfile)
+	big := lcLargestFile(t, mp)
+	rel, err := filepath.Rel(mp, big)
+	require.NoError(t, err)
+	var digs []string
+	d := tb.debug(daemon.DebugReq{IncludeImages: []string{lcOpusfileSph}, IncludeManifests: true})
+	require.Contains(t, d.Images, lcOpusfile)
+	for _, ent := range d.Images[lcOpusfile].Manifest.GetEntries() {
+		if ent.Path == "/"+rel {
+			digs = ent.DebugDigests
+		}
+	}
+	require.NotEmpty(t, digs, "chunks of %s", rel)
+	present := func() (n int) {
+		for _, c := range tb.debug(daemon.DebugReq{IncludeChunks: digs}).Chunks {
+			if c.Present {
+				n++
+			}
+		}
+		return n
+	}
+	require.Zero(t, present(), "%s was read already", rel)
+
+	dir := t.TempDir()
+	for _, f := range []string{"ran", "go"} {
+		require.NoError(t, unix.Mkfifo(filepath.Join(dir, f), 0o600))
+	}
+	wrapper := filepath.Join(dir, "filefrag")
+	require.NoError(t, os.WriteFile(wrapper, fmt.Appendf(nil, lcFilefragWrapper, common.FilefragBin, dir), 0o755))
+	realFilefrag := common.FilefragBin
+	common.FilefragBin = wrapper
+	t.Cleanup(func() { common.FilefragBin = realFilefrag })
+
+	repaired := make(chan error, 1)
+	go func() {
+		var res daemon.Status
+		c := client.NewClient(filepath.Join(tb.cachedir, "styx.sock"))
+		code, err := c.Call(daemon.RepairPath, daemon.RepairReq{Presence: true}, &res)
+		if err == nil && code != http.StatusOK {
+			err = fmt.Errorf("repair: status %d: %s", code, res.Error)
+		}
+		repaired <- err
+	}()
+	ran := make(chan error, 1)
+	go func() {
+		_, err := os.ReadFile(filepath.Join(dir, "ran"))
+		ran <- err
+	}()
+	select {
+	case err := <-ran:
+		require.NoError(t, err)
+	case err := <-repaired:
+		t.Fatalf("repair finished without running filefrag: %v", err)
+	case <-time.After(time.Minute):
+		t.Fatal("repair never ran filefrag")
+	}
+
+	// fetch the file's chunks after filefrag has run, and give their present records time to
+	// be committed (they can't be while repair holds its transaction)
+	_, err = os.ReadFile(big)
+	require.NoError(t, err)
+	for deadline := time.Now().Add(2 * time.Second); present() < len(digs) && time.Now().Before(deadline); {
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Logf("%d of %d chunks recorded present while repair ran", present(), len(digs))
+
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "go"), []byte("\n"), 0))
+	select {
+	case err := <-repaired:
+		require.NoError(t, err)
+	case <-time.After(time.Minute):
+		t.Fatal("repair didn't finish")
+	}
+
+	var n int
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
+		if n = present(); n == len(digs) {
+			break
+		}
+	}
+	require.Equal(t, len(digs), n, "repair dropped the present records of chunks written while it ran")
 }
