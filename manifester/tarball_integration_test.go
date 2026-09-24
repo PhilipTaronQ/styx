@@ -9,6 +9,7 @@ import (
 	"os"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/dnr/styx/common"
 	"github.com/stretchr/testify/assert"
@@ -71,8 +72,9 @@ func TestBuildFromTarball(t *testing.T) {
 }
 
 type mockChunkStore struct {
-	lock sync.Mutex
-	data map[string][]byte
+	lock    sync.Mutex
+	data    map[string][]byte
+	markers map[string]time.Time
 }
 
 func (m *mockChunkStore) PutIfNotExists(ctx context.Context, ns string, key string, data []byte) ([]byte, error) {
@@ -92,11 +94,21 @@ func (m *mockChunkStore) PutIfNotExists(ctx context.Context, ns string, key stri
 	return z.Compress(nil, data)
 }
 
-func (m *mockChunkStore) Has(ctx context.Context, ns string, key string) (bool, error) {
+func (m *mockChunkStore) PutShardMarker(ctx context.Context, key string) error {
 	m.lock.Lock()
 	defer m.lock.Unlock()
-	_, ok := m.data[ns+"/"+key]
-	return ok, nil
+	if m.markers == nil {
+		m.markers = make(map[string]time.Time)
+	}
+	m.markers[key] = time.Now()
+	return nil
+}
+
+func (m *mockChunkStore) ShardMarkerTime(ctx context.Context, key string) (time.Time, bool, error) {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+	t, ok := m.markers[key]
+	return t, ok, nil
 }
 
 func (m *mockChunkStore) Get(ctx context.Context, ns string, key string, dst []byte) ([]byte, error) {

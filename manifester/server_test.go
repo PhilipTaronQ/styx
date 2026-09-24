@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -13,12 +14,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/DataDog/zstd"
+	"github.com/nix-community/go-nix/pkg/narinfo/signature"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/dnr/styx/common"
 	"github.com/dnr/styx/common/cdig"
+	"github.com/dnr/styx/common/shift"
 	"github.com/dnr/styx/pb"
 )
 
@@ -239,82 +243,202 @@ func TestConfigZeroValues(t *testing.T) {
 	assert.Zero(t, up.requestCount())
 }
 
-// An unauthenticated caller can send only shard 0 of N. Shard 0 used to write the manifest to
-// the shared cache after uploading only its own 1/N of the chunks. Clients then got the
-// cached manifest and 404 on the rest (and remanifesting hit the same cache entry). The same
-// happened when one of the daemon's own shard requests failed.
-func TestShardZeroAloneCachesManifestWithMissingChunks(t *testing.T) {
+// shardEnv runs sharded manifest requests for one store path against manifesters that share
+// a chunk store.
+type shardEnv struct {
+	t        *testing.T
+	pk       signature.PublicKey
+	cs       *mockChunkStore
+	up       *fakeUpstream
+	sph      string
+	cacheKey string
+	srv      *server
+}
+
+func newShardEnv(t *testing.T, seed string) *shardEnv {
 	sk, pk := upstreamKeys(t)
-	up := newFakeUpstream(t)
-	sph := up.addPath(t, sk, "shard", []narFile{{"/big", 4<<16 + 1000}}, narinfoOpts{})
-
-	cs := &mockChunkStore{data: make(map[string][]byte)}
-	mb := newTestBuilder(t, cs, pk, 0)
-	srv, err := NewManifestServer(Config{AllowedUpstreams: []string{up.host()}, ChunkDiffParallel: 4}, mb)
-	require.NoError(t, err)
-
-	request := func(total, index int) *httptest.ResponseRecorder {
-		body, err := json.Marshal(ManifestReq{
-			Upstream:      up.url(),
-			StorePathHash: sph,
-			DigestAlgo:    cdig.Algo,
-			DigestBits:    int(cdig.Bits),
-			ShardTotal:    total,
-			ShardIndex:    index,
-		})
-		require.NoError(t, err)
-		rec := httptest.NewRecorder()
-		srv.handleManifest(rec, httptest.NewRequest(http.MethodPost, ManifestPath, bytes.NewReader(body)))
-		return rec
-	}
-
-	cacheKey := (&ManifestReq{
-		Upstream:      up.url(),
-		StorePathHash: sph,
+	e := &shardEnv{t: t, pk: pk, cs: &mockChunkStore{data: make(map[string][]byte)}, up: newFakeUpstream(t)}
+	// 5 chunks, so every one of 4 shards uploads at least one
+	e.sph = e.up.addPath(t, sk, seed, []narFile{{"/big", 4<<16 + 1000}}, narinfoOpts{})
+	e.cacheKey = (&ManifestReq{
+		Upstream:      e.up.url(),
+		StorePathHash: e.sph,
 		DigestAlgo:    cdig.Algo,
 		DigestBits:    int(cdig.Bits),
 	}).CacheKey()
-	checkCache := func() bool {
-		if !storeHas(cs, ManifestCachePath, cacheKey) {
-			return false
-		}
-		m := cachedManifest(t, cs, cacheKey)
-		var total, missing int
-		for _, e := range m.Entries {
-			for _, d := range cdig.FromSliceAlias(e.Digests) {
-				total++
-				if !storeHas(cs, ChunkReadPath, d.String()) {
-					missing++
-				}
-			}
-		}
-		require.Positive(t, total)
-		assert.Zero(t, missing,
-			"manifest was written to the shared cache while %d of %d referenced chunks are absent", missing, total)
-		return true
-	}
+	e.srv = e.server(newTestBuilder(t, e.cs, pk, 0))
+	return e
+}
 
-	// shard 0 alone gives up waiting for the others
-	mb.shardWait = 200 * time.Millisecond
-	rec := request(4, 0)
-	assert.NotEqual(t, http.StatusOK, rec.Code)
-	assert.False(t, checkCache(), "manifest cached without the other shards' chunks")
+func (e *shardEnv) server(mb *ManifestBuilder) *server {
+	srv, err := NewManifestServer(Config{AllowedUpstreams: []string{e.up.host()}, ChunkDiffParallel: 4}, mb)
+	require.NoError(e.t, err)
+	return srv
+}
 
-	// all shards together succeed
-	mb.shardWait = time.Minute
+func (e *shardEnv) request(srv *server, total, index int) *httptest.ResponseRecorder {
+	body, err := json.Marshal(ManifestReq{
+		Upstream:      e.up.url(),
+		StorePathHash: e.sph,
+		DigestAlgo:    cdig.Algo,
+		DigestBits:    int(cdig.Bits),
+		ShardTotal:    total,
+		ShardIndex:    index,
+	})
+	require.NoError(e.t, err)
+	rec := httptest.NewRecorder()
+	srv.handleManifest(rec, httptest.NewRequest(http.MethodPost, ManifestPath, bytes.NewReader(body)))
+	return rec
+}
+
+// requestAll sends shards concurrently, like the daemon, and returns the responses.
+func (e *shardEnv) requestAll(srv *server, total int, indexes ...int) []*httptest.ResponseRecorder {
+	recs := make([]*httptest.ResponseRecorder, len(indexes))
 	var wg sync.WaitGroup
-	recs := make([]*httptest.ResponseRecorder, 4)
-	for i := range recs {
-		wg.Go(func() { recs[i] = request(len(recs), i) })
+	for i, index := range indexes {
+		wg.Go(func() { recs[i] = e.request(srv, total, index) })
 	}
 	wg.Wait()
-	for i, rec := range recs {
-		require.Equal(t, http.StatusOK, rec.Code, "shard %d: %s", i, rec.Body.String())
+	return recs
+}
+
+// cached reports whether the manifest is in the cache, and checks that every chunk it refers
+// to exists if it is.
+func (e *shardEnv) cached() bool {
+	if !storeHas(e.cs, ManifestCachePath, e.cacheKey) {
+		return false
 	}
-	assert.True(t, checkCache(), "manifest not cached")
+	m := cachedManifest(e.t, e.cs, e.cacheKey)
+	var total, missing int
+	for _, ent := range m.Entries {
+		for _, d := range cdig.FromSliceAlias(ent.Digests) {
+			total++
+			if !storeHas(e.cs, ChunkReadPath, d.String()) {
+				missing++
+			}
+		}
+	}
+	require.Positive(e.t, total)
+	assert.Zero(e.t, missing,
+		"manifest was written to the shared cache while %d of %d referenced chunks are absent", missing, total)
+	return true
+}
+
+// requireShardOk checks that rec is a successful shard response, and returns whether it
+// carries the manifest (checking it matches the cache if so).
+func (e *shardEnv) requireShardOk(rec *httptest.ResponseRecorder) bool {
+	require.Equal(e.t, http.StatusOK, rec.Code, rec.Body.String())
+	if rec.Header().Get(ManifestHeader) == "" {
+		return false
+	}
+	sb, err := zstd.Decompress(nil, rec.Body.Bytes())
+	require.NoError(e.t, err)
+	var sm pb.SignedMessage
+	require.NoError(e.t, proto.Unmarshal(sb, &sm))
+	require.NotNil(e.t, sm.Msg)
+	require.True(e.t, e.cached(), "manifest returned but not cached")
+	return true
+}
+
+// A caller can send only some shards of N (the manifester is behind an unauthenticated URL),
+// and some of the daemon's own shard requests can fail or be refused with a 429. Shard 0 used
+// to write the manifest to the shared cache after uploading only its own 1/N of the chunks,
+// so clients got the cached manifest and 404 on the rest (and remanifesting hit the same
+// cache entry). The manifest must be cached only once every shard is done.
+func TestShardedManifestCachedOnlyWhenEveryShardIsDone(t *testing.T) {
+	e := newShardEnv(t, "shard")
+
+	// shard 0 alone doesn't cache
+	assert.False(t, e.requireShardOk(e.request(e.srv, 4, 0)), "shard 0 alone returned the manifest")
+	assert.False(t, e.cached(), "manifest cached with only shard 0 done")
+	assert.Len(t, e.cs.markers, 1)
+
+	// nor do three of four (shard 2's request was refused with a 429, say)
+	for _, rec := range e.requestAll(e.srv, 4, 1, 3) {
+		assert.False(t, e.requireShardOk(rec))
+	}
+	assert.False(t, e.cached(), "manifest cached with shard 2 not done")
+
+	// shard 2 fails
+	failing := e.server(newTestBuilder(t, failingStore{e.cs}, e.pk, 0))
+	rec := e.request(failing, 4, 2)
+	assert.Equal(t, http.StatusInternalServerError, rec.Code, rec.Body.String())
+	assert.Contains(t, rec.Body.String(), "injected chunk put failure")
+	assert.False(t, e.cached(), "manifest cached after shard 2 failed")
+
+	// the retry succeeds, and as the last shard to finish, caches and returns the manifest
+	assert.True(t, e.requireShardOk(e.request(e.srv, 4, 2)), "last shard didn't return the manifest")
+	assert.True(t, e.cached(), "manifest not cached")
+
+	// retrying any shard again is harmless, and returns the manifest since all are done
+	assert.True(t, e.requireShardOk(e.request(e.srv, 4, 0)))
 
 	// shard fields are checked
 	for _, s := range [][2]int{{-1, 0}, {4, 4}, {4, -1}, {0, 1}, {maxShards + 1, 0}} {
-		assert.Equal(t, http.StatusBadRequest, request(s[0], s[1]).Code, "shard %d of %d", s[1], s[0])
+		assert.Equal(t, http.StatusBadRequest, e.request(e.srv, s[0], s[1]).Code, "shard %d of %d", s[1], s[0])
 	}
+}
+
+// All shards together, as the daemon sends them: at least one returns the manifest.
+func TestShardedManifestAllShardsTogether(t *testing.T) {
+	for _, total := range []int{1, 2, 4, 7} {
+		e := newShardEnv(t, fmt.Sprint("together", total))
+		indexes := make([]int, total)
+		for i := range indexes {
+			indexes[i] = i
+		}
+		var returned int
+		for _, rec := range e.requestAll(e.srv, total, indexes...) {
+			if e.requireShardOk(rec) {
+				returned++
+			}
+		}
+		assert.Positive(t, returned, "%d shards: no shard returned the manifest", total)
+		assert.True(t, e.cached(), "%d shards: manifest not cached", total)
+	}
+}
+
+// A marker vouches for its shard's chunks only for so long (after that, GC may have deleted
+// them), and only for the manifest the shard built.
+func TestShardMarkersMustMatch(t *testing.T) {
+	e := newShardEnv(t, "stale")
+	for _, rec := range e.requestAll(e.srv, 4, 0, 1, 2) {
+		assert.False(t, e.requireShardOk(rec))
+	}
+	e.cs.lock.Lock()
+	for k := range e.cs.markers {
+		require.True(t, IsShardMarker(k), k)
+		e.cs.markers[k] = time.Now().Add(-shardMarkerMaxAge - time.Minute)
+	}
+	e.cs.lock.Unlock()
+	assert.False(t, e.requireShardOk(e.request(e.srv, 4, 3)), "used stale markers")
+	assert.False(t, e.cached(), "manifest cached with stale markers")
+	// retrying the others refreshes their markers
+	var returned int
+	for _, rec := range e.requestAll(e.srv, 4, 0, 1, 2) {
+		if e.requireShardOk(rec) {
+			returned++
+		}
+	}
+	assert.Positive(t, returned)
+	assert.True(t, e.cached())
+
+	// shards that chunked differently don't complete each other
+	e = newShardEnv(t, "layout")
+	styxSk, _, err := signature.GenerateKeypair("styx-test-1", rand.Reader)
+	require.NoError(t, err)
+	mb, err := NewManifestBuilder(ManifestBuilderConfig{
+		PublicKeys:  []signature.PublicKey{e.pk},
+		SigningKeys: []signature.SecretKey{styxSk},
+		ChunkSizer:  func(int64) shift.Shift { return 17 },
+	}, e.cs)
+	require.NoError(t, err)
+	other := e.server(mb)
+	for _, rec := range e.requestAll(e.srv, 4, 0, 1) {
+		assert.False(t, e.requireShardOk(rec))
+	}
+	for _, rec := range e.requestAll(other, 4, 2, 3) {
+		assert.False(t, e.requireShardOk(rec))
+	}
+	assert.False(t, e.cached(), "shards with different chunks completed each other")
 }

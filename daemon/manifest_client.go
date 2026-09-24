@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"path"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/DataDog/zstd"
@@ -203,7 +204,10 @@ func (s *Server) getNewManifest(ctx context.Context, req manifester.ManifestReq,
 	log.Print(msg)
 	egCtx := errgroup.WithContext(ctx)
 
-	var shard0 []byte
+	// every shard has to succeed, and the one that finishes last caches the manifest and
+	// returns it (two may, if they finish together)
+	var manifestMu sync.Mutex
+	var manifest []byte
 	for i := range shards {
 		egCtx.Go(func() error {
 			thisReq := req
@@ -218,24 +222,29 @@ func (s *Server) getNewManifest(ctx context.Context, req manifester.ManifestReq,
 				return fmt.Errorf("manifester http error: %w", err)
 			}
 			defer res.Body.Close()
-			if i == 0 {
-				zr := zstd.NewReader(res.Body)
-				defer zr.Close() // frees the C decompression stream
-				if b, err := io.ReadAll(zr); err != nil {
-					return err
-				} else {
-					shard0 = b
-				}
-			} else {
+			if res.Header.Get(manifester.ManifestHeader) == "" {
 				io.Copy(io.Discard, res.Body)
+				return nil
+			}
+			zr := zstd.NewReader(res.Body)
+			defer zr.Close() // frees the C decompression stream
+			b, err := io.ReadAll(zr)
+			if err != nil {
+				return err
+			}
+			manifestMu.Lock()
+			defer manifestMu.Unlock()
+			if manifest == nil {
+				manifest = b
 			}
 			return nil
 		})
 	}
 
-	err := egCtx.Wait()
-	if err != nil {
+	if err := egCtx.Wait(); err != nil {
 		return nil, err
+	} else if manifest == nil {
+		return nil, fmt.Errorf("manifester returned no manifest for %d shards", shards)
 	}
 	elapsed := time.Since(start)
 	msg = "got manifest for " + req.StorePathHash
@@ -247,7 +256,7 @@ func (s *Server) getNewManifest(ctx context.Context, req manifester.ManifestReq,
 		msg += fmt.Sprintf(" (%d shards)", shards)
 	}
 	log.Print(msg)
-	return shard0, nil
+	return manifest, nil
 }
 
 func (s *Server) calcShards(narSize int64) int {

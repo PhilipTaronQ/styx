@@ -66,7 +66,6 @@ type (
 		pubKeys    []signature.PublicKey
 		signKeys   []signature.SecretKey
 		chunkSizer func(int64) shift.Shift
-		shardWait  time.Duration
 
 		stats atomicStats
 	}
@@ -132,7 +131,6 @@ func NewManifestBuilder(cfg ManifestBuilderConfig, cs ChunkStoreWrite) (*Manifes
 		pubKeys:    cfg.PublicKeys,
 		signKeys:   cfg.SigningKeys,
 		chunkSizer: chunkSizer,
-		shardWait:  defaultShardWait,
 	}, nil
 }
 
@@ -350,12 +348,18 @@ func (b *ManifestBuilder) BuildFromNar(
 
 	b.stats.Shards.Add(1)
 
-	// if we're not shard 0, we're done
-	if shardIndex != 0 {
-		return nil, nil
-	}
-	if err := b.waitForOtherShards(ctx, args, manifest); err != nil {
+	cacheKey := (&ManifestReq{
+		Upstream:      upstream,
+		StorePathHash: storePathHash,
+		DigestAlgo:    cdig.Algo,
+		DigestBits:    int(cdig.Bits),
+	}).CacheKey()
+
+	// in a sharded build, only a shard that finds every shard done caches the manifest
+	if done, err := b.shardsDone(ctx, args, cacheKey, manifest); err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrInternal, err)
+	} else if !done {
+		return nil, nil
 	}
 
 	// add metadata
@@ -401,13 +405,7 @@ func (b *ManifestBuilder) BuildFromNar(
 	}
 
 	// write to cache (it'd be nice to return and do this in the background, but that doesn't
-	// work on lambda). waitForOtherShards made sure the other shards' chunks are there.
-	cacheKey := (&ManifestReq{
-		Upstream:      upstream,
-		StorePathHash: storePathHash,
-		DigestAlgo:    cdig.Algo,
-		DigestBits:    int(cdig.Bits),
-	}).CacheKey()
+	// work on lambda). shardsDone made sure every chunk is there.
 	cmpSb, err := b.cs.PutIfNotExists(ctx, ManifestCachePath, cacheKey, sb)
 	if err != nil {
 		return nil, fmt.Errorf("%w: manifest cache write error: %w", ErrInternal, err)

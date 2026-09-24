@@ -122,11 +122,13 @@ func (s *server) handleManifest(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	if r.ShardIndex != 0 {
+	if mres == nil {
+		// another shard caches and returns the manifest
 		w.Write([]byte(fmt.Sprintf("shard %d/%d ok", r.ShardIndex, r.ShardTotal)))
 		return
 	}
 
+	w.Header().Set(ManifestHeader, "1")
 	w.Header().Set("Content-Encoding", "zstd")
 	w.Write(mres.Bytes)
 }
