@@ -38,7 +38,7 @@ func (s *Server) handlePrefetchReq(ctx context.Context, r *PrefetchReq) (*Status
 		} else {
 			sphStr = r.StorePath
 		}
-		sph, sphStr, err := ParseSph(sphStr)
+		sph, _, err := ParseSph(sphStr)
 		if err != nil {
 			return err
 		}
