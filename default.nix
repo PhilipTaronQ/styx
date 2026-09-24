@@ -81,17 +81,24 @@ rec {
     tags = [ "lambda.norpc" ];
   };
 
-  styx-test = buildStyx (daemonConsts // { "tests.TestdataDir" = testdata; }) {
-    pname = "styxtest";
-    # need to override the build command to use "go test -c" so we can run the
-    # resulting binary with sudo.
-    buildPhase = ''go test -ldflags="$ldflags" -c -o styxtest ./tests'';
-    installPhase = ''
-      mkdir -p $out/bin $out/keys
-      install styxtest $out/bin/
-      cp keys/testsuite* $out/keys/
-    '';
-  };
+  mkStyxTest =
+    pname: testFlags:
+    buildStyx (daemonConsts // { "tests.TestdataDir" = testdata; }) {
+      inherit pname;
+      # need to override the build command to use "go test -c" so we can run the
+      # resulting binary with sudo.
+      buildPhase = ''go test ${testFlags} -ldflags="$ldflags" -c -o styxtest ./tests'';
+      installPhase = ''
+        mkdir -p $out/bin $out/keys
+        install styxtest $out/bin/
+        cp keys/testsuite* $out/keys/
+      '';
+    };
+
+  styx-test = mkStyxTest "styxtest" "";
+  # instrumented builds of the test suite, for CI
+  styx-test-race = mkStyxTest "styxtest-race" "-race";
+  styx-test-asan = mkStyxTest "styxtest-asan" "-asan";
 
   # TODO: switch to nixVersions.stable
   patchedNix = pkgs.nixVersions.nix_2_28.overrideAttrs (prev: {
