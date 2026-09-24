@@ -92,6 +92,13 @@ func (m *mockChunkStore) PutIfNotExists(ctx context.Context, ns string, key stri
 	return z.Compress(nil, data)
 }
 
+func (m *mockChunkStore) Has(ctx context.Context, ns string, key string) (bool, error) {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+	_, ok := m.data[ns+"/"+key]
+	return ok, nil
+}
+
 func (m *mockChunkStore) Get(ctx context.Context, ns string, key string, dst []byte) ([]byte, error) {
 	m.lock.Lock()
 	defer m.lock.Unlock()

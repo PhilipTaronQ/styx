@@ -176,6 +176,9 @@ func (b *ManifestBuilder) BuildFromTarball(
 	if shardIndex != 0 {
 		return nil, nil
 	}
+	if err := b.waitForOtherShards(ctx, args, manifest); err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrInternal, err)
+	}
 
 	// add metadata
 
@@ -211,9 +214,7 @@ func (b *ManifestBuilder) BuildFromTarball(
 	}
 
 	// write to cache (it'd be nice to return and do this in the background, but that doesn't
-	// work on lambda)
-	// TODO: we shouldn't write to cache unless we know for sure that other shards are done.
-	// (or else change client to re-request manifest on missing)
+	// work on lambda). waitForOtherShards made sure the other shards' chunks are there.
 	cacheKey := (&ManifestReq{
 		Upstream:      rr.Url,
 		StorePathHash: sph,

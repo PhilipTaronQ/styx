@@ -72,6 +72,8 @@ func (s *server) validateManifestReq(r *ManifestReq, upstreamHost string) error 
 	} else if r.DigestBits != cdig.Bits {
 		return fmt.Errorf("mismatched digest bits (this server uses %d, not %d)",
 			cdig.Bits, r.DigestBits)
+	} else if !validShard(r.ShardTotal, r.ShardIndex) {
+		return fmt.Errorf("invalid shard %d of %d", r.ShardIndex, r.ShardTotal)
 	}
 
 	if !slices.Contains(s.cfg.AllowedUpstreams, upstreamHost) {
