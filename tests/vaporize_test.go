@@ -33,6 +33,7 @@ func TestVaporize(t *testing.T) {
 		// should be requests for manifest chunks only, all data is in slab
 		d2 := tb.debug()
 		require.Equal(t, expected, d2.Stats.Sub(d1.Stats).TotalReqs())
+		require.Zero(t, d2.Stats.Sub(d1.Stats).TotalErrs())
 		// TODO: btrfs fi du to check that extents are shared
 	}
 

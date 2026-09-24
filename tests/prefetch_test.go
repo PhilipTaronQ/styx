@@ -11,7 +11,8 @@ func TestPrefetch(t *testing.T) {
 	tb := newTestBase(t)
 	tb.startAll()
 
-	mp1 := tb.mount("qa22bifihaxyvn6q2a6w9m0nklqrk9wh-opusfile-0.12")
+	sp1 := "qa22bifihaxyvn6q2a6w9m0nklqrk9wh-opusfile-0.12"
+	mp1 := tb.mount(sp1)
 	sph := "qa22bifihaxyvn6q2a6w9m0nklqrk9wh"
 	libDir := filepath.Join(mp1, "lib")
 	shareDir := filepath.Join(mp1, "share")
@@ -46,7 +47,8 @@ func TestPrefetch(t *testing.T) {
 	require.Zero(t, d4.Stats.DiffReqs-d3.Stats.DiffReqs)
 
 	// similar image
-	mp2 := tb.mount("kcyrz2y8si9ry5p8qkmj0gp41n01sa1y-opusfile-0.12")
+	sp2 := "kcyrz2y8si9ry5p8qkmj0gp41n01sa1y-opusfile-0.12"
+	mp2 := tb.mount(sp2)
 	sph2 := "kcyrz2y8si9ry5p8qkmj0gp41n01sa1y"
 
 	// this one should do a diff (in one req)
@@ -57,20 +59,27 @@ func TestPrefetch(t *testing.T) {
 	require.EqualValues(t, 1, d5.Stats.DiffReqs-d4.Stats.DiffReqs)
 
 	// read all, no reqs
-	tb.nixHash(mp2)
+	tb.requireNarHash(mp2, sp2)
 	d6 := tb.debug()
 	require.Zero(t, d6.Stats.SingleReqs-d5.Stats.SingleReqs)
 	require.Zero(t, d6.Stats.BatchReqs-d5.Stats.BatchReqs)
 	require.Zero(t, d6.Stats.DiffReqs-d5.Stats.DiffReqs)
 
-	require.Zero(t, d6.Stats.SingleErrs+d6.Stats.BatchErrs+d6.Stats.DiffErrs)
+	// lib and share are all of the first image, so it's complete: the whole
+	// thing hashes right with no reqs
+	tb.requireNarHash(mp1, sp1)
+	d7 := tb.debug()
+	require.Zero(t, d7.Stats.Sub(d6.Stats).TotalReqs())
+
+	require.Zero(t, d7.Stats.TotalErrs())
 }
 
 func TestPrefetchLarge(t *testing.T) {
 	tb := newTestBase(t)
 	tb.startAll()
 
-	mp1 := tb.mount("xpq4yhadyhazkcsggmqd7rsgvxb3kjy4-gnugrep-3.11")
+	sp1 := "xpq4yhadyhazkcsggmqd7rsgvxb3kjy4-gnugrep-3.11"
+	mp1 := tb.mount(sp1)
 	sph := "xpq4yhadyhazkcsggmqd7rsgvxb3kjy4"
 
 	// 49 chunks total, but fits into one req because we increase the limit for prefetch
@@ -81,9 +90,10 @@ func TestPrefetchLarge(t *testing.T) {
 	require.Zero(t, d1.Stats.DiffReqs)
 
 	// read, no reqs
-	tb.nixHash(mp1)
+	tb.requireNarHash(mp1, sp1)
 	d2 := tb.debug()
 	require.Zero(t, d2.Stats.SingleReqs-d1.Stats.SingleReqs)
 	require.Zero(t, d2.Stats.BatchReqs-d1.Stats.BatchReqs)
 	require.Zero(t, d2.Stats.DiffReqs-d1.Stats.DiffReqs)
+	require.Zero(t, d2.Stats.TotalErrs())
 }
