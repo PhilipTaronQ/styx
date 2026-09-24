@@ -16,7 +16,6 @@ pkgs.mkShell {
     protobuf
     protoc-gen-go
     skopeo
-    terraform
     #xdelta
     #xz
   ];

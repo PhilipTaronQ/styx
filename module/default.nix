@@ -16,7 +16,6 @@ with lib;
       enable = mkEnableOption "Styx storage manager for Nix";
       enablePatchedNix = mkEnableOption "Patched Nix for Styx";
       enableNixSettings = mkEnableOption "nix.conf settings for Styx";
-      enableStyxNixCache = mkEnableOption "binary cache for Styx and related packages";
       enableKernelOptions = mkEnableOption "required kernel config for Styx (erofs+cachefiles)";
       publicCommands = mkOption {
         default = true;
@@ -45,15 +44,6 @@ with lib;
         styx-substituters = [ "https://cache.nixos.org/" ];
         styx-ondemand = [ ];
         styx-materialize = [ ];
-      };
-    })
-
-    (mkIf (cfg.enable || cfg.enableStyxNixCache) {
-      nix.settings = {
-        # Use binary cache to avoid rebuilds:
-        extra-substituters = [ "https://styx-1.s3.amazonaws.com/nixcache/" ];
-        extra-styx-substituters = [ "https://styx-1.s3.amazonaws.com/nixcache/" ];
-        extra-trusted-public-keys = [ "styx-nixcache-test-1:IbJB9NG5antB2WpE+aE5QzmXapT2yLQb8As/FRkbm3Q=" ];
       };
     })
 
