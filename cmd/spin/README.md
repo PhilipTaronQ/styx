@@ -88,7 +88,7 @@ system:
   nix.nixPath = builtins.map (n: "${n}=/run/current-system/pins/${n}") (builtins.attrNames pins);
   nix.channel.enable = false;
   system.systemBuilderCommands = builtins.concatStringsSep "\n" (
-    builtins.attrValues (builtins.mapAttrs (n: v: "mkdir $out/pins && ln -s ${v} $out/pins/${n}") pins)
+    builtins.attrValues (builtins.mapAttrs (n: v: "mkdir -p $out/pins && ln -s ${v} $out/pins/${n}") pins)
   );
 }
 ```
