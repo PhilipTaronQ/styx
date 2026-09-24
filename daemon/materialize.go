@@ -8,7 +8,6 @@ import (
 	"io"
 	"io/fs"
 	"log"
-	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -151,9 +150,12 @@ func (s *Server) materialize(dest string, m *pb.Manifest) error {
 	}
 
 	var cloneFailed atomic.Bool
-	s.stateLock.Lock()
-	readFds := maps.Clone(s.readfdBySlab)
-	s.stateLock.Unlock()
+	readFds := s.dupCacheFds()
+	defer func() {
+		for _, fds := range readFds {
+			_ = unix.Close(fds.cacheFd)
+		}
+	}()
 
 	// create all directories first
 	for _, ent := range ents {

@@ -1484,6 +1484,36 @@ func (s *Server) handleReadSlab(state *openFileState, ln, off uint64) (retErr er
 	return s.requestChunk(ctx, erofs.SlabLoc{SlabId: slabId, Addr: addr}, digest, sphps)
 }
 
+// Returns dups of the slabs' cache fds, for use without stateLock (a CLOSE could close
+// the originals, and the numbers be reused). The caller must close them.
+func (s *Server) dupCacheFds() map[uint16]slabFds {
+	s.stateLock.Lock()
+	defer s.stateLock.Unlock()
+	out := make(map[uint16]slabFds, len(s.readfdBySlab))
+	for id, fds := range s.readfdBySlab {
+		if fds.cacheFd > 0 {
+			if dfd, err := dupFd(fds.cacheFd); err == nil {
+				out[id] = slabFds{cacheFd: dfd}
+			}
+		}
+	}
+	return out
+}
+
+// Like dupCacheFds for one slab.
+func (s *Server) dupCacheFd(slabId uint16) (int, error) {
+	s.stateLock.Lock()
+	defer s.stateLock.Unlock()
+	if cfd := s.readfdBySlab[slabId].cacheFd; cfd > 0 {
+		return dupFd(cfd)
+	}
+	return 0, errCachefdNotFound
+}
+
+func dupFd(fd int) (int, error) {
+	return unix.FcntlInt(uintptr(fd), unix.F_DUPFD_CLOEXEC, 0)
+}
+
 func (s *Server) mountSlabImage(slabId uint16) error {
 	fsid := slabImagePrefix + strconv.Itoa(int(slabId))
 	mountPoint := filepath.Join(s.cfg.CachePath, fsid)

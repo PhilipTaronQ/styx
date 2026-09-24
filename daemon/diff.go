@@ -554,20 +554,23 @@ func (s *Server) doDiffOp(ctx context.Context, op *diffOp) error {
 	return nil
 }
 
-func (s *Server) getWriteFdForSlab(slabId uint16) (int, error) {
+// Returns a dup of the slab's write fd, so that a CLOSE can't close it (and let the number
+// be reused) while we use it. The caller must close it.
+func (s *Server) dupWriteFdForSlab(slabId uint16) (int, error) {
 	s.stateLock.Lock()
 	defer s.stateLock.Unlock()
 	if state := s.stateBySlab[slabId]; state != nil {
-		return int(state.writeFd), nil
+		return dupFd(int(state.writeFd))
 	}
 	return 0, errors.New("slab not loaded or missing write fd")
 }
 
-func (s *Server) getReadFdForSlab(slabId uint16) (int, error) {
+// Like dupWriteFdForSlab for the read fd.
+func (s *Server) dupReadFdForSlab(slabId uint16) (int, error) {
 	s.stateLock.Lock()
 	defer s.stateLock.Unlock()
 	if readFd := s.readfdBySlab[slabId].readFd; readFd > 0 {
-		return readFd, nil
+		return dupFd(readFd)
 	}
 	return 0, errors.New("slab not loaded or missing read fd")
 }
@@ -578,23 +581,27 @@ func (s *Server) gotNewChunk(loc erofs.SlabLoc, digest cdig.CDig, b []byte) erro
 		return err
 	}
 
-	writeFd, err := s.getWriteFdForSlab(loc.SlabId)
+	writeFd, err := s.dupWriteFdForSlab(loc.SlabId)
 	if err != nil {
 		// try reading the loc to force cachefiles to load the slab. we haven't
 		// written it yet so this will block waiting for whatever diff op is
 		// calling us. do it in a new goroutine to avoid a deadlock.
-		if readFd, rerr := s.getReadFdForSlab(loc.SlabId); rerr == nil {
+		if readFd, rerr := s.dupReadFdForSlab(loc.SlabId); rerr == nil {
 			log.Println("forcing reopen on slab", loc.SlabId)
-			go unix.Pread(readFd, make([]byte, 1), int64(loc.Addr)<<s.blockShift)
+			go func() {
+				_, _ = unix.Pread(readFd, make([]byte, 1), int64(loc.Addr)<<s.blockShift)
+				_ = unix.Close(readFd)
+			}()
 			for i := 0; i < 10 && err != nil; i++ {
 				time.Sleep(50 * time.Duration(i+1) * time.Millisecond)
-				writeFd, err = s.getWriteFdForSlab(loc.SlabId)
+				writeFd, err = s.dupWriteFdForSlab(loc.SlabId)
 			}
 		}
 	}
 	if err != nil {
 		return err
 	}
+	defer unix.Close(writeFd)
 
 	// we can only write full + aligned blocks
 	prevLen := len(b)
@@ -783,10 +790,11 @@ func (s *Server) getManifestLocal(tx *bbolt.Tx, sphStr string) (*pb.Manifest, []
 }
 
 func (s *Server) getKnownChunk(loc erofs.SlabLoc, buf []byte) error {
-	readFd, err := s.getReadFdForSlab(loc.SlabId)
+	readFd, err := s.dupReadFdForSlab(loc.SlabId)
 	if err != nil {
 		return err
 	}
+	defer unix.Close(readFd)
 
 	// record that we're reading this out of the slab
 	s.readKnownMap.Modify(loc, func(i int, _ bool) (int, bool) { return i + 1, true })
