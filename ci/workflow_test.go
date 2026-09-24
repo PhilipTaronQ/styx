@@ -23,7 +23,7 @@ func newCiTestEnv(t *testing.T) *testsuite.TestWorkflowEnvironment {
 
 var testCiArgs = CiArgs{
 	Channel:  "nixos-26.05",
-	StyxRepo: RepoConfig{Repo: "https://github.com/dnr/styx/", Branch: "release"},
+	StyxRepo: RepoConfig{Repo: "https://git.example.org/styx/", Branch: "main"},
 }
 
 // mockPolls makes the pollers find a release and a commit when there's none yet, and
@@ -110,4 +110,23 @@ func TestCiWorkflowCancel(t *testing.T) {
 	require.Error(t, err)
 	require.True(t, temporal.IsCanceledError(err), "workflow error: %v", err)
 	require.Greater(t, polls.Load(), int32(1))
+}
+
+// There's no default deployment: charon start needs to be told where to build from and
+// copy to.
+func TestStartRequiresDeployment(t *testing.T) {
+	cfg := StartConfig{Args: CiArgs{
+		StyxRepo:         RepoConfig{Repo: "https://git.example.org/styx/", Branch: "main"},
+		CopyDest:         "s3://bucket/nixcache/",
+		ManifestUpstream: "https://bucket.example.org/nixcache/",
+	}}
+	for flag, clear := range map[string]func(*StartConfig){
+		"styx_repo":         func(c *StartConfig) { c.Args.StyxRepo.Repo = "" },
+		"copy_dest":         func(c *StartConfig) { c.Args.CopyDest = "" },
+		"manifest_upstream": func(c *StartConfig) { c.Args.ManifestUpstream = "" },
+	} {
+		c := cfg
+		clear(&c)
+		require.ErrorContains(t, Start(context.Background(), c), "--"+flag+" is required")
+	}
 }
