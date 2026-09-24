@@ -312,16 +312,19 @@ func (s *server) expand(egCtx *errgroup.Group, digests []cdig.CDig, expand strin
 		if err = decompress.Start(); err != nil {
 			return nil, err
 		}
+		fetchErr := make(chan error, 1)
 		go func() {
-			s.fetchChunkSeries(egCtx, digests, pw, &budget.fetch)
+			err := s.fetchChunkSeries(egCtx, digests, pw, &budget.fetch)
 			pw.Close()
+			fetchErr <- err
 		}()
 		out, readErr := io.ReadAll(budgetReader{pr, &budget.expand})
 		if readErr != nil {
 			egCtx.Cancel(readErr) // kill xz, which may be blocked writing to us
 		}
-		waitErr := decompress.Wait()
-		return common.ValOrErr(out, cmp.Or(readErr, waitErr))
+		waitErr := decompress.Wait() // also closes pw, so the fetch can't block writing to it
+		// a failed fetch truncates xz's input (or kills it), so its error is the real one
+		return common.ValOrErr(out, cmp.Or(<-fetchErr, readErr, waitErr))
 
 	default:
 		var out bytes.Buffer
@@ -335,32 +338,49 @@ func (s *server) fetchChunkSeries(egCtx *errgroup.Group, digests []cdig.CDig, ou
 	// TODO: ew, use separate setting?
 	cs := s.mb.cs
 
-	chs := make(chan chan []byte, egCtx.Limit())
+	// Each fetch sends its error along with its data: a failed fetch cancels egCtx only
+	// after its result is sent, so checking egCtx for errors could miss it, and the failed
+	// chunk would read as empty.
+	type result struct {
+		b   []byte
+		err error
+	}
+	chs := make(chan chan result, egCtx.Limit())
 	go func() {
 		for i := 0; i < len(digests) && egCtx.Err() == nil; i++ {
 			digest := digests[i]
 			digestStr := digest.String()
-			ch := make(chan []byte)
+			ch := make(chan result, 1)
 			chs <- ch
 			egCtx.Go(func() error {
 				b, err := cs.Get(egCtx, ChunkReadPath, digestStr, nil)
-				ch <- b
+				ch <- result{b, err}
 				return err
 			})
 		}
 		close(chs)
 	}()
 
+	// read every result, so that the producer isn't left blocked, but stop writing at the
+	// first error
+	var err error
 	for ch := range chs {
-		if b := <-ch; len(b) > 0 && egCtx.Err() == nil {
-			if budget.Add(-int64(len(b))) < 0 {
-				egCtx.Cancel(errChunkDiffTooBig)
-			} else if _, err := out.Write(b); err != nil {
-				egCtx.Cancel(err)
-			}
+		r := <-ch
+		if err != nil {
+			continue
+		}
+		err = cmp.Or(r.err, context.Cause(egCtx))
+		if err == nil && budget.Add(-int64(len(r.b))) < 0 {
+			err = errChunkDiffTooBig
+		}
+		if err == nil {
+			_, err = out.Write(r.b)
+		}
+		if err != nil {
+			egCtx.Cancel(err)
 		}
 	}
-	return context.Cause(egCtx)
+	return cmp.Or(err, context.Cause(egCtx))
 }
 
 const (

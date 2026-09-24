@@ -8,8 +8,11 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -163,6 +166,73 @@ func TestChunkDiffGzipErrorLeaksFetchGoroutines(t *testing.T) {
 	after := waitGoroutines(marker, before, 3*time.Second)
 	assert.LessOrEqual(t, after, before,
 		"%d chunk-series goroutines still blocked after the request finished and its context was cancelled", after-before)
+}
+
+// missingChunkStore reports the chunks in missing as not found, like the real stores.
+type missingChunkStore struct {
+	*mockChunkStore
+	missing map[string]bool
+}
+
+func (m missingChunkStore) Get(ctx context.Context, ns, key string, dst []byte) ([]byte, error) {
+	if m.missing[key] {
+		return nil, wrapNotFound(os.ErrNotExist)
+	}
+	return m.mockChunkStore.Get(ctx, ns, key, dst)
+}
+
+// A chunk fetch that failed sent nil on its result channel, then returned its error, which
+// cancelled the group only after that. The consumer skipped the empty result, and if it
+// checked the group before the cancel landed, the diff was served with 200 and the chunk
+// silently left out. The daemon then failed with "decompressed data is too short" instead
+// of seeing a 404 and remanifesting.
+func TestChunkDiffMissingChunkIsNotFound(t *testing.T) {
+	cs := &mockChunkStore{data: make(map[string][]byte)}
+	var chunks [][]byte
+	for i := range 8 {
+		chunks = append(chunks, []byte(fmt.Sprintf("chunk %d", i)))
+	}
+	digests := putChunks(t, cs, chunks...)
+
+	// a gzip stream split over two chunks
+	var gz bytes.Buffer
+	zw := gzip.NewWriter(&gz)
+	_, err := zw.Write(bytes.Repeat([]byte("styx"), 1000))
+	require.NoError(t, err)
+	require.NoError(t, zw.Close())
+	gzDigests := putChunks(t, cs, gz.Bytes()[:gz.Len()/2], gz.Bytes()[gz.Len()/2:])
+
+	nth := func(ds []byte, i int) string { return cdig.FromBytes(ds[i*cdig.Bytes:]).String() }
+	for _, tc := range []struct {
+		name    string
+		missing string
+		req     *pb.ManifesterChunkDiffReq_Req
+	}{
+		{"first", nth(digests, 0), &pb.ManifesterChunkDiffReq_Req{Reqs: digests}},
+		{"middle", nth(digests, 4), &pb.ManifesterChunkDiffReq_Req{Reqs: digests}},
+		{"last", nth(digests, 7), &pb.ManifesterChunkDiffReq_Req{Reqs: digests}},
+		{"base", nth(digests, 7), &pb.ManifesterChunkDiffReq_Req{Bases: digests, Reqs: digests[:cdig.Bytes]}},
+		{"gz first", nth(gzDigests, 0), &pb.ManifesterChunkDiffReq_Req{Reqs: gzDigests, ExpandBeforeDiff: ExpandGz}},
+		{"gz last", nth(gzDigests, 1), &pb.ManifesterChunkDiffReq_Req{Reqs: gzDigests, ExpandBeforeDiff: ExpandGz}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mb, err := NewManifestBuilder(ManifestBuilderConfig{}, missingChunkStore{cs, map[string]bool{tc.missing: true}})
+			require.NoError(t, err)
+			srv, err := NewManifestServer(Config{ChunkDiffParallel: 8, ChunkDiffZstdLevel: 1}, mb)
+			require.NoError(t, err)
+			// it was a race, so try many times
+			for range 200 {
+				rec := doChunkDiff(t, context.Background(), srv, tc.req)
+				require.Equal(t, http.StatusNotFound, rec.Code, "diff with a missing chunk served: %q", rec.Body.String())
+			}
+		})
+	}
+
+	// and the daemon sees a 404 as not found, which makes it remanifest
+	assert.True(t, common.IsNotFound(common.HttpErrorFromRes(&http.Response{
+		StatusCode: http.StatusNotFound,
+		Body:       io.NopCloser(strings.NewReader("not found")),
+	})))
 }
 
 // The upstream allow-list was checked for the first URL only: http.DefaultClient follows up
