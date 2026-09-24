@@ -6,6 +6,7 @@ package daemon
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"io"
 	"math/rand/v2"
 	"net/http"
@@ -52,7 +53,8 @@ type fetchEnv struct {
 	manifesterHang   bool          // first manifester request blocks until the client goes away
 	manifestStarted  chan struct{} // closed when the first manifester request arrives
 	manifestPosts    atomic.Int32
-	quit             chan struct{} // closed at cleanup so hanging handlers return
+	manifestReqs     []manifester.ManifestReq // requests the manifester got (under mu)
+	quit             chan struct{}            // closed at cleanup so hanging handlers return
 }
 
 func newFetchEnv(t *testing.T) *fetchEnv {
@@ -190,7 +192,14 @@ func (e *fetchEnv) handleManifester(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	io.Copy(io.Discard, r.Body)
+	var mreq manifester.ManifestReq
+	if err := json.NewDecoder(r.Body).Decode(&mreq); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	e.mu.Lock()
+	e.manifestReqs = append(e.manifestReqs, mreq)
+	e.mu.Unlock()
 	if n := e.manifestPosts.Add(1); n == 1 && e.manifesterHang {
 		close(e.manifestStarted)
 		select {

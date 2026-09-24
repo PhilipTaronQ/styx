@@ -48,13 +48,15 @@ func TestReviewSignatureCoversAllUsedEntryFields(t *testing.T) {
 			e.ManifestMeta.GenericTarballResolved = "https://attacker.example/evil.tar.gz"
 		},
 	} {
-		var sm pb.SignedMessage
-		require.NoError(t, proto.Unmarshal(signed, &sm))
-		tamper(sm.Msg)
-		tampered, err := proto.Marshal(&sm)
-		require.NoError(t, err)
-		_, _, err = VerifyMessageAsEntry([]signature.PublicKey{pk}, ManifestContext, tampered)
-		require.Error(t, err, "envelope with tampered %s still verifies", name)
+		t.Run(name, func(t *testing.T) {
+			var sm pb.SignedMessage
+			require.NoError(t, proto.Unmarshal(signed, &sm))
+			tamper(sm.Msg)
+			tampered, err := proto.Marshal(&sm)
+			require.NoError(t, err)
+			_, _, err = VerifyMessageAsEntry([]signature.PublicKey{pk}, ManifestContext, tampered)
+			require.Error(t, err, "envelope with tampered %s still verifies", name)
+		})
 	}
 }
 
