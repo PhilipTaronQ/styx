@@ -1,5 +1,5 @@
 diff --git a/src/libstore/build/substitution-goal.cc b/src/libstore/build/substitution-goal.cc
-index 9027349..6f86533 100644
+index 9027349..7fb87ed 100644
 --- a/src/libstore/build/substitution-goal.cc
 +++ b/src/libstore/build/substitution-goal.cc
 @@ -6,6 +6,9 @@
@@ -29,16 +29,18 @@ index 9027349..6f86533 100644
                         maybeWaker = worker.getCrossThreadWaker(),
                         maybeWorkerStore = worker.store.weak_from_this()]() mutable {
          try {
-@@ -227,15 +231,41 @@ Goal::Co PathSubstitutionGoal::tryToRun(
+@@ -227,15 +231,43 @@ Goal::Co PathSubstitutionGoal::tryToRun(
              if (!workerStore)
                  return;
  
-+            /* Styx can provide paths from a binary cache to a local store. */
++            /* Styx can provide paths from a binary cache to a local store.
++               It can't repair a path, so repairs use regular substitution. */
 +            auto cacheSrc = sub.dynamic_pointer_cast<BinaryCacheStore>();
 +            auto localDst = std::dynamic_pointer_cast<LocalStore>(workerStore);
 +            auto sourceUri = sub->config.getReference().render(/*withParams=*/false);
-+            auto styxMode = (cacheSrc && localDst) ? canUseStyx(sourceUri, info->narSize, std::string(info->path.name()))
-+                                                   : StyxDisable;
++            auto styxMode = (cacheSrc && localDst && repair == NoRepair)
++                                ? canUseStyx(sourceUri, info->narSize, std::string(info->path.name()))
++                                : StyxDisable;
 +            auto checkSigs = sub->config.isTrusted ? NoCheckSigs : CheckSigs;
 +
              Activity act(
@@ -74,7 +76,7 @@ index 9027349..6f86533 100644
          } catch (...) {
              promise.set_exception(std::current_exception());
          }
-@@ -258,8 +288,9 @@ Goal::Co PathSubstitutionGoal::tryToRun(
+@@ -258,8 +290,9 @@ Goal::Co PathSubstitutionGoal::tryToRun(
      thr.join();
      worker.childTerminated(this);
  
@@ -85,7 +87,7 @@ index 9027349..6f86533 100644
      } catch (std::exception & e) {
          /* Cause the parent build to fail unless --fallback is given,
             or the substitute has disappeared. The latter case behaves
-@@ -281,7 +312,17 @@ Goal::Co PathSubstitutionGoal::tryToRun(
+@@ -281,7 +314,17 @@ Goal::Co PathSubstitutionGoal::tryToRun(
  
      worker.markContentsGood(storePath);
  
