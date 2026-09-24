@@ -17,6 +17,7 @@ import (
 	"os/exec"
 	"path"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/DataDog/zstd"
@@ -160,7 +161,11 @@ func (s *server) handleChunkDiff(w http.ResponseWriter, req *http.Request) {
 	if r.Params.GetDigestAlgo() != cdig.Algo || r.Params.GetDigestBits() != cdig.Bits {
 		writeError(w, fmt.Errorf("%w: parameter mismatch", ErrReq))
 		return
+	} else if err := checkChunkDiffReq(&r); err != nil {
+		writeError(w, err)
+		return
 	}
+	baseBudget, reqBudget := newDiffBudget(), newDiffBudget()
 
 	// load requested chunks
 	start := time.Now()
@@ -187,11 +192,11 @@ func (s *server) handleChunkDiff(w http.ResponseWriter, req *http.Request) {
 		stats.ReqChunks += len(ri.Reqs) / cdig.Bytes
 
 		expandGrp.Go(func() (err error) {
-			baseDatas[i], err = s.expand(egCtx, cdig.FromSliceAlias(ri.Bases), ri.ExpandBeforeDiff)
+			baseDatas[i], err = s.expand(egCtx, cdig.FromSliceAlias(ri.Bases), ri.ExpandBeforeDiff, baseBudget)
 			return
 		})
 		expandGrp.Go(func() (err error) {
-			reqDatas[i], err = s.expand(egCtx, cdig.FromSliceAlias(ri.Reqs), ri.ExpandBeforeDiff)
+			reqDatas[i], err = s.expand(egCtx, cdig.FromSliceAlias(ri.Reqs), ri.ExpandBeforeDiff, reqBudget)
 			return
 		})
 	}
@@ -260,7 +265,7 @@ func (s *server) handleChunkDiff(w http.ResponseWriter, req *http.Request) {
 	log.Printf("diff done %#v", stats)
 }
 
-func (s *server) expand(egCtx *errgroup.Group, digests []cdig.CDig, expand string) ([]byte, error) {
+func (s *server) expand(egCtx *errgroup.Group, digests []cdig.CDig, expand string, budget *diffBudget) ([]byte, error) {
 	if len(digests) == 0 {
 		return nil, nil
 	}
@@ -269,14 +274,14 @@ func (s *server) expand(egCtx *errgroup.Group, digests []cdig.CDig, expand strin
 	case ExpandGz:
 		pr, pw := io.Pipe()
 		go func() {
-			pw.CloseWithError(s.fetchChunkSeries(egCtx, digests, pw))
+			pw.CloseWithError(s.fetchChunkSeries(egCtx, digests, pw, &budget.fetch))
 		}()
 		gzr, err := gzip.NewReader(pr)
 		if err != nil {
 			pr.CloseWithError(err) // cause writes to write end to fail
 			return nil, err
 		}
-		return io.ReadAll(gzr)
+		return io.ReadAll(budgetReader{gzr, &budget.expand})
 
 	case ExpandXz:
 		decompress := exec.CommandContext(egCtx, common.XzBin, "-d")
@@ -292,21 +297,25 @@ func (s *server) expand(egCtx *errgroup.Group, digests []cdig.CDig, expand strin
 			return nil, err
 		}
 		go func() {
-			s.fetchChunkSeries(egCtx, digests, pw)
+			s.fetchChunkSeries(egCtx, digests, pw, &budget.fetch)
 			pw.Close()
 		}()
-		out, readErr := io.ReadAll(pr)
-		return common.ValOrErr(out, cmp.Or(decompress.Wait(), readErr))
+		out, readErr := io.ReadAll(budgetReader{pr, &budget.expand})
+		if readErr != nil {
+			egCtx.Cancel(readErr) // kill xz, which may be blocked writing to us
+		}
+		waitErr := decompress.Wait()
+		return common.ValOrErr(out, cmp.Or(readErr, waitErr))
 
 	default:
 		var out bytes.Buffer
 		out.Grow(len(digests) << shift.DefaultChunkShift)
-		err := s.fetchChunkSeries(egCtx, digests, &out)
+		err := s.fetchChunkSeries(egCtx, digests, &out, &budget.fetch)
 		return common.ValOrErr(out.Bytes(), err)
 	}
 }
 
-func (s *server) fetchChunkSeries(egCtx *errgroup.Group, digests []cdig.CDig, out io.Writer) error {
+func (s *server) fetchChunkSeries(egCtx *errgroup.Group, digests []cdig.CDig, out io.Writer, budget *atomic.Int64) error {
 	// TODO: ew, use separate setting?
 	cs := s.mb.cs
 
@@ -328,12 +337,68 @@ func (s *server) fetchChunkSeries(egCtx *errgroup.Group, digests []cdig.CDig, ou
 
 	for ch := range chs {
 		if b := <-ch; len(b) > 0 && egCtx.Err() == nil {
-			if _, err := out.Write(b); err != nil {
+			if budget.Add(-int64(len(b))) < 0 {
+				egCtx.Cancel(errChunkDiffTooBig)
+			} else if _, err := out.Write(b); err != nil {
 				egCtx.Cancel(err)
 			}
 		}
 	}
 	return context.Cause(egCtx)
+}
+
+const (
+	// gz and xz expansion can produce much more than ChunkDiffMaxBytes
+	chunkDiffMaxExpandedBytes = 4 * ChunkDiffMaxBytes
+)
+
+var errChunkDiffTooBig = fmt.Errorf("%w: chunk diff data is too big", ErrReq)
+
+// checkChunkDiffReq enforces the documented limits on digests (and on the number of
+// requests, which is otherwise unbounded).
+func checkChunkDiffReq(r *pb.ManifesterChunkDiffReq) error {
+	if len(r.Req) > ChunkDiffMaxDigests {
+		return fmt.Errorf("%w: too many requests (%d)", ErrReq, len(r.Req))
+	}
+	var bases, reqs int
+	for _, ri := range r.Req {
+		if len(ri.Bases)%cdig.Bytes != 0 || len(ri.Reqs)%cdig.Bytes != 0 {
+			return fmt.Errorf("%w: digest lists must be a multiple of %d bytes", ErrReq, cdig.Bytes)
+		}
+		bases += len(ri.Bases) / cdig.Bytes
+		reqs += len(ri.Reqs) / cdig.Bytes
+	}
+	if bases > ChunkDiffMaxDigests || reqs > ChunkDiffMaxDigests {
+		return fmt.Errorf("%w: too many digests (%d bases, %d reqs, max %d each)",
+			ErrReq, bases, reqs, ChunkDiffMaxDigests)
+	}
+	return nil
+}
+
+// diffBudget is the number of bytes left for one side (bases or reqs) of a chunk diff, as
+// fetched from the chunk store and after expansion.
+type diffBudget struct {
+	fetch, expand atomic.Int64
+}
+
+func newDiffBudget() *diffBudget {
+	b := &diffBudget{}
+	b.fetch.Store(ChunkDiffMaxBytes)
+	b.expand.Store(chunkDiffMaxExpandedBytes)
+	return b
+}
+
+type budgetReader struct {
+	r    io.Reader
+	left *atomic.Int64
+}
+
+func (br budgetReader) Read(p []byte) (int, error) {
+	n, err := br.r.Read(p)
+	if br.left.Add(-int64(n)) < 0 {
+		return n, errChunkDiffTooBig
+	}
+	return n, err
 }
 
 func (s *server) handleChunk(w http.ResponseWriter, r *http.Request) {

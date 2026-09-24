@@ -2,7 +2,10 @@ package manifester
 
 import (
 	"bytes"
+	"compress/gzip"
+	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -11,8 +14,11 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 
+	"github.com/dnr/styx/common"
 	"github.com/dnr/styx/common/cdig"
+	"github.com/dnr/styx/pb"
 )
 
 // Upstream 404 for the narinfo: RetryHttpRequest turns it into an error, which was wrapped
@@ -36,6 +42,91 @@ func TestNarinfo404IsReportedAs417(t *testing.T) {
 	rec := httptest.NewRecorder()
 	srv.handleManifest(rec, httptest.NewRequest(http.MethodPost, ManifestPath, bytes.NewReader(body)))
 	assert.Equal(t, http.StatusNotFound, rec.Code, rec.Body.String())
+}
+
+func putChunks(t *testing.T, cs *mockChunkStore, chunks ...[]byte) []byte {
+	var digests []byte
+	for _, c := range chunks {
+		d := cdig.Sum(c)
+		_, err := cs.PutIfNotExists(context.Background(), ChunkReadPath, d.String(), c)
+		require.NoError(t, err)
+		digests = append(digests, d[:]...)
+	}
+	return digests
+}
+
+func doChunkDiff(t *testing.T, ctx context.Context, srv *server, reqs ...*pb.ManifesterChunkDiffReq_Req) *httptest.ResponseRecorder {
+	body, err := proto.Marshal(&pb.ManifesterChunkDiffReq{
+		Params: &pb.GlobalParams{DigestAlgo: cdig.Algo, DigestBits: cdig.Bits},
+		Req:    reqs,
+	})
+	require.NoError(t, err)
+	hr := httptest.NewRequest(http.MethodPost, ChunkDiffPath, bytes.NewReader(body)).WithContext(ctx)
+	hr.Header.Set(common.CTHdr, common.CTProto)
+	rec := httptest.NewRecorder()
+	srv.handleChunkDiff(rec, hr)
+	return rec
+}
+
+// The chunkdiff protocol documents a max of 256 digests per side, but the server didn't
+// enforce it (nor ChunkDiffMaxBytes, nor the number of Req entries, nor repeats).
+func TestChunkDiffDigestLimitNotEnforced(t *testing.T) {
+	cs := &mockChunkStore{data: make(map[string][]byte)}
+	mb, err := NewManifestBuilder(ManifestBuilderConfig{}, cs)
+	require.NoError(t, err)
+	srv, err := NewManifestServer(Config{ChunkDiffParallel: 8, ChunkDiffZstdLevel: 3}, mb)
+	require.NoError(t, err)
+
+	var chunks [][]byte
+	for i := range ChunkDiffMaxDigests + 44 {
+		chunks = append(chunks, []byte(fmt.Sprintf("test chunk %06d payload", i)))
+	}
+	reqs := putChunks(t, cs, chunks...)
+	rec := doChunkDiff(t, context.Background(), srv, &pb.ManifesterChunkDiffReq_Req{Bases: reqs[:cdig.Bytes], Reqs: reqs})
+	assert.GreaterOrEqual(t, rec.Code, 400,
+		"request with %d req digests (documented max %d) was served", len(reqs)/cdig.Bytes, ChunkDiffMaxDigests)
+
+	// the limit is for the whole request
+	half := reqs[:ChunkDiffMaxDigests/2*cdig.Bytes]
+	rec = doChunkDiff(t, context.Background(), srv,
+		&pb.ManifesterChunkDiffReq_Req{Reqs: half},
+		&pb.ManifesterChunkDiffReq_Req{Reqs: half},
+		&pb.ManifesterChunkDiffReq_Req{Reqs: half})
+	assert.GreaterOrEqual(t, rec.Code, 400, "three requests of %d digests were served", ChunkDiffMaxDigests/2)
+
+	// at the limit is fine
+	rec = doChunkDiff(t, context.Background(), srv,
+		&pb.ManifesterChunkDiffReq_Req{Bases: reqs[:cdig.Bytes], Reqs: reqs[:ChunkDiffMaxDigests*cdig.Bytes]})
+	assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+}
+
+func TestChunkDiffByteLimits(t *testing.T) {
+	cs := &mockChunkStore{data: make(map[string][]byte)}
+	mb, err := NewManifestBuilder(ManifestBuilderConfig{}, cs)
+	require.NoError(t, err)
+	srv, err := NewManifestServer(Config{ChunkDiffParallel: 8, ChunkDiffZstdLevel: 1}, mb)
+	require.NoError(t, err)
+
+	// more than ChunkDiffMaxBytes of chunks, in few digests
+	var big [][]byte
+	for i := range ChunkDiffMaxBytes>>20 + 1 {
+		c := make([]byte, 1<<20)
+		fillPseudoRandom(c, uint64(i))
+		big = append(big, c)
+	}
+	rec := doChunkDiff(t, context.Background(), srv, &pb.ManifesterChunkDiffReq_Req{Reqs: putChunks(t, cs, big...)})
+	assert.Equal(t, http.StatusExpectationFailed, rec.Code, "%d bytes of chunks were served", len(big)<<20)
+
+	// a gzip bomb
+	var gz bytes.Buffer
+	zw, err := gzip.NewWriterLevel(&gz, gzip.BestSpeed)
+	require.NoError(t, err)
+	_, err = zw.Write(make([]byte, chunkDiffMaxExpandedBytes+1))
+	require.NoError(t, err)
+	require.NoError(t, zw.Close())
+	rec = doChunkDiff(t, context.Background(), srv,
+		&pb.ManifesterChunkDiffReq_Req{Bases: putChunks(t, cs, gz.Bytes()), ExpandBeforeDiff: ExpandGz})
+	assert.Equal(t, http.StatusExpectationFailed, rec.Code, "%d byte gzip expanded without limit", gz.Len())
 }
 
 // An unauthenticated caller can send only shard 0 of N. Shard 0 used to write the manifest to
