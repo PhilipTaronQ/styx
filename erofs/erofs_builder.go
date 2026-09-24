@@ -203,6 +203,12 @@ func (b *Builder) BuildFromManifestWithSlab(
 
 	for _, e := range m.Entries {
 		// every entry gets an inode and all but the root get a dirent
+		if !path.IsAbs(e.Path) || path.Clean(e.Path) != e.Path {
+			return fmt.Errorf("bad entry path %q", e.Path)
+		} else if e.Path == "/" && (e.Type != pb.EntryType_DIRECTORY || root != nil) {
+			return errors.New("root must be one directory")
+		}
+
 		var fstype uint16
 		i := &inodebuilder{
 			i: erofs_inode_compact{
@@ -254,6 +260,9 @@ func (b *Builder) BuildFromManifestWithSlab(
 				i.i.ISize = common.TruncU32(e.Size)
 				i.i.IFormat = formatChunked
 				cshift := e.ChunkShiftDef()
+				if cshift < b.blk || cshift > shift.MaxChunkShift {
+					return fmt.Errorf("%q: bad chunk shift %d", e.Path, cshift)
+				}
 				chunkedIU, err := inodeChunkInfo(b.blk, cshift)
 				if err != nil {
 					return err
@@ -304,6 +313,9 @@ func (b *Builder) BuildFromManifestWithSlab(
 				return errors.New("file name too long")
 			}
 			db := dirsmap[path.Clean(dir)]
+			if db == nil {
+				return fmt.Errorf("found %q before its parent dir", e.Path)
+			}
 			db.ents = append(db.ents, dbent{
 				name: file,
 				i:    i,
@@ -313,6 +325,8 @@ func (b *Builder) BuildFromManifestWithSlab(
 	}
 	if err := flushBlocks(); err != nil {
 		return err
+	} else if root == nil {
+		return errors.New("missing root directory")
 	}
 
 	// pass 2: pack inodes and tails

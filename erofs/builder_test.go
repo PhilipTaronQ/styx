@@ -110,3 +110,38 @@ func TestBuildLongSymlink(t *testing.T) {
 	_, err := buildNoPanic(m, &bumpSlab{})
 	require.ErrorContains(t, err, "symlink target too long")
 }
+
+// Manifests aren't trusted to be well formed: bad ones must be rejected, not crash the daemon.
+func TestBuildRejectsMalformedManifest(t *testing.T) {
+	root := &pb.Entry{Path: "/", Type: pb.EntryType_DIRECTORY}
+	withShift := func(cs int32) *pb.Entry {
+		e := chunkedEntry("/f", 100, 'f')
+		e.ChunkShift = cs
+		return e
+	}
+	for name, entries := range map[string][]*pb.Entry{
+		"chunk shift below block size": {root, withShift(8)},
+		"chunk shift above max":        {root, withShift(21)},
+		"huge chunk shift":             {root, withShift(62)},
+		"negative chunk shift":         {root, withShift(-1)},
+		"file before its parent":       {root, {Path: "/d/f", Type: pb.EntryType_REGULAR}},
+		"symlink before its parent":    {root, {Path: "/d/l", Type: pb.EntryType_SYMLINK, InlineData: []byte("x")}},
+		"directory before its parent":  {root, {Path: "/d/e", Type: pb.EntryType_DIRECTORY}},
+		"relative path":                {root, {Path: "f", Type: pb.EntryType_REGULAR}},
+		"unclean path":                 {root, {Path: "/../f", Type: pb.EntryType_REGULAR}},
+		"trailing slash":               {root, {Path: "/d", Type: pb.EntryType_DIRECTORY}, {Path: "/d/", Type: pb.EntryType_REGULAR}},
+		"no root":                      {{Path: "/d", Type: pb.EntryType_DIRECTORY}},
+		"two roots":                    {root, root},
+		"root that isn't a directory":  {root, {Path: "/", Type: pb.EntryType_SYMLINK, InlineData: []byte("x")}},
+	} {
+		_, err := buildNoPanic(&pb.Manifest{Entries: entries}, &bumpSlab{})
+		require.Error(t, err, name)
+		require.NotContains(t, err.Error(), "panic:", name)
+	}
+
+	// and the good ones still build
+	for _, cs := range []int32{0, 12, 16, 20} {
+		_, err := buildNoPanic(&pb.Manifest{Entries: []*pb.Entry{root, withShift(cs)}}, &bumpSlab{})
+		require.NoError(t, err, "chunk shift %d", cs)
+	}
+}
