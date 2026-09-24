@@ -48,16 +48,17 @@ rec {
     "common.Version" = version;
   };
 
-  overlaidBuildGoModule =
-    # ensure overlay is applied even if we got pkgs from somewhere else
-    # TODO: there's got to be a better way to do this...
-    if overlay == null || (builtins.hasAttr "nixGocacheprogHook" pkgs) then
-      pkgs.buildGoModule
+  # Build with the newest Go toolchain rather than nixpkgs' default. The
+  # nix-gocacheprog overlay only hooks the default buildGoModule, so add its
+  # hook ourselves (this also covers pkgs passed in without the overlay).
+  buildGoModule = pkgs.buildGo127Module;
+  gocacheprogHooks =
+    if overlay == null then
+      [ ]
+    else if pkgs ? nixGocacheprogHook then
+      [ pkgs.nixGocacheprogHook ]
     else
-      let
-        final = pkgs // (overlay final pkgs);
-      in
-      final.buildGoModule;
+      [ (overlay pkgs pkgs).nixGocacheprogHook ];
 
   buildStyx =
     consts: args:
@@ -65,7 +66,14 @@ rec {
       # note: putting "-s -w" in ldflags only saves 3.6% of image size
       ldflags = pkgs.lib.mapAttrsToList (k: v: "-X github.com/dnr/styx/${k}=${v}") consts;
     in
-    overlaidBuildGoModule (baseArgs // args // { inherit ldflags; });
+    buildGoModule (
+      baseArgs
+      // args
+      // {
+        inherit ldflags;
+        nativeBuildInputs = (args.nativeBuildInputs or [ ]) ++ gocacheprogHooks;
+      }
+    );
 
   styx-local = buildStyx daemonConsts { };
 
