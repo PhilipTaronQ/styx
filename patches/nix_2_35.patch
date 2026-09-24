@@ -156,10 +156,18 @@ index 8e997c8..9cff3bb 100644
                      deleteFromStore(path.to_string(), true);
                      referrersCache.erase(path);
 diff --git a/src/libstore/include/nix/store/globals.hh b/src/libstore/include/nix/store/globals.hh
-index 34eab7f..91d940a 100644
+index 34eab7f..09c53e2 100644
 --- a/src/libstore/include/nix/store/globals.hh
 +++ b/src/libstore/include/nix/store/globals.hh
-@@ -421,6 +421,33 @@ public:
+@@ -9,6 +9,7 @@
+ #include "nix/store/build/derivation-builder.hh"
+ #include "nix/store/local-settings.hh"
+ #include "nix/store/store-reference.hh"
++#include "nix/store/styx.hh"
+ #include "nix/store/worker-settings.hh"
+ 
+ #include "nix/store/config.hh"
+@@ -421,6 +422,33 @@ public:
            Set it to 1 to warn on all paths.
          )"};
  
@@ -169,21 +177,21 @@ index 34eab7f..91d940a 100644
 +    Setting<uint64_t> styxMinSize{
 +        this, 64 * 1024, "styx-min-size", "Use Styx only for paths larger than this nar size."};
 +
-+    Setting<Strings> styxOndemand{
++    Setting<StyxPatterns> styxOndemand{
 +        this,
-+        Strings{},
++        StyxPatterns{},
 +        "styx-ondemand",
 +        "List of package name regexes to mount using Styx (empty means never use)"};
 +
-+    Setting<Strings> styxMaterialize{
++    Setting<StyxPatterns> styxMaterialize{
 +        this,
-+        Strings{},
++        StyxPatterns{},
 +        "styx-materialize",
 +        "List of package name regexes to materialize using Styx (empty means never use)"};
 +
-+    Setting<Strings> styxExclude{
++    Setting<StyxPatterns> styxExclude{
 +        this,
-+        Strings{},
++        StyxPatterns{},
 +        "styx-exclude",
 +        "List of package name regexes to deny using Styx (overrides styx-ondemand/materialize)"};
 +
@@ -221,15 +229,21 @@ index 3ccf0ad..7be7bb9 100644
    'worker-protocol-impl.hh',
 diff --git a/src/libstore/include/nix/store/styx.hh b/src/libstore/include/nix/store/styx.hh
 new file mode 100644
-index 0000000..1362f45
+index 0000000..ab7b439
 --- /dev/null
 +++ b/src/libstore/include/nix/store/styx.hh
-@@ -0,0 +1,28 @@
+@@ -0,0 +1,60 @@
 +#pragma once
 +///@file
 +
 +#include <cstdint>
++#include <regex>
 +#include <string>
++#include <vector>
++
++#include <nlohmann/json_fwd.hpp>
++
++#include "nix/util/configuration.hh"
 +
 +namespace nix {
 +
@@ -238,6 +252,32 @@ index 0000000..1362f45
 +    StyxMount,
 +    StyxMaterialize
 +} StyxMode;
++
++/**
++ * A package name regex from a styx-* setting. It is compiled when the
++ * setting is set, so that an invalid regex is rejected there, like any
++ * other malformed setting, and matching doesn't compile it again.
++ */
++struct StyxPattern
++{
++    std::string source;
++    std::regex regex;
++};
++
++typedef std::vector<StyxPattern> StyxPatterns;
++
++void to_json(nlohmann::json & json, const StyxPattern & pattern);
++
++template<>
++struct BaseSetting<StyxPatterns>::trait
++{
++    static constexpr bool appendable = true;
++};
++
++NIX_DECLARE_CONFIG_SERIALISER(StyxPatterns)
++
++template<>
++void BaseSetting<StyxPatterns>::appendOrSet(StyxPatterns newValue, bool append);
 +
 +StyxMode canUseStyx(const std::string storeUri, uint64_t narSize, std::string name);
 +void makeStyxMount(const std::string upstream, const std::string storePath, const std::string mountPoint, uint64_t narSize);
@@ -406,23 +446,24 @@ index fa19b08..8c32232 100644
          }
 diff --git a/src/libstore/styx.cc b/src/libstore/styx.cc
 new file mode 100644
-index 0000000..ffe8aac
+index 0000000..c432875
 --- /dev/null
 +++ b/src/libstore/styx.cc
-@@ -0,0 +1,220 @@
+@@ -0,0 +1,239 @@
 +
 +#include "nix/util/error.hh"
 +#include "nix/util/file-system.hh"
 +#include "nix/store/globals.hh"
 +#include "nix/util/logging.hh"
++#include "nix/util/config-impl.hh"
++#include "nix/util/abstract-setting-to-json.hh"
 +#include "nix/store/styx.hh"
 +
++#include <algorithm>
 +#include <cerrno>
 +#include <cstring>
 +#include <regex>
 +#include <map>
-+#include <memory>
-+#include <mutex>
 +#include <sys/mount.h>
 +#include <sys/stat.h>
 +#include <sys/vfs.h>
@@ -470,23 +511,47 @@ index 0000000..ffe8aac
 +    }
 +}
 +
-+// Compiles each styx-* pattern once. An invalid pattern is reported once and
-+// gives null, so a bad setting can't break substitution.
-+static const std::regex * styxRegex(const std::string & pattern) {
-+    static std::mutex lock;
-+    static std::map<std::string, std::unique_ptr<std::regex>> cache;
-+    std::lock_guard<std::mutex> guard(lock);
-+    auto i = cache.find(pattern);
-+    if (i == cache.end()) {
-+        std::unique_ptr<std::regex> re;
++void to_json(nlohmann::json & json, const StyxPattern & pattern)
++{
++    json = pattern.source;
++}
++
++template<>
++StyxPatterns BaseSetting<StyxPatterns>::parse(const std::string & str) const
++{
++    StyxPatterns res;
++    for (auto & s : tokenizeString<Strings>(str)) {
 +        try {
-+            re = std::make_unique<std::regex>(pattern);
++            res.push_back({.source = s, .regex = std::regex(s)});
 +        } catch (std::regex_error & e) {
-+            warn("ignoring invalid styx pattern '%s': %s", pattern, e.what());
++            throw UsageError("setting '%s' has invalid regex '%s': %s", name, s, e.what());
 +        }
-+        i = cache.emplace(pattern, std::move(re)).first;
 +    }
-+    return i->second.get();
++    return res;
++}
++
++template<>
++std::string BaseSetting<StyxPatterns>::to_string() const
++{
++    Strings ss;
++    for (auto & p : value)
++        ss.push_back(p.source);
++    return concatStringsSep(" ", ss);
++}
++
++template<>
++void BaseSetting<StyxPatterns>::appendOrSet(StyxPatterns newValue, bool append)
++{
++    if (!append)
++        value.clear();
++    value.insert(value.end(), std::make_move_iterator(newValue.begin()), std::make_move_iterator(newValue.end()));
++}
++
++template class BaseSetting<StyxPatterns>;
++
++static bool matchesStyxPattern(const StyxPatterns & patterns, const std::string & name)
++{
++    return std::ranges::any_of(patterns, [&](auto & p) { return std::regex_match(name, p.regex); });
 +}
 +
 +StyxMode canUseStyx(const std::string storeUri, uint64_t narSize, std::string name) {
@@ -503,18 +568,12 @@ index 0000000..ffe8aac
 +        if (!useStyx || narSize < settings.styxMinSize)
 +            return StyxDisable;
 +    }
-+    for (auto & exc : settings.styxExclude.get()) {
-+        auto re = styxRegex(exc);
-+        // an exclusion we can't evaluate excludes everything
-+        if (!re || std::regex_match(name, *re))
-+            return StyxDisable;
-+    }
-+    for (auto & inc : settings.styxOndemand.get())
-+        if (auto re = styxRegex(inc); re && std::regex_match(name, *re))
-+            return StyxMount;
-+    for (auto & inc : settings.styxMaterialize.get())
-+        if (auto re = styxRegex(inc); re && std::regex_match(name, *re))
-+            return StyxMaterialize;
++    if (matchesStyxPattern(settings.styxExclude.get(), name))
++        return StyxDisable;
++    if (matchesStyxPattern(settings.styxOndemand.get(), name))
++        return StyxMount;
++    if (matchesStyxPattern(settings.styxMaterialize.get(), name))
++        return StyxMaterialize;
 +    return StyxDisable;
 +}
 +

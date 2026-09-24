@@ -67,15 +67,43 @@ fi
 nixstore --store "$work/s1" "${styxopts[@]}" --option styx-ondemand '' --repair-path "$P" \
     && nixstore --store "$work/s1" --verify-path "$P" || setup_err "control repair without styx failed"
 
-section "invalid styx regex"
-# Expected: a malformed styx-ondemand pattern disables styx (or is rejected
-# when the setting is read); it must not break ordinary substitution.
-if nixstore --store "$work/s2" "${styxopts[@]}" --option styx-ondemand '*' --realise "$P" 2>&1 | tee "$work/regex.log"; then
-    pass "substitution still works with styx-ondemand = '*'"
-else
-    nfail "styx-ondemand = '*' makes substitution fail: $(tail -n 3 "$work/regex.log" | tr '\n' ' ')"
-fi
-nixstore --store "$work/s2b" "${styxopts[@]}" --option styx-ondemand 'nomatch' --realise "$P" >/dev/null \
+section "invalid styx regexes"
+# Expected: a styx-ondemand, styx-materialize or styx-exclude pattern that
+# isn't a valid regex is rejected when the settings are loaded or set, with
+# an error naming the setting and the pattern, as for any other malformed
+# setting. (--option only warns about a malformed value and keeps the
+# previous one, for every setting.)
+nixcmd() { "$NIXBIN/nix" --extra-experimental-features nix-command "$@"; }
+oneline() { tail -n 3 "$1" | tr '\n' ' '; }
+for s in styx-ondemand styx-materialize styx-exclude; do
+    err="setting '$s' has invalid regex '\*'"
+    log="$work/regex-$s.log"
+    if NIX_CONFIG="$s = foo.* *" nixcmd config show "$s" > "$log" 2>&1; then
+        nfail "nix loaded '$s = foo.* *' from NIX_CONFIG: $(oneline "$log")"
+    elif ! grep -q "$err" "$log"; then
+        nfail "nix rejected '$s = foo.* *' without naming the setting and pattern: $(oneline "$log")"
+    else
+        pass "config load rejects '$s = foo.* *': $(grep -m 1 error "$log")"
+    fi
+    if nixstore --store "$work/s2" "${styxopts[@]}" "--$s" '*' --realise "$P" > "$log" 2>&1; then
+        nfail "nix-store --$s '*' --realise succeeded: $(oneline "$log")"
+    elif ! grep -q "$err" "$log"; then
+        nfail "nix-store --$s '*' failed without naming the setting and pattern: $(oneline "$log")"
+    else
+        pass "nix-store --$s '*' is rejected"
+    fi
+    if ! nixcmd --option "$s" '*' config show "$s" > "$log" 2>&1; then
+        nfail "nix --option $s '*' failed: $(oneline "$log")"
+    elif ! grep -q "$err" "$log" || [ "$(grep -v "$err" "$log")" != "" ]; then
+        nfail "nix --option $s '*' did not warn and keep the default: $(oneline "$log")"
+    else
+        pass "nix --option $s '*' warns and keeps the default"
+    fi
+    # Control: valid patterns load and print as given.
+    v=$(NIX_CONFIG="$s = foo.* bar" nixcmd config show "$s") && [ "$v" = "foo.* bar" ] \
+        || setup_err "'$s = foo.* bar' does not load or show as given: $v"
+done
+nixstore --store "$work/s2" "${styxopts[@]}" --option styx-ondemand 'nomatch' --realise "$P" >/dev/null \
     || setup_err "control substitution with a valid regex failed"
 
 # Fake styx daemon: /mount and /materialize answer Success, /umount answers
@@ -177,18 +205,6 @@ elif ! grep -q "falling back to substitution" "$work/s4b.log"; then
     nfail "styx was not used, or did not fail: $(tail -n 3 "$work/s4b.log" | tr '\n' ' ')"
 else
     pass "a corrupt materialize fell back to substitution"
-fi
-
-section "invalid styx-exclude regex"
-# Expected: an exclusion that can't be evaluated keeps styx away from every
-# path, and substitution still works.
-nmount=$(grep -c '^/mount' "$work/fake.log")
-if ! nixstore --store "$work/s6" "${fakeopts[@]}" --option styx-ondemand '.*' --option styx-exclude '*' --realise "$P" > "$work/s6.log" 2>&1; then
-    nfail "styx-exclude = '*' makes substitution fail: $(tail -n 3 "$work/s6.log" | tr '\n' ' ')"
-elif [ "$(grep -c '^/mount' "$work/fake.log")" != "$nmount" ]; then
-    nfail "styx-exclude = '*' did not keep styx away: $(tail -n 1 "$work/fake.log")"
-else
-    pass "substitution without styx with styx-exclude = '*'"
 fi
 
 # The rest needs root and a loop-mounted EROFS image over a valid path.
