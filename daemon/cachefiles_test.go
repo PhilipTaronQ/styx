@@ -176,6 +176,19 @@ func TestImageDataNotRetainedAfterWrite(t *testing.T) {
 		"mounted image object still holds %d bytes of image data that was already written", len(st.imageData))
 }
 
+// Stop must close the manifest slab fd, which has no cachefiles object.
+func TestStopClosesManifestSlabFd(t *testing.T) {
+	s := newTestServer(t, 2, true)
+	require.NoError(t, s.setupManifestSlab())
+	fd := s.readfdBySlab[manifestSlabOffset].readFd
+	require.Positive(t, fd)
+
+	s.Stop(false)
+
+	_, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0)
+	require.ErrorIs(t, err, unix.EBADF, "manifest slab fd still open after Stop")
+}
+
 // handleReadSlabImage must not write a buffer that SlabImageRead failed to fill.
 func TestSlabImageReadErrorIsReturned(t *testing.T) {
 	s := newTestServer(t, 2, true)

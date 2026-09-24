@@ -942,20 +942,40 @@ func (s *Server) Stop(closeDevnode bool) {
 	log.Print("daemon shutdown done")
 }
 
+// Closes the fds of open objects, and of slabs that have no object: the manifest slab,
+// the slab outside on-demand mode, and slab images mounted before the slab was opened.
 func (s *Server) closeAllFds() {
 	s.stateLock.Lock()
 	defer s.stateLock.Unlock()
-	for _, state := range s.cacheState {
-		var fds slabFds
-		switch state.tp {
-		case typeSlab, typeManifestSlab:
-			fds = s.readfdBySlab[state.slabId]
-		}
-		s.closeState(state, fds)
-		if state.tp == typeSlab {
-			s.unmountSlabImage(state.slabId)
+	fds := make(map[int]struct{})
+	add := func(fd int) {
+		if fd > 0 {
+			fds[fd] = struct{}{}
 		}
 	}
+	var slabIds []uint16
+	for _, state := range s.cacheState {
+		add(int(state.writeFd))
+		if state.tp == typeSlab {
+			slabIds = append(slabIds, state.slabId)
+		}
+	}
+	for _, state := range s.stateBySlab {
+		add(int(state.writeFd))
+	}
+	for _, sfds := range s.readfdBySlab {
+		add(sfds.readFd)
+		add(sfds.cacheFd)
+	}
+	for fd := range fds {
+		_ = unix.Close(fd)
+	}
+	for _, id := range slabIds {
+		s.unmountSlabImage(id)
+	}
+	clear(s.cacheState)
+	clear(s.stateBySlab)
+	clear(s.readfdBySlab)
 }
 
 // Unbounded FIFO of cachefiles messages, so that queueing one never blocks.
