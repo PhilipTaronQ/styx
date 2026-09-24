@@ -1,0 +1,83 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pins.nix can only fetch pins via `spin` unless this is set.
+  SPIN_FALLBACK: "1"
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::files need gofmt:"; echo "$unformatted"; exit 1
+          fi
+      - run: go vet ./...
+      - run: go build ./...
+      # ./tests needs root and a styx-capable kernel; it runs in the test job.
+      - run: go list ./... | grep -v '/tests$' | xargs go test
+
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: cachix/install-nix-action@v31
+      - uses: nix-community/cache-nix-action@v6
+        with:
+          primary-key: nix-build-${{ hashFiles('**/*.nix', 'Pins.json', 'go.sum') }}
+          restore-prefixes-first-match: nix-build-
+      - name: nix-build
+        run: nix-build --no-out-link -A styx-local -A charon -A charon-light -A spin
+
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check kernel supports styx
+        run: |
+          kver=$(uname -r)
+          echo "kernel $kver"
+          missing=
+          for opt in CACHEFILES_ONDEMAND EROFS_FS_ONDEMAND; do
+            grep -q "^CONFIG_${opt}=y" "/boot/config-$kver" || missing="$missing CONFIG_${opt}"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::runner kernel $kver lacks$missing; styx tests cannot run on the host"
+            exit 1
+          fi
+          sudo modprobe cachefiles
+          sudo modprobe erofs
+      - uses: actions/checkout@v5
+      - uses: cachix/install-nix-action@v31
+      - uses: nix-community/cache-nix-action@v6
+        with:
+          primary-key: nix-test-${{ hashFiles('**/*.nix', 'Pins.json', 'go.sum') }}
+          restore-prefixes-first-match: nix-test-
+      - name: Build test binary and tools
+        run: |
+          nix-build -o styxtest -A styx-test
+          # tools the tests exec from PATH (the VM test gets these from NixOS)
+          nix-build -o tools -E 'with import (import ./Pins.nix).nixpkgs {}; buildEnv { name = "styxtest-tools"; paths = [ nix psmisc xz ]; }'
+      - name: Run test suite
+        working-directory: styxtest/bin
+        run: |
+          sudo env PATH="$GITHUB_WORKSPACE/tools/bin:$PATH" \
+            ./styxtest -test.v -test.timeout 45m
