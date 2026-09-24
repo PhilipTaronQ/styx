@@ -12,6 +12,7 @@ import (
 	"maps"
 	"net/http"
 	"regexp"
+	"runtime/debug"
 	"slices"
 	"strings"
 	"sync"
@@ -147,44 +148,46 @@ func (s *Server) requestChunk(ctx context.Context, loc erofs.SlabLoc, digest cdi
 		sphps = nil
 	}
 
-	var op reqOp
+	op := func() (op reqOp) {
+		s.diffLock.Lock()
+		defer s.diffLock.Unlock()
 
-	s.diffLock.Lock()
-	if op = s.diffMap[loc]; op != nil {
-		// being request already, wait on this one
-	} else if len(sphps) == 0 {
-		// force single op
-	} else {
-		set := newOpSet(s)
-		err := s.db.View(func(tx *bbolt.Tx) (err error) {
-			// If we already have it (another read of it was handled after the op that wrote it
-			// finished, or its present record outlived its data), don't build ops for its
-			// neighbours, just read it again directly.
-			if !s.locPresent(tx, loc) {
-				op, err = set.build(tx, loc, digest, sphps, true)
-			}
-			return
-		})
-		if err != nil {
-			log.Printf("buildDiff failed: %v", err)
-		} else if op != nil {
-			// TODO: if set is a single op, with a single req and no base, change to single
+		if op = s.diffMap[loc]; op != nil {
+			// being request already, wait on this one
+		} else if len(sphps) == 0 {
+			// force single op
+		} else {
+			set := newOpSet(s)
+			err := s.db.View(func(tx *bbolt.Tx) (err error) {
+				// If we already have it (another read of it was handled after the op that wrote
+				// it finished, or its present record outlived its data), don't build ops for
+				// its neighbours, just read it again directly.
+				if !s.locPresent(tx, loc) {
+					op, err = set.build(tx, loc, digest, sphps, true)
+				}
+				return
+			})
+			if err != nil {
+				log.Printf("buildDiff failed: %v", err)
+			} else if op != nil {
+				// TODO: if set is a single op, with a single req and no base, change to single
 
-			// note that op is left as diffMap[loc] to wait on
-			for _, startOp := range set.ops {
-				go s.startDiffOp(ctx, startOp)
-			}
-			if extra := len(set.ops) - 1; extra > 0 {
-				s.stats.extraReqs.Add(int64(extra))
+				// note that op is left as diffMap[loc] to wait on
+				for _, startOp := range set.ops {
+					go s.startDiffOp(ctx, startOp)
+				}
+				if extra := len(set.ops) - 1; extra > 0 {
+					s.stats.extraReqs.Add(int64(extra))
+				}
 			}
 		}
-	}
-	if op == nil {
-		sop := s.buildSingleOp(loc, digest)
-		go s.startSingleOp(ctx, sop)
-		op = sop
-	}
-	s.diffLock.Unlock()
+		if op == nil {
+			sop := s.buildSingleOp(loc, digest)
+			go s.startSingleOp(ctx, sop)
+			op = sop
+		}
+		return op
+	}()
 
 	// TODO: consider racing the diff against a single chunk read (with small delay)
 	// return when either is done
@@ -1238,9 +1241,9 @@ func (set *opSet) subOpFits(sop subOp) bool {
 		(set.op.reqTotalSize+sop.reqSize) <= MaxOpBytes
 }
 
-// build runs buildDiff and returns the op that will fetch the chunk at loc. If that fails,
-// it unregisters every op it added to diffMap, since nothing will start them and anyone
-// waiting on one would wait forever.
+// build runs buildDiff and returns the op that will fetch the chunk at loc. If that fails
+// or panics, it unregisters every op it added to diffMap, since nothing will start them and
+// anyone waiting on one would wait forever.
 // call with diffLock held
 func (set *opSet) build(
 	tx *bbolt.Tx,
@@ -1250,6 +1253,12 @@ func (set *opSet) build(
 	useRR bool,
 ) (op reqOp, err error) {
 	defer func() {
+		if r := recover(); r != nil {
+			// buildDiff works from db contents and manifests, so treat a panic as bad data,
+			// like startDiffOp does: callers can still fall back to a single read.
+			log.Printf("panic in buildDiff: %v\n%s", r, debug.Stack())
+			op, err = nil, fmt.Errorf("panic in buildDiff: %v", r)
+		}
 		if err != nil {
 			for _, op := range set.ops {
 				set.s.unregisterDiffOp(op)

@@ -7,9 +7,11 @@ import (
 
 	"github.com/stretchr/testify/require"
 	"go.etcd.io/bbolt"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/dnr/styx/common"
 	"github.com/dnr/styx/common/cdig"
+	"github.com/dnr/styx/pb"
 )
 
 // buildOps builds the ops that requestChunk would build for digest, without starting them.
@@ -49,6 +51,63 @@ func TestRequestChunkForPresentChunkLeavesNoOps(t *testing.T) {
 
 	// a later read of chunk 8 would find a leaked op in diffMap and wait on it forever
 	requestChunkWithin(t, e.s, locs[8], digests[8], e.sphps(digests[8]), 5*time.Second)
+}
+
+// requestChunk took diffLock without defer and ran buildDiff (manifest reads, proto decoding,
+// iterator arithmetic on db contents) under it. handleMessage recovers panics, so a panic
+// there left diffLock held and every later chunk request blocked forever. One data-driven
+// trigger: an envelope's chunk_shift is not covered by the signature (entryFingerprint), and
+// a negative value panics in Shift.Size() when a diff base's chunked manifest is read.
+func TestPanicInBuildDiffDoesNotWedge(t *testing.T) {
+	e := newFetchEnv(t)
+	chunks := testChunks(2, 3)
+	e.serveChunks(chunks)
+	digests, locs := e.addImage(testSpX, chunks)
+
+	// diff base candidate (same pname) with a chunked manifest envelope, chunk_shift = -1
+	sphB, sphStrB, nameB, err := ParseSphAndName(testSpB)
+	require.NoError(t, err)
+	mdata := []byte("manifest chunk")
+	mdig := cdig.Sum(mdata)
+	envelope, err := proto.Marshal(&pb.SignedMessage{
+		Msg: &pb.Entry{
+			Path:       common.ManifestContext + "/" + testSpB,
+			Type:       pb.EntryType_REGULAR,
+			Size:       int64(len(mdata)),
+			Digests:    mdig[:],
+			ChunkShift: -1,
+		},
+		Params: &pb.GlobalParams{DigestAlgo: cdig.Algo, DigestBits: cdig.Bits},
+	})
+	require.NoError(t, err)
+	e.putManifest(sphB, sphStrB, nameB, envelope)
+	mlocs, err := e.s.AllocateBatch(withAllocateCtx(context.Background(), makeManifestSph(sphB), true), []uint16{1}, []cdig.CDig{mdig})
+	require.NoError(t, err)
+	e.s.presentMap.Put(mlocs[0], struct{}{})
+
+	// precondition: building the diff panics
+	sphps := e.sphps(digests[0])
+	var buildErr error
+	e.s.diffLock.Lock()
+	_ = e.s.db.View(func(tx *bbolt.Tx) error {
+		_, buildErr = newOpSet(e.s).build(tx, locs[0], digests[0], sphps, false)
+		return nil
+	})
+	e.s.diffLock.Unlock()
+	require.ErrorContains(t, buildErr, "panic in buildDiff")
+	require.Zero(t, e.diffMapLen())
+
+	// falls back to a single read
+	requestChunkWithin(t, e.s, locs[0], digests[0], e.sphps(digests[0]), 10*time.Second)
+
+	if !e.s.diffLock.TryLock() {
+		t.Fatal("diffLock is still held after a panic in buildDiff; every later chunk request would block forever")
+	}
+	e.s.diffLock.Unlock()
+	require.Zero(t, e.diffMapLen())
+
+	// and later requests still work
+	requestChunkWithin(t, e.s, locs[1], digests[1], e.sphps(digests[1]), 10*time.Second)
 }
 
 // Chunk diffs are checked against their digests only after decompressing, so a small zstd
