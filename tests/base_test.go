@@ -37,8 +37,9 @@ const (
 
 	blockShift = 12
 
-	// Stop returns within one cachefiles poll (500ms in testing mode) once
-	// the workers are idle.
+	// Stop wakes the cachefiles poll and cancels reads in flight, so it
+	// returns promptly unless something is wedged. This is far longer than
+	// that, and short enough to report a wedge before the suite timeout.
 	stopTimeout = 2 * time.Minute
 )
 

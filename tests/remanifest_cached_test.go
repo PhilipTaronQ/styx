@@ -23,7 +23,8 @@ func TestRemanifestWithCachedManifestButMissingChunks(t *testing.T) {
 	tb := newTestBase(t)
 	tb.startAll()
 
-	mp1 := tb.mount("qa22bifihaxyvn6q2a6w9m0nklqrk9wh-opusfile-0.12")
+	sp := "qa22bifihaxyvn6q2a6w9m0nklqrk9wh-opusfile-0.12"
+	mp1 := tb.mount(sp)
 
 	ents, err := os.ReadDir(tb.chunkdir)
 	require.NoError(t, err)
@@ -42,5 +43,7 @@ func TestRemanifestWithCachedManifestButMissingChunks(t *testing.T) {
 	require.NotZero(t, removed)
 	require.NotZero(t, kept)
 
-	require.Equal(t, "1rswindywkyq2jmfpxd6n772jii3z5xz6ypfbb63c17k5il39hfm", tb.nixHash(mp1))
+	d1 := tb.debug()
+	tb.requireNarHash(mp1, sp)
+	requireRemanifested(t, tb.debug().Stats.Sub(d1.Stats))
 }
