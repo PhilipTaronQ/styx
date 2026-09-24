@@ -109,6 +109,52 @@ func TestReaderCloseStopsParser(t *testing.T) {
 	}
 }
 
+// A nar cut short anywhere, including between two tokens, is an error, not a clean end
+// (which is what callers check for with err == io.EOF).
+func TestReaderTruncated(t *testing.T) {
+	// contents that need no padding
+	var eight bytes.Buffer
+	nw, err := nar.NewWriter(&eight)
+	require.NoError(t, err)
+	require.NoError(t, nw.WriteHeader(&nar.Header{Path: "/", Type: nar.TypeRegular, Size: 8}))
+	_, err = nw.Write([]byte("12345678"))
+	require.NoError(t, err)
+	require.NoError(t, nw.Close())
+
+	for name, full := range map[string][]byte{
+		"empty directory": genEmptyDirectoryNar(),
+		"regular":         genOneByteRegularNar(),
+		"regular 8 bytes": eight.Bytes(),
+		"symlink":         genSymlinkNar(),
+	} {
+		for _, contents := range []bool{false, true} {
+			require.ErrorIs(t, readAllOf(t, full, contents), io.EOF, name)
+			for n := 24; n < len(full); n++ { // 24: just the magic
+				err := readAllOf(t, full[:n], contents)
+				assert.Error(t, err, "%s cut to %d bytes", name, n)
+				assert.NotEqual(t, io.EOF, err, "%s cut to %d bytes", name, n)
+			}
+		}
+	}
+}
+
+// readAllOf reads every header of a nar, and the contents of every file if contents is set,
+// and returns the first error.
+func readAllOf(t *testing.T, b []byte, contents bool) error {
+	nr, err := nar.NewReader(bytes.NewReader(b))
+	require.NoError(t, err)
+	defer nr.Close()
+	for {
+		if _, err := nr.Next(); err != nil {
+			return err
+		} else if contents {
+			if _, err := io.ReadAll(nr); err != nil {
+				return err
+			}
+		}
+	}
+}
+
 // Next after Close fails instead of blocking.
 func TestReaderNextAfterClose(t *testing.T) {
 	nr, err := nar.NewReader(bytes.NewReader(genSymlinkNar()))

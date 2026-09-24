@@ -1,6 +1,7 @@
 // Copied from github.com/nix-community/go-nix pkg/nar at commit 4bdde671e0a1
 // (v0.0.0-20250101154619-4bdde671e0a1). Licensed under the Apache License 2.0, see LICENSE.
-// Modified: Close stops the parser goroutine, which could otherwise block forever.
+// Modified: Close stops the parser goroutine, which could otherwise block forever, and a nar
+// that's cut short anywhere is an error, not a clean io.EOF (see wire.go).
 
 package nar
 
@@ -99,6 +100,9 @@ func NewReader(r io.Reader) (*Reader, error) {
 		err := narReader.parseNode("/")
 		if err == nil {
 			err = io.EOF
+		} else if err == io.EOF {
+			// the input ended between two tokens, before the nar did
+			err = io.ErrUnexpectedEOF
 		}
 		select {
 		case narReader.errors <- err:
@@ -128,7 +132,7 @@ func (nr *Reader) parseNode(p string) error {
 	var currentToken string
 
 	// switch on the type label
-	currentToken, err = wire.ReadString(nr.r, tokenLenMax)
+	currentToken, err = readString(nr.r, tokenLenMax)
 	if err != nil {
 		return err
 	}
@@ -137,7 +141,7 @@ func (nr *Reader) parseNode(p string) error {
 	case "regular":
 		// we optionally see executable, marking the file as executable,
 		// and then contents, with the contents afterwards
-		currentToken, err = wire.ReadString(nr.r, uint64(len("executable")))
+		currentToken, err = readString(nr.r, uint64(len("executable")))
 		if err != nil {
 			return err
 		}
@@ -148,12 +152,12 @@ func (nr *Reader) parseNode(p string) error {
 
 			// These seems to be 8 null bytes after the executable field,
 			// which can be seen as an empty string field.
-			_, err := wire.ReadBytesFull(nr.r, 0)
+			_, err := readBytesFull(nr.r, 0)
 			if err != nil {
 				return fmt.Errorf("error reading placeholder: %w", err)
 			}
 
-			currentToken, err = wire.ReadString(nr.r, tokenLenMax)
+			currentToken, err = readString(nr.r, tokenLenMax)
 			if err != nil {
 				return err
 			}
@@ -164,7 +168,7 @@ func (nr *Reader) parseNode(p string) error {
 		}
 
 		// peek at the bytes field
-		contentLength, contentReader, err := wire.ReadBytes(nr.r)
+		contentLength, err := wire.ReadUint64(nr.r)
 		if err != nil {
 			return err
 		}
@@ -173,7 +177,7 @@ func (nr *Reader) parseNode(p string) error {
 			return fmt.Errorf("content length of %v is larger than MaxInt64", contentLength)
 		}
 
-		nr.contentReader = contentReader
+		nr.contentReader = newContentReader(nr.r, contentLength)
 
 		// yield back the header, and wait for the Next() call
 		if !nr.yield(&Header{
@@ -193,7 +197,7 @@ func (nr *Reader) parseNode(p string) error {
 		}
 
 		// consume the next token
-		currentToken, err = wire.ReadString(nr.r, tokenLenMax)
+		currentToken, err = readString(nr.r, tokenLenMax)
 		if err != nil {
 			return err
 		}
@@ -206,7 +210,7 @@ func (nr *Reader) parseNode(p string) error {
 		}
 
 		// read in the target
-		target, err := wire.ReadString(nr.r, pathLenMax)
+		target, err := readString(nr.r, pathLenMax)
 		if err != nil {
 			return err
 		}
@@ -226,7 +230,7 @@ func (nr *Reader) parseNode(p string) error {
 		}
 
 		// consume the next token
-		currentToken, err = wire.ReadString(nr.r, tokenLenMax)
+		currentToken, err = readString(nr.r, tokenLenMax)
 		if err != nil {
 			return err
 		}
@@ -249,7 +253,7 @@ func (nr *Reader) parseNode(p string) error {
 
 		for {
 			// read the next token
-			currentToken, err = wire.ReadString(nr.r, tokenLenMax)
+			currentToken, err = readString(nr.r, tokenLenMax)
 			if err != nil {
 				return err
 			}
@@ -266,7 +270,7 @@ func (nr *Reader) parseNode(p string) error {
 					return err
 				}
 
-				currentToken, err = wire.ReadString(nr.r, nameLenMax)
+				currentToken, err = readString(nr.r, nameLenMax)
 				if err != nil {
 					return err
 				}
@@ -398,7 +402,7 @@ func (nr *Reader) yield(hdr *Header) bool {
 // expectString reads a string field from a reader, expecting a certain result,
 // and errors out if the reader ends unexpected, or didn't read the expected.
 func expectString(r io.Reader, expected string) error {
-	s, err := wire.ReadString(r, uint64(len(expected)))
+	s, err := readString(r, uint64(len(expected)))
 	if err != nil {
 		if err == io.EOF {
 			err = io.ErrUnexpectedEOF
