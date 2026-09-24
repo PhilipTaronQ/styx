@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -82,6 +83,31 @@ func TestTarballDotDotEntryDuplicatesPath(t *testing.T) {
 		paths = append(paths, e.Path)
 	}
 	assert.Equal(t, []string{"/", "/a", "/a/b", "/c"}, paths)
+}
+
+// Tarball path depth was unbounded. A single entry at depth D creates D parent directories,
+// and sorting them with narPathLess costs O(D) per comparison, so a ~16KB path in a tiny
+// tarball cost seconds; a 1MiB PAX path (archive/tar's limit) kept a Lambda busy until its
+// timeout.
+func TestTarballDeepPathIsSuperlinear(t *testing.T) {
+	const depth = 8000
+	up := newFakeUpstream(t)
+	up.set("/deep.tar", makeTar(t, []tarFile{{strings.Repeat("a/", depth) + "f", tar.TypeReg, "x"}}))
+	cs := &mockChunkStore{data: make(map[string][]byte)}
+	mb, err := NewManifestBuilder(ManifestBuilderConfig{}, cs)
+	require.NoError(t, err)
+
+	start := time.Now()
+	_, err = mb.BuildFromTarball(context.Background(), up.ts.URL+"/deep.tar", 0, 0, "", false)
+	elapsed := time.Since(start)
+	t.Logf("tarball with path depth %d: err=%v in %s", depth, err, elapsed)
+	assert.Less(t, elapsed, time.Second, "a tiny tarball took %s to process", elapsed)
+	assert.Error(t, err)
+
+	// reasonable depths are fine
+	up.set("/ok.tar", makeTar(t, []tarFile{{strings.Repeat("a/", 200) + "f", tar.TypeReg, "x"}}))
+	_, err = mb.BuildFromTarball(context.Background(), up.ts.URL+"/ok.tar", 0, 0, "", false)
+	assert.NoError(t, err)
 }
 
 // Same for tarballs: nothing read or closed the pipe after buildFromNar failed, so the

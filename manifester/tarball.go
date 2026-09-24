@@ -28,6 +28,14 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+const (
+	// Limits on tarball structure. Each entry adds its missing parents, and sorting compares
+	// paths component by component, so the cost grows with depth as well as entry count.
+	maxTarPathLen   = 4096 // PATH_MAX, also bounds the depth
+	maxTarEntries   = 1 << 20
+	maxTarPathBytes = 64 << 20 // total over all entries, including added parents
+)
+
 type tarEntry struct {
 	nar.Header
 	offset int64
@@ -298,6 +306,7 @@ func (b *ManifestBuilder) extractTar(r io.Reader, tmpData *os.File, tmpBuf []byt
 		},
 	}}
 	seen := map[string]int{"/": 0} // path -> index in ents
+	pathBytes := 0
 
 	for {
 		ent, err := b.tarEntry(tr, tmpData, tmpBuf)
@@ -331,6 +340,14 @@ func (b *ManifestBuilder) extractTar(r io.Reader, tmpData *os.File, tmpBuf []byt
 		} else {
 			seen[ent.Path] = len(ents)
 			ents = append(ents, ent)
+		}
+
+		for _, p := range parents {
+			pathBytes += len(p)
+		}
+		pathBytes += len(ent.Path)
+		if len(ents) > maxTarEntries || pathBytes > maxTarPathBytes {
+			return nil, fmt.Errorf("tarball has more than %d entries or %d bytes of paths", maxTarEntries, maxTarPathBytes)
 		}
 	}
 
@@ -385,6 +402,8 @@ func (b *ManifestBuilder) tarEntry(tr *tar.Reader, tmpData *os.File, tmpBuf []by
 		return nil, err
 	} else if h.Typeflag == tar.TypeXGlobalHeader {
 		return nil, nil // skip PAX global headers
+	} else if len(h.Name) > maxTarPathLen || len(h.Linkname) > maxTarPathLen {
+		return nil, fmt.Errorf("tar entry name or link target longer than %d bytes", maxTarPathLen)
 	}
 
 	// like tar, refuse ".." components. path.Clean keeps a leading "..", and "/../x" would
