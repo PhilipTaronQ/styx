@@ -9,12 +9,16 @@ package tests
 import (
 	"errors"
 	"io/fs"
+	"net/http"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 
+	"github.com/dnr/styx/common/client"
+	"github.com/dnr/styx/daemon"
 	"github.com/dnr/styx/erofs"
 )
 
@@ -52,4 +56,39 @@ func TestNixContractRestoreSkipsDeletedMountPoint(t *testing.T) {
 	} else {
 		require.True(t, errors.Is(err, fs.ErrNotExist), "lstat: %v", err)
 	}
+}
+
+// If a mount goes away without the daemon's involvement (unmounted by an
+// admin or a systemd mount unit, or not yet restored after boot), the
+// daemon's record still says Mounted. The patch's makeStyxMount clears and
+// re-creates the mount point and sends /mount; on Success it registers the
+// store path as valid. So Success must mean the path is actually mounted.
+func TestNixContractMountSuccessMeansMounted(t *testing.T) {
+	tb := newTestBase(t)
+	tb.startAll()
+
+	sp := "qa22bifihaxyvn6q2a6w9m0nklqrk9wh-opusfile-0.12"
+	mp := tb.mount(sp)
+	require.True(t, statfsIsErofs(t, mp))
+
+	require.NoError(t, unix.Unmount(mp, 0))
+	require.False(t, statfsIsErofs(t, mp))
+
+	// What makeStyxMount does before its request: deletePath + createDirs.
+	require.NoError(t, os.RemoveAll(mp))
+	require.NoError(t, os.MkdirAll(mp, 0o755))
+
+	c := client.NewClient(filepath.Join(tb.cachedir, "styx.sock"))
+	var res daemon.Status
+	code, err := c.Call(daemon.MountPath, daemon.MountReq{
+		Upstream:   tb.upstreamUrl,
+		StorePath:  sp,
+		MountPoint: mp,
+	}, &res)
+	require.NoError(t, err)
+	t.Logf("mount after external unmount: code %d, res %+v", code, res)
+	require.Equal(t, http.StatusOK, code)
+	require.True(t, res.Success, "error: %s", res.Error)
+	require.True(t, statfsIsErofs(t, mp),
+		"daemon reported mount success but %s is not an erofs mount; nix would register an empty directory as valid", mp)
 }

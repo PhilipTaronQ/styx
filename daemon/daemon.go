@@ -594,10 +594,14 @@ func (s *Server) handleMountReq(ctx context.Context, r *MountReq) (*Status, erro
 
 	common.NormalizeUpstream(&r.Upstream)
 
+	// the record can still say mounted after the mount went away without us
+	// (unmounted by someone else, or not restored yet). then mount it again.
+	kernelMounted, _ := isErofsMount(r.MountPoint)
+
 	var haveImageSize int64
 	var haveIsBare bool
 	err = s.imageTx(sphStr, func(img *pb.DbImage) error {
-		if img.MountState == pb.MountState_Mounted {
+		if img.MountState == pb.MountState_Mounted && (kernelMounted || img.MountPoint != r.MountPoint) {
 			if img.MountPoint == r.MountPoint {
 				// nix thinks it's not mounted but it is. return success so nix can enter in db.
 				return errAlreadyMounted
