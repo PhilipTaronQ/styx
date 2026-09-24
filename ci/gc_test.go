@@ -660,3 +660,29 @@ func TestGCFakeBasics(t *testing.T) {
 		require.False(t, f.has(testChunkKey(d)), "dropped chunk "+d.String())
 	}
 }
+
+// A sharded build writes an empty completion marker under manifest/ for each shard. Nothing
+// refers to one, so GC deletes it once it's past the grace window, and it must never be
+// traced as a manifest: if its delete failed, tracing it as one failed the whole GC run.
+func TestGCShardMarkers(t *testing.T) {
+	f := newFakeS3()
+	g, sb := newTestGC(t, f)
+	recent := testManifestKey("v1-recent.shard-0-of-2.layout")
+	old := testManifestKey("v1-old.shard-1-of-2.layout")
+	stuck := testManifestKey("v1-stuck.shard-0-of-3.layout")
+	f.putAt(recent, nil, g.now.Add(-gcGrace+time.Hour))
+	f.putAt(old, nil, g.now.Add(-gcGrace-time.Hour))
+	f.putAt(stuck, nil, g.now.Add(-gcGrace-time.Hour))
+	f.failDelete = func(key string) bool { return key == stuck }
+
+	require.NoError(t, g.run(context.Background()))
+	t.Log(sb.String())
+	require.True(t, f.has(recent), "a marker within the grace window was deleted")
+	require.False(t, f.has(old), "an old marker was kept")
+	require.True(t, f.has(stuck), "test setup: the marker's delete should have failed")
+	for _, key := range []string{recent, old, stuck} {
+		phase, _, known := g.classify(key)
+		require.True(t, known)
+		require.Equal(t, phaseLeaves, phase, "%s isn't deleted with the leaves", key)
+	}
+}

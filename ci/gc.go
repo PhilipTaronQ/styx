@@ -248,6 +248,11 @@ func (gc *gc) classify(key string) (phase int, live, known bool) {
 	has := func(m *sync.Map, k any) bool { _, ok := m.Load(k); return ok }
 	if strings.HasPrefix(key, manifester.BuildRootPath[1:]) {
 		return phaseRoots, has(&gc.tracedRoots, path.Base(key)), true
+	} else if strings.HasPrefix(key, manifester.ManifestCachePath[1:]) && manifester.IsShardMarker(path.Base(key)) {
+		// A sharded build's completion marker: empty, referenced by nothing, and useful only
+		// while its build runs. Delete it with the leaves, so that if its delete fails
+		// keepReferents doesn't try to trace it as a manifest.
+		return phaseLeaves, false, true
 	} else if strings.HasPrefix(key, manifester.ManifestCachePath[1:]) {
 		return phaseRefs, has(&gc.goodManifest, path.Base(key)), true
 	} else if key == "nixcache/nix-cache-info" {

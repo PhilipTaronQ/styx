@@ -45,8 +45,9 @@ import (
 // that changed chunking) never complete each other.
 //
 // Markers are empty objects in ManifestCachePath, named "<cache key>.shard-<i>-of-<n>.<hash>".
-// No cache key or chunk digest contains a ".". Bucket GC (ci/gc.go) sees them as manifests
-// that no build root refers to, so it deletes them once they're older than its grace window.
+// No cache key or chunk digest contains a ".". Bucket GC (ci/gc.go) recognises them with
+// IsShardMarker: nothing refers to them, so it deletes them with the leaves once they're
+// older than its grace window, and never reads one as a manifest.
 // A marker vouches for its chunks only while they can't have been garbage-collected, so
 // markers older than shardMarkerMaxAge are ignored: every shard of a request runs within
 // that, and it's far shorter than GC's grace window.
