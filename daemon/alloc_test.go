@@ -8,6 +8,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 	"go.etcd.io/bbolt"
+	"golang.org/x/sys/unix"
 
 	"github.com/dnr/styx/common/cdig"
 	"github.com/dnr/styx/common/shift"
@@ -88,6 +89,11 @@ func TestPreallocateBatchSlabRollover(t *testing.T) {
 	s := newTestServer(t, 1, false)
 	limit := uint64(slabBytes >> s.blockShift)
 	setSlabSequence(t, s, 0, limit-20)
+	// commitPreallocated syncs the slabs it wrote to, so both need files
+	for id := range uint16(2) {
+		require.NoError(t, s.setupFakeSlabImage(id))
+		t.Cleanup(func() { unix.Close(s.readfdBySlab[id].readFd) })
+	}
 
 	ctx := withAllocateCtx(context.Background(), slabTestSph(t), false)
 	var allocs []testAlloc
