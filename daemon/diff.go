@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -35,6 +36,7 @@ import (
 const (
 	recentReadExpiry      = 30 * time.Second
 	remanifestCacheExpiry = time.Minute
+	remanifestTimeout     = 15 * time.Minute
 
 	// only public so they can be referenced by tests
 	InitOpSize = 8
@@ -126,6 +128,11 @@ type (
 		when time.Time
 		err  error         // only read after done is closed
 		done chan struct{} // closed after writing err
+
+		cancel    context.CancelFunc // cancels the request
+		mu        sync.Mutex
+		waiters   int  // callers waiting on done (under mu)
+		abandoned bool // every waiter left before done, request was cancelled (under mu)
 	}
 
 	triedRemanifest struct{}
@@ -941,29 +948,8 @@ func (s *Server) doRemanifestReqs(ctx context.Context, reqs []MountReq) error {
 	var success atomic.Int64
 	for _, req := range reqs {
 		eg.Go(func() error {
-			rr, ok := s.remanifestCache.GetOrPut(req.StorePath, &remanifestCacheEntry{
-				when: time.Now(),
-				done: make(chan struct{}),
-			})
-			if ok {
-				<-rr.done
-				if rr.err == nil {
-					success.Add(1)
-				}
-				return nil
-			}
-
-			// skip the manifest cache: the cached manifest is what refers to the missing chunks
-			_, err := s.requestNewManifest(ctx, newManifestReq(req.Upstream, req.StorePath), req.NarSize)
-
-			rr.err = err
-			close(rr.done)
-			s.remanifestCache.WithValue(req.StorePath, func(rr *remanifestCacheEntry) { rr.when = time.Now() })
-
-			if err == nil {
+			if s.remanifest(ctx, req) == nil {
 				success.Add(1)
-			} else {
-				log.Printf("remanifest of %s failed: %v", req.StorePath, err)
 			}
 			return nil // don't cancel others
 		})
@@ -972,6 +958,105 @@ func (s *Server) doRemanifestReqs(ctx context.Context, reqs []MountReq) error {
 		return errors.New("no remanifest succeeded")
 	}
 	return nil
+}
+
+// remanifest asks the manifester to rebuild req's manifest. Concurrent callers share one
+// request, and its result is cached for remanifestCacheExpiry. The request runs on its own
+// context, so one caller going away doesn't fail it for the others: it's cancelled only
+// when every caller waiting on it has gone, and then its result isn't cached.
+func (s *Server) remanifest(ctx context.Context, req MountReq) error {
+	for {
+		reqCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), remanifestTimeout)
+		rr, loaded := s.remanifestCache.GetOrPut(req.StorePath, &remanifestCacheEntry{
+			when:   time.Now(),
+			done:   make(chan struct{}),
+			cancel: cancel,
+		})
+		if loaded {
+			cancel()
+		} else {
+			go s.runRemanifest(reqCtx, req, rr)
+		}
+
+		joined := rr.join()
+		select {
+		case <-rr.done:
+		case <-ctx.Done():
+			if joined {
+				rr.leave()
+			}
+			return ctx.Err()
+		}
+		if joined {
+			rr.leave()
+		}
+		if rr.err == errRemanifestAbandoned {
+			// everyone waiting on that one left before it finished; start another
+			continue
+		}
+		return rr.err
+	}
+}
+
+func (s *Server) runRemanifest(ctx context.Context, req MountReq, rr *remanifestCacheEntry) {
+	defer rr.cancel()
+
+	// skip the manifest cache: the cached manifest is what refers to the missing chunks
+	_, err := s.requestNewManifest(ctx, newManifestReq(req.Upstream, req.StorePath), req.NarSize)
+
+	if err != nil && ctx.Err() != nil {
+		// cancelled or timed out: don't cache that
+		s.remanifestCache.Modify(req.StorePath, func(have *remanifestCacheEntry, ok bool) (*remanifestCacheEntry, bool) {
+			return have, ok && have != rr
+		})
+		rr.mu.Lock()
+		if rr.abandoned {
+			err = errRemanifestAbandoned
+		}
+		rr.mu.Unlock()
+	}
+	if err != nil && err != errRemanifestAbandoned {
+		log.Printf("remanifest of %s failed: %v", req.StorePath, err)
+	}
+
+	rr.err = err
+	close(rr.done)
+	s.remanifestCache.WithValue(req.StorePath, func(have *remanifestCacheEntry) {
+		if have == rr {
+			have.when = time.Now()
+		}
+	})
+}
+
+// remanifest cache entry
+
+var errRemanifestAbandoned = errors.New("remanifest abandoned")
+
+// join registers a waiter. It returns false if the request was already abandoned.
+func (rr *remanifestCacheEntry) join() bool {
+	rr.mu.Lock()
+	defer rr.mu.Unlock()
+	if rr.abandoned {
+		return false
+	}
+	rr.waiters++
+	return true
+}
+
+// leave unregisters a waiter, and cancels the request if it was the last one and the request
+// hasn't finished.
+func (rr *remanifestCacheEntry) leave() {
+	rr.mu.Lock()
+	defer rr.mu.Unlock()
+	if rr.waiters--; rr.waiters > 0 {
+		return
+	}
+	select {
+	case <-rr.done:
+	default:
+		rr.abandoned = true
+		rr.cancel()
+	}
 }
 
 // single op

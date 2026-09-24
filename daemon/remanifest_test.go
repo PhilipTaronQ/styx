@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"testing"
+	"time"
 
 	"github.com/DataDog/zstd"
 	"github.com/stretchr/testify/require"
@@ -98,4 +99,66 @@ func TestRemanifestForManifestChunkAsksForImage(t *testing.T) {
 		require.Equal(t, sphStr, r.StorePathHash, "remanifest asked for the wrong store path hash (manifest sph is %s)", manifestSph.String())
 		require.Equal(t, upstream, r.Upstream, "remanifest lost the image's upstream")
 	}
+}
+
+// doRemanifestReqs dedups through remanifestCache. The first caller used to run the
+// remanifest on its own context and cache the result, including a context.Canceled caused
+// by that caller going away. Every other caller for the next remanifestCacheExpiry (1
+// minute) got that failure without the manifester being asked again. For a kernel read
+// that hit NotFound, that meant EIO.
+func TestRemanifestCacheDoesNotShareCancellation(t *testing.T) {
+	e := newFetchEnv(t)
+	e.manifesterHang = true
+	req := MountReq{StorePath: testSpX[:32], Upstream: "http://upstream.invalid/", NarSize: 1000}
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	errc := make(chan error, 1)
+	go func() { errc <- e.s.doRemanifestReqs(ctx1, []MountReq{req}) }()
+	select {
+	case <-e.manifestStarted:
+	case <-time.After(10 * time.Second):
+		t.Fatal("manifester never got the first request")
+	}
+	cancel1() // e.g. `styx materialize` interrupted, or nix killed during a mount
+	require.Error(t, <-errc)
+
+	// another caller with a live context; the manifester would succeed now
+	err := e.s.doRemanifestReqs(context.Background(), []MountReq{req})
+	require.NoError(t, err, "second caller got the first caller's cancellation")
+	require.EqualValues(t, 2, e.manifestPosts.Load(), "second caller never reached the manifester")
+}
+
+// A caller that goes away doesn't cancel the remanifest for others still waiting on it.
+func TestRemanifestSurvivesFirstCallerLeaving(t *testing.T) {
+	e := newFetchEnv(t)
+	e.manifesterGate = make(chan struct{})
+	req := MountReq{StorePath: testSpX[:32], Upstream: "http://upstream.invalid/", NarSize: 1000}
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	errc1 := make(chan error, 1)
+	go func() { errc1 <- e.s.doRemanifestReqs(ctx1, []MountReq{req}) }()
+	select {
+	case <-e.manifestStarted:
+	case <-time.After(10 * time.Second):
+		t.Fatal("manifester never got the first request")
+	}
+
+	// a second caller joins the same request
+	errc2 := make(chan error, 1)
+	go func() { errc2 <- e.s.doRemanifestReqs(context.Background(), []MountReq{req}) }()
+	require.Eventually(t, func() bool {
+		rr, ok := e.s.remanifestCache.Get(req.StorePath)
+		if !ok {
+			return false
+		}
+		rr.mu.Lock()
+		defer rr.mu.Unlock()
+		return rr.waiters == 2
+	}, 10*time.Second, 10*time.Millisecond)
+
+	cancel1()
+	require.Error(t, <-errc1)
+	close(e.manifesterGate)
+	require.NoError(t, <-errc2, "the first caller leaving cancelled the second caller's remanifest")
+	require.EqualValues(t, 1, e.manifestPosts.Load(), "the second caller should have shared the first request")
 }

@@ -48,6 +48,7 @@ type fetchEnv struct {
 
 	manifestCacheHit []byte        // zstd envelope to serve from the manifest cache (nil: 404)
 	manifesterHang   bool          // first manifester request blocks until the client goes away
+	manifesterGate   chan struct{} // if set, first manifester request succeeds once it's closed
 	manifestStarted  chan struct{} // closed when the first manifester request arrives
 	manifestPosts    atomic.Int32
 	manifestReqs     []manifester.ManifestReq // requests the manifester got (under mu)
@@ -207,6 +208,15 @@ func (e *fetchEnv) handleManifester(w http.ResponseWriter, r *http.Request) {
 		case <-e.quit:
 		}
 		return
+	} else if n == 1 && e.manifesterGate != nil {
+		close(e.manifestStarted)
+		select {
+		case <-e.manifesterGate:
+		case <-r.Context().Done():
+			return
+		case <-e.quit:
+			return
+		}
 	}
 	comp, err := zstd.Compress(nil, []byte("rebuilt envelope"))
 	if err != nil {
