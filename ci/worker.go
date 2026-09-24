@@ -640,6 +640,7 @@ func (a *heavyActivities) HeavyBuild(ctx context.Context, req *buildReq) (retBui
 	// even though we will eventually manifest this tarball, we don't need --name here because
 	// it doesn't affect the contents, only the store path.
 	cmd := exec.CommandContext(ctx, common.NixBin+"-prefetch-url", "--unpack", "--print-path", nixexprs)
+	cmd.Stderr = os.Stderr
 	out, err := cmd.Output()
 	if err != nil {
 		l.Error("fetch error", "error", err)
@@ -685,7 +686,10 @@ func (a *heavyActivities) HeavyBuild(ctx context.Context, req *buildReq) (retBui
 	cmd = exec.CommandContext(ctx,
 		common.NixBin, "--extra-experimental-features", "nix-command",
 		"path-info",
+		// Format 1 is a map from full store path to info. Nix 2.34 and 2.35 warn that
+		// --json without --json-format is deprecated and will become an error.
 		"--json",
+		"--json-format", "1",
 		"--recursive",
 		strings.TrimSpace(string(out)),
 	)
@@ -710,6 +714,10 @@ func (a *heavyActivities) HeavyBuild(ctx context.Context, req *buildReq) (retBui
 	sphForRoot := make([]string, 0, len(pathInfo)+1)
 
 	for piPath, pi := range pathInfo {
+		if err := storepath.Validate(piPath); err != nil {
+			l.Error("get closure unexpected path", "error", err)
+			return nil, err
+		}
 		// add all to root record in case some of these filtered ones end up getting copied
 		sph := piPath[11:43]
 		sphForRoot = append(sphForRoot, sph)
