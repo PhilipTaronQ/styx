@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 
 	"github.com/dnr/styx/common/cobrautil"
@@ -48,7 +49,30 @@ func updatePinsNix() error {
 	if have, err := os.ReadFile(pinsNixName); err == nil && bytes.Equal(have, pinsNixCode) {
 		return nil
 	}
-	return os.WriteFile(pinsNixName, pinsNixCode, 0o644)
+	return writeFileAtomic(pinsNixName, pinsNixCode)
+}
+
+// writeFileAtomic writes data to a temporary file next to name and renames it over name, so
+// that a failed or interrupted write leaves the old contents in place.
+func writeFileAtomic(name string, data []byte) error {
+	f, err := os.CreateTemp(filepath.Dir(name), "."+filepath.Base(name)+".tmp*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(f.Name()) // fails harmlessly after the rename
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	} else if err := f.Chmod(0o644); err != nil {
+		f.Close()
+		return err
+	} else if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	} else if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(f.Name(), name)
 }
 
 func loadOrCreatePinJson(c *cobra.Command) error {
@@ -79,23 +103,35 @@ func savePinJson(j *pinJson) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(pinsJsonName, b, 0o644)
+	return writeFileAtomic(pinsJsonName, b)
+}
+
+// copied from daemon/proto.go TarballResp to avoid dependency
+type tarballResp struct {
+	ResolvedUrl   string `json:"resolvedUrl"`
+	StorePathHash string `json:"storePathHash"`
+	StorePathName string `json:"storePathName"`
+	NarHash       string `json:"narHash"`
+	NarHashAlgo   string `json:"narHashAlgo"`
+}
+
+func (r *tarballResp) outputHash() string { return r.NarHashAlgo + ":" + r.NarHash }
+
+func styxTarball(ctx context.Context, url string) (*tarballResp, error) {
+	log.Println("running: styx tarball --json", url)
+	var out tarballResp
+	b, err := exec.CommandContext(ctx, "styx", "tarball", "--json", url).Output()
+	if err != nil {
+		return nil, err
+	} else if err = json.Unmarshal(b, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
 }
 
 func (d *pinData) update(ctx context.Context) error {
-	// copied from daemon/proto.go TarballResp to avoid dependency
-	var out struct {
-		ResolvedUrl   string `json:"resolvedUrl"`
-		StorePathHash string `json:"storePathHash"`
-		StorePathName string `json:"storePathName"`
-		NarHash       string `json:"narHash"`
-		NarHashAlgo   string `json:"narHashAlgo"`
-	}
-	log.Println("running: styx tarball --json", d.OriginalUrl)
-	b, err := exec.CommandContext(ctx, "styx", "tarball", "--json", d.OriginalUrl).Output()
+	out, err := styxTarball(ctx, d.OriginalUrl)
 	if err != nil {
-		return err
-	} else if err = json.Unmarshal(b, &out); err != nil {
 		return err
 	}
 	log.Println("resolved to", out.ResolvedUrl)
@@ -103,14 +139,25 @@ func (d *pinData) update(ctx context.Context) error {
 	d.ResolvedUrl = out.ResolvedUrl
 	d.StorePathName = out.StorePathName
 	d.StorePathHash = out.StorePathHash
-	d.OutputHash = out.NarHashAlgo + ":" + out.NarHash
+	d.OutputHash = out.outputHash()
 	return nil
 }
 
 func (d *pinData) refresh(ctx context.Context) error {
-	log.Println("running: styx tarball --json", d.ResolvedUrl)
-	_, err := exec.CommandContext(ctx, "styx", "tarball", "--json", d.ResolvedUrl).Output()
-	return err
+	out, err := styxTarball(ctx, d.ResolvedUrl)
+	if err != nil {
+		return err
+	}
+	// If the contents behind the resolved url changed, telling styx about them doesn't make
+	// the pinned path substitutable.
+	if got := out.outputHash(); got != d.OutputHash {
+		return fmt.Errorf("pin %q: %s now has hash %s, pinned %s; use `spin update %s` to accept the change",
+			d.Name, d.ResolvedUrl, got, d.OutputHash, d.Name)
+	} else if out.StorePathHash != d.StorePathHash {
+		log.Printf("warning: pin %q: %s now gives store path %s-%s, pinned %s-%s",
+			d.Name, d.ResolvedUrl, out.StorePathHash, out.StorePathName, d.StorePathHash, d.StorePathName)
+	}
+	return nil
 }
 
 func withAllFlag(c *cobra.Command) *bool {

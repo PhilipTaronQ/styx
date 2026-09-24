@@ -84,15 +84,24 @@ resource "aws_ssm_parameter" "charon_temporal_params" {
 
 // security group
 
+// Addresses allowed to ssh to the heavy worker, e.g. ["203.0.113.7/32"] when debugging.
+variable "ssh_ingress_cidrs" {
+  type    = list(string)
+  default = []
+}
+
 resource "aws_security_group" "worker_sg" {
   name        = "charon-worker-sg"
   description = "Security group for workers"
 
-  ingress {
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+  dynamic "ingress" {
+    for_each = length(var.ssh_ingress_cidrs) > 0 ? [1] : []
+    content {
+      from_port   = 22
+      to_port     = 22
+      protocol    = "tcp"
+      cidr_blocks = var.ssh_ingress_cidrs
+    }
   }
 
   egress {
@@ -141,6 +150,11 @@ resource "aws_launch_template" "charon_worker" {
     arn = aws_iam_instance_profile.charon_worker.arn
   }
   key_name = aws_key_pair.my_ssh_key.id
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_tokens                 = "required" # IMDSv2 only
+    http_put_response_hop_limit = 1
+  }
   user_data = base64encode(templatefile("charon-worker-ud.nix", {
     sub           = "https://${aws_s3_bucket.styx.id}.s3.amazonaws.com/nixcache/"
     pubkey        = trimspace(file("../keys/styx-nixcache-test-1.public"))

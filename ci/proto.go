@@ -61,6 +61,7 @@ type (
 		// build args
 		RelID      string
 		StyxCommit string
+		SkipGC     bool `json:",omitempty"` // the workflow runs HeavyGC itself
 	}
 	buildRes struct {
 		FakeError     string
@@ -71,6 +72,13 @@ type (
 	}
 	buildErrDetails struct {
 		Logs string
+	}
+
+	gcReq struct{}
+	gcRes struct {
+		Time    int64  // unix seconds when GC started
+		Error   string `json:",omitempty"`
+		Summary string `json:",omitempty"`
 	}
 
 	notifyReq struct {

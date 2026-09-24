@@ -44,8 +44,9 @@ import (
 
 type (
 	WorkerConfig struct {
-		TemporalParams string
-		SmtpParams     string
+		TemporalParams   string
+		SmtpParams       string
+		CompressPayloads bool
 
 		RunWorker      bool
 		RunScaler      bool
@@ -79,10 +80,14 @@ type (
 		ns         string
 		c          client.Client
 		notifyCh   chan struct{}
-		prev       int
-		asgcli     *autoscaling.Client
+		prev       int // last capacity set successfully, or -1
+		asgcli     asgClient
 		startTime  time.Time // non-zero when we scale up asg
 		failedTime time.Time // non-zero after a failure
+	}
+
+	asgClient interface {
+		SetDesiredCapacity(context.Context, *autoscaling.SetDesiredCapacityInput, ...func(*autoscaling.Options)) (*autoscaling.SetDesiredCapacityOutput, error)
 	}
 
 	scalerInfo struct {
@@ -110,6 +115,10 @@ const (
 	// gc
 	gcInterval = 7 * 24 * time.Hour
 	gcMaxAge   = 210 * 24 * time.Hour
+	gcTimeout  = 6 * time.Hour
+
+	// notify
+	notifyAttempts = 5
 
 	memoKeyBuildFailed = "buildFailed"
 )
@@ -123,7 +132,7 @@ func RunWorker(ctx context.Context, cfg WorkerConfig) error {
 		return errors.New("must run either worker or heavy worker")
 	}
 
-	c, namespace, err := getTemporalClient(ctx, cfg.TemporalParams)
+	c, namespace, err := getTemporalClient(ctx, cfg.TemporalParams, cfg.CompressPayloads)
 	if err != nil {
 		return err
 	}
@@ -181,6 +190,12 @@ func ci(ctx workflow.Context, args *CiArgs) error {
 	l := workflow.GetLogger(ctx)
 	forceCh := workflow.GetSignalChannel(ctx, "buildnow")
 	for !workflow.GetInfo(ctx).GetContinueAsNewSuggested() {
+		// Once the workflow is cancelled, activities and timers return right away, so the
+		// loop would spin until the deadlock detector panics.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
 		// poll nixos channels
 		cctx, cancel := workflow.WithCancel(ctx)
 		actx := withPollActivity(cctx, releasePollInterval, time.Minute)
@@ -236,12 +251,16 @@ func ci(ctx workflow.Context, args *CiArgs) error {
 			continue
 		}
 
+		// Version 1 runs GC in its own activity after the build, instead of in HeavyBuild.
+		gcSeparate := workflow.GetVersion(ctx, "gc-activity", workflow.DefaultVersion, 1) == 1
+
 		buildStart := workflow.Now(ctx)
 		l.Info("building", "relid", args.LastRelID, "styx", args.LastStyxCommit)
 		bres, err := ciBuild(ctx, &buildReq{
 			Args:       args,
 			RelID:      args.LastRelID,
 			StyxCommit: args.LastStyxCommit,
+			SkipGC:     gcSeparate,
 		})
 		workflow.UpsertMemo(ctx, map[string]any{
 			memoKeyBuildFailed: err != nil || bres.FakeError != "",
@@ -265,10 +284,25 @@ func ci(ctx workflow.Context, args *CiArgs) error {
 			continue
 		}
 		l.Info("build succeeded", "relid", args.LastRelID, "styx", args.LastStyxCommit)
+		buildElapsed := workflow.Now(ctx).Sub(buildStart).Round(time.Second)
 		prevNames := args.PrevNames
 		args.PrevNames = bres.Names
 		if bres.NewLastGC > 0 {
 			args.LastGC = bres.NewLastGC
+		}
+		gcSummary := bres.GCSummary
+		if gcSeparate && workflow.Now(ctx).Unix()-args.LastGC > int64(gcInterval.Seconds()) {
+			if gres, err := ciGC(ctx); err != nil {
+				l.Error("gc error", "error", err)
+				gcSummary = "gc error: " + err.Error()
+			} else {
+				gcSummary = gres.Summary
+				if gres.Error == "" {
+					args.LastGC = gres.Time
+				} else {
+					l.Error("gc error", "error", gres.Error)
+				}
+			}
 		}
 
 		// notify
@@ -276,11 +310,11 @@ func ci(ctx workflow.Context, args *CiArgs) error {
 			Args:          args,
 			RelID:         args.LastRelID,
 			StyxCommit:    args.LastStyxCommit,
-			BuildElapsed:  workflow.Now(ctx).Sub(buildStart).Round(time.Second),
+			BuildElapsed:  buildElapsed,
 			PrevNames:     prevNames,
 			NewNames:      bres.Names,
 			ManifestStats: bres.ManifestStats,
-			GCSummary:     bres.GCSummary,
+			GCSummary:     gcSummary,
 		})
 	}
 	return workflow.NewContinueAsNewError(ctx, ci, args)
@@ -313,12 +347,38 @@ func ciBuild(ctx workflow.Context, req *buildReq) (*buildRes, error) {
 	return &res, workflow.ExecuteActivity(actx, a.HeavyBuild, req).Get(ctx, &res)
 }
 
-func ciNotify(ctx workflow.Context, req *notifyReq) error {
+func ciGC(ctx workflow.Context) (*gcRes, error) {
+	pokeScaler(ctx)
+	actx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+		TaskQueue:           heavyTaskQueue,
+		HeartbeatTimeout:    buildHeartbeat,
+		StartToCloseTimeout: gcTimeout,
+		RetryPolicy: &temporal.RetryPolicy{
+			// GC runs again after the next build if this fails
+			MaximumAttempts: 1,
+		},
+	})
+	var res gcRes
+	var a *heavyActivities
+	return &res, workflow.ExecuteActivity(actx, a.HeavyGC, &gcReq{}).Get(ctx, &res)
+}
+
+// ciNotify sends a notification. It's best-effort: without a retry limit, a notification
+// that can't be sent (say, the SMTP server rejects our credentials) would block the ci loop
+// forever.
+func ciNotify(ctx workflow.Context, req *notifyReq) {
 	actx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
 		StartToCloseTimeout: time.Minute,
+		RetryPolicy: &temporal.RetryPolicy{
+			InitialInterval:    time.Minute,
+			BackoffCoefficient: 2,
+			MaximumAttempts:    notifyAttempts,
+		},
 	})
 	var a *activities
-	return workflow.ExecuteActivity(actx, a.Notify, req).Get(ctx, nil)
+	if err := workflow.ExecuteActivity(actx, a.Notify, req).Get(ctx, nil); err != nil {
+		workflow.GetLogger(ctx).Error("notify error", "error", err)
+	}
 }
 
 func pokeScaler(ctx workflow.Context) {
@@ -365,7 +425,10 @@ func (s *scaler) iter() {
 		log.Println("scaler getPending error:", err)
 		return
 	}
+	s.update(info)
+}
 
+func (s *scaler) update(info scalerInfo) {
 	target := 0
 
 	if info.scheduled > 0 || info.started > 0 {
@@ -398,8 +461,8 @@ func (s *scaler) iter() {
 		}
 	}
 
-	if target != s.prev {
-		s.setSize(target)
+	// if setting fails, try again next time
+	if target != s.prev && s.setSize(target) == nil {
 		s.prev = target
 	}
 }
@@ -424,7 +487,7 @@ func (s *scaler) getInfo() (scalerInfo, error) {
 		}
 		if p := desc.WorkflowExecutionInfo.GetMemo().GetFields()[memoKeyBuildFailed]; p != nil {
 			var failed bool
-			if getDataConverter().FromPayload(p, &failed) == nil {
+			if getDataConverter(false).FromPayload(p, &failed) == nil {
 				info.failed = info.failed || failed
 			}
 		}
@@ -442,7 +505,7 @@ func (s *scaler) getInfo() (scalerInfo, error) {
 	return info, nil
 }
 
-func (s *scaler) setSize(size int) {
+func (s *scaler) setSize(size int) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -455,9 +518,16 @@ func (s *scaler) setSize(size int) {
 	} else {
 		log.Println("asg set capacity error:", err)
 	}
+	return err
 }
 
-func (s *scaler) poke() { s.notifyCh <- struct{}{} }
+// poke asks the scaler to run soon. It's called from workflow code, so it must not block.
+func (s *scaler) poke() {
+	select {
+	case s.notifyCh <- struct{}{}:
+	default: // already poked
+	}
+}
 
 // activities
 
@@ -545,6 +615,7 @@ func getLatestCommit(ctx context.Context, repo, branch string) (*ghLatestCommit,
 func (a *heavyActivities) HeavyBuild(ctx context.Context, req *buildReq) (retBuildRes *buildRes, retErr error) {
 	l := activity.GetLogger(ctx)
 	info := activity.GetInfo(ctx)
+	stage := heartbeatStages(ctx)
 
 	defer func() {
 		if retErr == nil {
@@ -559,19 +630,7 @@ func (a *heavyActivities) HeavyBuild(ctx context.Context, req *buildReq) (retBui
 		retErr = temporal.NewApplicationError(retErr.Error(), errType, details)
 	}()
 
-	var stageName atomic.Value
-	stage := func(s string) {
-		l.Info("====================== STAGE " + s)
-		stageName.Store(s)
-	}
 	stage("INIT")
-
-	go func() {
-		for ctx.Err() == nil {
-			time.Sleep(5 * time.Second)
-			activity.RecordHeartbeat(ctx, stageName.Load())
-		}
-	}()
 
 	// fetch nixexprs
 
@@ -581,6 +640,7 @@ func (a *heavyActivities) HeavyBuild(ctx context.Context, req *buildReq) (retBui
 	// even though we will eventually manifest this tarball, we don't need --name here because
 	// it doesn't affect the contents, only the store path.
 	cmd := exec.CommandContext(ctx, common.NixBin+"-prefetch-url", "--unpack", "--print-path", nixexprs)
+	cmd.Stderr = os.Stderr
 	out, err := cmd.Output()
 	if err != nil {
 		l.Error("fetch error", "error", err)
@@ -626,7 +686,10 @@ func (a *heavyActivities) HeavyBuild(ctx context.Context, req *buildReq) (retBui
 	cmd = exec.CommandContext(ctx,
 		common.NixBin, "--extra-experimental-features", "nix-command",
 		"path-info",
+		// Format 1 is a map from full store path to info. Nix 2.34 and 2.35 warn that
+		// --json without --json-format is deprecated and will become an error.
 		"--json",
+		"--json-format", "1",
 		"--recursive",
 		strings.TrimSpace(string(out)),
 	)
@@ -651,6 +714,10 @@ func (a *heavyActivities) HeavyBuild(ctx context.Context, req *buildReq) (retBui
 	sphForRoot := make([]string, 0, len(pathInfo)+1)
 
 	for piPath, pi := range pathInfo {
+		if err := storepath.Validate(piPath); err != nil {
+			l.Error("get closure unexpected path", "error", err)
+			return nil, err
+		}
 		// add all to root record in case some of these filtered ones end up getting copied
 		sph := piPath[11:43]
 		sphForRoot = append(sphForRoot, sph)
@@ -772,15 +839,7 @@ func (a *heavyActivities) HeavyBuild(ctx context.Context, req *buildReq) (retBui
 
 	btime := time.Now()
 	var gcSummary strings.Builder
-	gc := gc{
-		now:     btime,
-		stage:   stage,
-		summary: &gcSummary,
-		zp:      a.zp,
-		s3:      a.s3cli,
-		bucket:  a.cfg.CSWCfg.ChunkBucket,
-		age:     gcMaxAge,
-	}
+	gc := a.newGC(btime, &gcSummary, stage)
 
 	stage("WRITE ROOT")
 	root := &pb.BuildRoot{
@@ -804,12 +863,13 @@ func (a *heavyActivities) HeavyBuild(ctx context.Context, req *buildReq) (retBui
 		return nil, err
 	}
 
-	// gc
+	// gc (only for workflows started before HeavyGC existed)
 
 	newLastGC := req.Args.LastGC
-	if btime.Unix()-req.Args.LastGC > int64(gcInterval.Seconds()) {
-		newLastGC = btime.Unix()
-		gc.run(ctx)
+	if !req.SkipGC && btime.Unix()-req.Args.LastGC > int64(gcInterval.Seconds()) {
+		if err := gc.run(ctx); err == nil {
+			newLastGC = btime.Unix()
+		}
 	}
 
 	slices.Sort(names)
@@ -822,6 +882,52 @@ func (a *heavyActivities) HeavyBuild(ctx context.Context, req *buildReq) (retBui
 		NewLastGC:     newLastGC,
 		GCSummary:     gcSummary.String(),
 	}, nil
+}
+
+// HeavyGC runs bucket GC. It reports GC errors in the result, so that the summary still gets
+// to the notification.
+func (a *heavyActivities) HeavyGC(ctx context.Context, req *gcReq) (*gcRes, error) {
+	stage := heartbeatStages(ctx)
+	stage("INIT")
+	var summary strings.Builder
+	gc := a.newGC(time.Now(), &summary, stage)
+	res := &gcRes{Time: gc.now.Unix()}
+	if err := gc.run(ctx); err != nil {
+		res.Error = err.Error()
+	}
+	res.Summary = summary.String()
+	stage("DONE")
+	return res, nil
+}
+
+func (a *heavyActivities) newGC(now time.Time, summary *strings.Builder, stage func(string)) *gc {
+	return &gc{
+		now:     now,
+		stage:   stage,
+		summary: summary,
+		zp:      a.zp,
+		s3:      a.s3cli,
+		bucket:  a.cfg.CSWCfg.ChunkBucket,
+		age:     gcMaxAge,
+		grace:   gcGrace,
+	}
+}
+
+// heartbeatStages returns a function that logs a stage name and records it as the activity's
+// heartbeat details. It heartbeats until ctx is done.
+func heartbeatStages(ctx context.Context) func(string) {
+	l := activity.GetLogger(ctx)
+	var stageName atomic.Value
+	go func() {
+		for ctx.Err() == nil {
+			time.Sleep(5 * time.Second)
+			activity.RecordHeartbeat(ctx, stageName.Load())
+		}
+	}()
+	return func(s string) {
+		l.Info("====================== STAGE " + s)
+		stageName.Store(s)
+	}
 }
 
 func makeNixexprsUrl(channel, relid string) string {

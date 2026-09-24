@@ -31,11 +31,14 @@ func withAxiomLogs(c *cobra.Command) cobrautil.RunEC {
 	}
 }
 
+const compressPayloadsHelp = "zstd-compress temporal payloads (enable only once all workers can decode them)"
+
 func withWorkerConfig(c *cobra.Command) *ci.WorkerConfig {
 	var cfg ci.WorkerConfig
 
 	c.Flags().StringVar(&cfg.TemporalParams, "temporal_params", "", "source for temporal params")
 	c.Flags().StringVar(&cfg.SmtpParams, "smtp_params", "", "source for smtp params")
+	c.Flags().BoolVar(&cfg.CompressPayloads, "compress_payloads", false, compressPayloadsHelp)
 
 	c.Flags().BoolVar(&cfg.RunWorker, "worker", false, "run temporal workflow+activity worker")
 	c.Flags().BoolVar(&cfg.RunScaler, "scaler", true, "run scaler on worker")
@@ -61,6 +64,7 @@ func withStartConfig(c *cobra.Command) *ci.StartConfig {
 	var cfg ci.StartConfig
 
 	c.Flags().StringVar(&cfg.TemporalParams, "temporal_params", "keys/temporal-creds-charon.secret", "source for temporal params")
+	c.Flags().BoolVar(&cfg.CompressPayloads, "compress_payloads", false, compressPayloadsHelp)
 
 	// might use these:
 	c.Flags().StringVar(&cfg.Args.Channel, "nix_channel", "nixos-26.05", "nix channel to watch/build")
@@ -84,8 +88,9 @@ func withStartConfig(c *cobra.Command) *ci.StartConfig {
 
 func withGCConfig(c *cobra.Command) *ci.GCConfig {
 	var cfg ci.GCConfig
-	c.Flags().StringVar(&cfg.Bucket, "bucket", "styx-1", "s3 bucket")
+	c.Flags().StringVar(&cfg.Bucket, "bucket", "", "s3 bucket (required)")
 	c.Flags().DurationVar(&cfg.MaxAge, "max_age", 210*24*time.Hour, "gc age")
+	c.Flags().BoolVar(&cfg.DryRun, "dry_run", true, "only log what would be deleted; pass --dry_run=false to delete")
 	return &cfg
 }
 

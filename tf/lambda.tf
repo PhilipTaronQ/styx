@@ -49,7 +49,10 @@ data "aws_iam_policy_document" "styx_bucket_policy" {
     actions   = ["s3:GetObject"]
     resources = [aws_s3_bucket.styx.arn, "${aws_s3_bucket.styx.arn}/*"]
   }
+  // Writers need ListBucket so that HeadObject on a missing key returns 404, not 403:
+  // the chunk store and nix's S3 store both treat 404 as "not there yet".
   statement {
+    sid = "WritersList"
     principals {
       type = "AWS"
       identifiers = [
@@ -57,8 +60,45 @@ data "aws_iam_policy_document" "styx_bucket_policy" {
         aws_iam_role.iam_for_charon.arn,
       ]
     }
-    actions   = ["s3:*"]
-    resources = [aws_s3_bucket.styx.arn, "${aws_s3_bucket.styx.arn}/*"]
+    actions   = ["s3:ListBucket"]
+    resources = [aws_s3_bucket.styx.arn]
+  }
+  // The manifester is internet-facing: it only reads and adds chunks, manifests and
+  // build roots (PutObject also covers the chunk store's in-place CopyObject refresh).
+  // It never deletes.
+  statement {
+    sid = "ManifesterWrite"
+    principals {
+      type        = "AWS"
+      identifiers = [aws_iam_role.iam_for_lambda.arn]
+    }
+    actions = ["s3:GetObject", "s3:PutObject"]
+    resources = [
+      "${aws_s3_bucket.styx.arn}/chunk/*",
+      "${aws_s3_bucket.styx.arn}/manifest/*",
+      "${aws_s3_bucket.styx.arn}/buildroot/*",
+    ]
+  }
+  // The heavy CI worker also writes the nix cache (nix copy) and runs bucket GC.
+  statement {
+    sid = "CharonReadWriteDelete"
+    principals {
+      type        = "AWS"
+      identifiers = [aws_iam_role.iam_for_charon.arn]
+    }
+    actions = [
+      "s3:GetObject",
+      "s3:PutObject",
+      "s3:DeleteObject",
+      "s3:AbortMultipartUpload",
+      "s3:ListMultipartUploadParts",
+    ]
+    resources = [
+      "${aws_s3_bucket.styx.arn}/nixcache/*",
+      "${aws_s3_bucket.styx.arn}/chunk/*",
+      "${aws_s3_bucket.styx.arn}/manifest/*",
+      "${aws_s3_bucket.styx.arn}/buildroot/*",
+    ]
   }
 }
 
@@ -67,8 +107,22 @@ resource "aws_s3_bucket_policy" "styx" {
   policy = data.aws_iam_policy_document.styx_bucket_policy.json
 }
 
+// Versioning keeps what bucket GC deletes (and what the chunk store's refresh copies over)
+// for a while, so a GC mistake can be undone. Note it can be suspended but never turned
+// off again once enabled.
+resource "aws_s3_bucket_versioning" "styx" {
+  bucket = aws_s3_bucket.styx.id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
 resource "aws_s3_bucket_lifecycle_configuration" "styx" {
   bucket = aws_s3_bucket.styx.id
+
+  # lifecycle rules for noncurrent versions need versioning in place first
+  depends_on = [aws_s3_bucket_versioning.styx]
+
   rule {
     id     = "nixcache-ttl"
     status = "Enabled"
@@ -76,6 +130,13 @@ resource "aws_s3_bucket_lifecycle_configuration" "styx" {
       prefix = "nixcache/"
     }
     abort_incomplete_multipart_upload { days_after_initiation = 1 }
+  }
+  rule {
+    id     = "expire-noncurrent"
+    status = "Enabled"
+    filter {}
+    noncurrent_version_expiration { noncurrent_days = 30 }
+    expiration { expired_object_delete_marker = true }
   }
 }
 
@@ -124,6 +185,11 @@ resource "aws_lambda_function" "manifester" {
   architectures = ["x86_64"] # TODO: can we make it run on arm?
 
   memory_size = 500 # MB
+
+  # The function URL is public, so cap how much of the account's concurrency (and bill)
+  # it can take.
+  reserved_concurrent_executions = 100
+
   ephemeral_storage {
     size = 1024 # MB
   }
