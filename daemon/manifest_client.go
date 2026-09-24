@@ -236,11 +236,10 @@ func (s *Server) getNewManifest(ctx context.Context, req manifester.ManifestReq,
 		return nil, err
 	}
 	elapsed := time.Since(start)
-	msg = fmt.Sprintf("got manifest for %s", req.StorePathHash)
+	msg = "got manifest for " + req.StorePathHash
 	if req.StorePathHash == "" {
-		msg = fmt.Sprintf("got tarball for %s", req.Upstream)
+		msg = "got tarball for " + req.Upstream
 	}
-	msg = fmt.Sprintf("got manifest for %s", req.StorePathHash)
 	msg += fmt.Sprintf(" in %.2fs", elapsed.Seconds())
 	if shards > 1 {
 		msg += fmt.Sprintf(" (%d shards)", shards)
