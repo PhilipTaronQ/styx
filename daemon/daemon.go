@@ -471,7 +471,7 @@ func (s *Server) runSocketServer(socketPath string, mux http.Handler) error {
 	s.shutdownWait.Add(1)
 	go func() {
 		defer s.shutdownWait.Done()
-		srv := &http.Server{Handler: mux}
+		srv := newHttpServer(mux)
 		go srv.Serve(l)
 		<-s.shutdownChan
 		log.Printf("stopping http server")
@@ -479,6 +479,23 @@ func (s *Server) runSocketServer(socketPath string, mux http.Handler) error {
 	}()
 	return nil
 }
+
+// There's no ReadTimeout or WriteTimeout: mount, materialize and gc requests can take
+// minutes, and net/http cancels the request context once ReadTimeout passes. jsonmw
+// limits reading the body instead.
+func newHttpServer(h http.Handler) *http.Server {
+	return &http.Server{
+		Handler:           h,
+		ReadHeaderTimeout: 30 * time.Second,
+		IdleTimeout:       5 * time.Minute,
+	}
+}
+
+const (
+	// far more than the styx cli (bounded by the size of its arguments) or nix sends
+	maxRequestBytes    = 16 << 20
+	requestBodyTimeout = time.Minute
+)
 
 type errWithStatus struct {
 	error
@@ -511,9 +528,21 @@ func jsonmw[reqT, resT any](f func(context.Context, *reqT) (*resT, error)) func(
 		w.Header().Set(common.CTHdr, common.CTJson)
 		wEnc := json.NewEncoder(w)
 
+		// limit the body's size and the time to read it. the deadline is cleared once
+		// it's read, so it doesn't apply to the handler.
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
+		rc := http.NewResponseController(w)
+		_ = rc.SetReadDeadline(time.Now().Add(requestBodyTimeout))
 		var req reqT
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			w.WriteHeader(http.StatusBadRequest)
+		err := json.NewDecoder(r.Body).Decode(&req)
+		_ = rc.SetReadDeadline(time.Time{})
+		if err != nil {
+			var mbErr *http.MaxBytesError
+			if errors.As(err, &mbErr) {
+				w.WriteHeader(http.StatusRequestEntityTooLarge)
+			} else {
+				w.WriteHeader(http.StatusBadRequest)
+			}
 			wEnc.Encode(nil)
 			return
 		}

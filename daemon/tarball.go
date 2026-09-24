@@ -50,7 +50,7 @@ func (s *Server) startFakeCacheServer() (err error) {
 	s.shutdownWait.Add(1)
 	go func() {
 		defer s.shutdownWait.Done()
-		srv := &http.Server{Handler: mux}
+		srv := newHttpServer(mux)
 		go srv.Serve(l)
 		<-s.shutdownChan
 		log.Printf("stopping fake cache server")
