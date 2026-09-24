@@ -154,6 +154,7 @@ func (tb *testBase) startManifester() {
 	mbcfg.SigningKeys, err = common.LoadSecretKeys([]string{"../keys/testsuite.secret"})
 	require.NoError(tb.t, err)
 	mb, err := manifester.NewManifestBuilder(mbcfg, cs)
+	require.NoError(tb.t, err)
 
 	hostport := fmt.Sprintf("localhost:%d", port)
 	tb.manifesterAddr = fmt.Sprintf("http://%s/", hostport)
