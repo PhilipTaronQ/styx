@@ -81,17 +81,3 @@ jobs:
         run: |
           sudo env PATH="$GITHUB_WORKSPACE/tools/bin:$PATH" \
             ./styxtest -test.v -test.timeout 45m
-      # TEMPORARY: capture the cachefiles on-disk layout during a test run
-      - name: Debug cachefiles layout
-        if: failure()
-        working-directory: styxtest/bin
-        run: |
-          uname -r
-          # shellcheck disable=SC2024  # $RUNNER_TEMP is writable without sudo
-          sudo env PATH="$GITHUB_WORKSPACE/tools/bin:$PATH" ./styxtest -test.run '^TestMaterialize$' > "$RUNNER_TEMP/run.log" 2>&1 &
-          pid=$!
-          while kill -0 $pid 2>/dev/null; do
-            sudo find /tmp -path '*/cache/cache*' 2>/dev/null
-            sleep 0.05
-          done | sort -u
-          grep -E 'domain|backing' "$RUNNER_TEMP/run.log" || true
