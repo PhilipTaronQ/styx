@@ -254,7 +254,7 @@ index 0000000..1362f45
 +
 +}  // namespace nix
 diff --git a/src/libstore/local-store.cc b/src/libstore/local-store.cc
-index 909f223..44ac6e3 100644
+index 909f223..80283db 100644
 --- a/src/libstore/local-store.cc
 +++ b/src/libstore/local-store.cc
 @@ -17,6 +17,7 @@
@@ -265,7 +265,7 @@ index 909f223..44ac6e3 100644
  
  #include <algorithm>
  #include <cstring>
-@@ -1313,6 +1314,62 @@ StorePath LocalStore::addToStoreFromDump(
+@@ -1313,6 +1314,97 @@ StorePath LocalStore::addToStoreFromDump(
      return dstPath;
  }
  
@@ -317,7 +317,42 @@ index 909f223..44ac6e3 100644
 +
 +        /* The path may have been created by another process in the meantime, so check again. */
 +        if (!isValidPathUncached(info.path)) {
-+            makeStyxMaterialize(sourceUri, std::string(info.path.to_string()), realPath.string(), info.narSize);
++            /* Materialize into a temporary directory and check the result
++               before moving it into place. The daemon writes into whatever
++               is at its destination, and may still be writing after we have
++               given up on it and fallen back to regular substitution. */
++            auto [tempDir, tempDirFd] = createTempDirInStore();
++            AutoDelete delTempDir(tempDir);
++            auto tempPath = tempDir / "x";
++
++            makeStyxMaterialize(sourceUri, std::string(info.path.to_string()), tempPath.string(), info.narSize);
++
++            HashSink narSink{info.narHash.algo};
++            dumpPath(tempPath, narSink);
++            auto narHash = narSink.finish();
++            if (narHash.hash != info.narHash)
++                throw Error(
++                    "hash mismatch materializing path '%s' with styx;\n  specified: %s\n  got:       %s",
++                    printStorePath(info.path),
++                    info.narHash.to_string(HashFormat::SRI, true),
++                    narHash.hash.to_string(HashFormat::SRI, true));
++            if (narHash.numBytesDigested != info.narSize)
++                throw Error(
++                    "size mismatch materializing path '%s' with styx;\n  specified: %s\n  got:       %s",
++                    printStorePath(info.path),
++                    info.narSize,
++                    narHash.numBytesDigested);
++
++            deletePath(realPath);
++            moveFile(tempPath, realPath);
++
++            canonicalisePathMetaData(realPath, {NIX_WHEN_SUPPORT_ACLS(config->getLocalSettings().ignoredAcls)});
++
++            if (config->getLocalSettings().fsyncStorePaths) {
++                recursiveSync(realPath);
++                syncParent(realPath);
++            }
++
 +            registerValidPath(info);
 +        }
 +
