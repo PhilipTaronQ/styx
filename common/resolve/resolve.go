@@ -1,6 +1,7 @@
 package resolve
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -186,19 +187,25 @@ func ResolveUrl(ctx context.Context, input string) (Result, error) {
 
 var reNixExprs = regexp.MustCompile(`^https://releases\.nixos\.org/.*/(nix(os|pkgs)-\d\d\.\d\d(\.|pre)\d+).[a-z0-9]+/nixexprs\.tar`)
 
-func getSpNameFromUrl(url string) string {
+func getSpNameFromUrl(rawUrl string) string {
 	// hack: tweak name, e.g. we want
 	//   https://releases.nixos.org/nixos/25.11/nixos-25.11.1056.d9bc5c7dceb3/nixexprs.tar.xz
 	// to turn into "nixexprs-nixos-25.11.1056" for better diffing
-	if m := reNixExprs.FindStringSubmatch(url); m != nil {
+	if m := reNixExprs.FindStringSubmatch(rawUrl); m != nil {
 		return "nixexprs-" + m[1]
 	}
 
-	name := path.Base(url)
+	// use only the path: redirects often go to signed urls whose query strings change on
+	// every request and contain characters that aren't allowed in store path names.
+	p := rawUrl
+	if u, err := url.Parse(rawUrl); err == nil {
+		p = u.Path
+	}
+	name := path.Base(p)
 	name = strings.TrimSuffix(name, ".gz")
 	name = strings.TrimSuffix(name, ".xz")
 	name = strings.TrimSuffix(name, ".tar")
-	return name
+	return cmp.Or(sanitizeStorePathName(name), "source")
 }
 
 func sanitizeStorePathName(s string) string {
