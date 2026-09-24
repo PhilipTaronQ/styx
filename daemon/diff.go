@@ -12,8 +12,10 @@ import (
 	"maps"
 	"net/http"
 	"regexp"
+	"runtime/debug"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -35,6 +37,7 @@ import (
 const (
 	recentReadExpiry      = 30 * time.Second
 	remanifestCacheExpiry = time.Minute
+	remanifestTimeout     = 15 * time.Minute
 
 	// only public so they can be referenced by tests
 	InitOpSize = 8
@@ -44,6 +47,11 @@ const (
 	MaxSources = 3
 	// start doubling on any file RRs, but require two extra image RRs
 	ImageRROffset = 2
+
+	// the manifester pads the json stats after chunk diff data to 256 bytes
+	maxDiffStatsBytes = 4096
+	// limit on the expanded size of a recompressed file in a chunk diff
+	maxRecompressBytes = 256 << 20
 )
 
 type (
@@ -121,13 +129,19 @@ type (
 		when time.Time
 		err  error         // only read after done is closed
 		done chan struct{} // closed after writing err
+
+		cancel    context.CancelFunc // cancels the request
+		mu        sync.Mutex
+		waiters   int  // callers waiting on done (under mu)
+		abandoned bool // every waiter left before done, request was cancelled (under mu)
 	}
 
 	triedRemanifest struct{}
 )
 
 func (s *Server) requestChunk(ctx context.Context, loc erofs.SlabLoc, digest cdig.CDig, sphps []SphPrefix) error {
-	if s.readKnownMap.Has(loc) {
+	known := s.readKnownMap.Has(loc)
+	if known {
 		// We think we have this chunk and are trying to use it as a base, but we got asked for
 		// it again. This shouldn't happen, but at least try to recover by doing a single read
 		// instead of diffing more.
@@ -135,40 +149,53 @@ func (s *Server) requestChunk(ctx context.Context, loc erofs.SlabLoc, digest cdi
 		sphps = nil
 	}
 
-	var op reqOp
+	op := func() (op reqOp) {
+		s.diffLock.Lock()
+		defer s.diffLock.Unlock()
 
-	s.diffLock.Lock()
-	if op = s.diffMap[loc]; op != nil {
-		// being request already, wait on this one
-	} else if len(sphps) == 0 {
-		// force single op
-	} else {
-		set := newOpSet(s)
-		err := s.db.View(func(tx *bbolt.Tx) error {
-			return set.buildDiff(tx, digest, sphps, true)
-		})
-		if err != nil {
-			log.Printf("buildDiff failed: %v", err)
-		} else if op = s.diffMap[loc]; op == nil {
-			log.Print("buildDiff did not include requested chunk") // shouldn't happen
+		op = s.diffMap[loc]
+		if _, single := op.(*singleOp); known && op != nil && !single {
+			// Don't wait on a diff op: it may be waiting for a slot held by whoever is reading
+			// this chunk as a base, which is waiting on us. A single op doesn't read bases.
+			op = nil
+		}
+
+		if op != nil {
+			// being request already, wait on this one
+		} else if len(sphps) == 0 {
+			// force single op
 		} else {
-			// TODO: if set is a single op, with a single req and no base, change to single
+			set := newOpSet(s)
+			err := s.db.View(func(tx *bbolt.Tx) (err error) {
+				// If we already have it (another read of it was handled after the op that wrote
+				// it finished, or its present record outlived its data), don't build ops for
+				// its neighbours, just read it again directly.
+				if !s.locPresent(tx, loc) {
+					op, err = set.build(tx, loc, digest, sphps, true)
+				}
+				return
+			})
+			if err != nil {
+				log.Printf("buildDiff failed: %v", err)
+			} else if op != nil {
+				// TODO: if set is a single op, with a single req and no base, change to single
 
-			// note that op is left as diffMap[loc] to wait on
-			for _, startOp := range set.ops {
-				go s.startDiffOp(ctx, startOp)
-			}
-			if extra := len(set.ops) - 1; extra > 0 {
-				s.stats.extraReqs.Add(int64(extra))
+				// note that op is left as diffMap[loc] to wait on
+				for _, startOp := range set.ops {
+					go s.startDiffOp(ctx, startOp)
+				}
+				if extra := len(set.ops) - 1; extra > 0 {
+					s.stats.extraReqs.Add(int64(extra))
+				}
 			}
 		}
-	}
-	if op == nil {
-		sop := s.buildSingleOp(loc, digest)
-		go s.startSingleOp(ctx, sop)
-		op = sop
-	}
-	s.diffLock.Unlock()
+		if op == nil {
+			sop := s.buildSingleOp(loc, digest)
+			go s.startSingleOp(ctx, sop)
+			op = sop
+		}
+		return op
+	}()
 
 	// TODO: consider racing the diff against a single chunk read (with small delay)
 	// return when either is done
@@ -220,13 +247,50 @@ func (s *Server) requestPrefetch(ctx context.Context, reqs []cdig.CDig) error {
 
 	if len(remanifestReqs) > 0 {
 		log.Println("chunk not found, remanifesting")
+		ctx = context.WithValue(ctx, triedRemanifest{}, true)
 		if s.doRemanifestReqs(ctx, remanifestReqs) == nil {
-			ctx = context.WithValue(ctx, triedRemanifest{}, true)
 			return s.requestPrefetch(ctx, reqs)
 		}
 	}
 
+	if err != nil && ctx.Err() == nil {
+		// like requestChunk, fall back to plain reads of whatever is still missing
+		log.Printf("prefetch failed (%v), doing plain reads", err)
+		return s.prefetchSingle(ctx, reqs)
+	}
 	return err
+}
+
+// prefetchSingle reads the missing chunks in reqs one at a time.
+func (s *Server) prefetchSingle(ctx context.Context, reqs []cdig.CDig) error {
+	var locs []erofs.SlabLoc
+	var digests []cdig.CDig
+	err := s.db.View(func(tx *bbolt.Tx) error {
+		cb := tx.Bucket(chunkBucket)
+		for _, req := range reqs {
+			loc := cb.Get(req[:])
+			if loc == nil {
+				return errors.New("missing digest->loc reference")
+			}
+			if l := loadLoc(loc); !s.locPresent(tx, l) {
+				locs = append(locs, l)
+				digests = append(digests, req)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	eg := errgroup.WithContext(ctx)
+	eg.SetLimit(max(s.cfg.Workers, 1))
+	for i := range locs {
+		eg.Go(func() error {
+			return s.requestChunk(eg, locs[i], digests[i], nil)
+		})
+	}
+	return eg.Wait()
 }
 
 func (s *Server) buildAndStartPrefetch(ctx context.Context, reqs []cdig.CDig) ([]reqOp, error) {
@@ -266,15 +330,12 @@ func (s *Server) buildAndStartPrefetch(ctx context.Context, reqs []cdig.CDig) ([
 		}
 		set := newOpSet(s)
 		set.maxOpSize = MaxOpSize // use larger ops immediately
-		err := set.buildDiff(tx, req, sphps, false)
+		op, err := set.build(tx, l, req, sphps, false)
 		if err != nil {
 			return nil, err
-		} else if op := s.diffMap[l]; op == nil {
-			return nil, errors.New("buildDiff did not include requested chunk")
-		} else {
-			have[op] = struct{}{}
-			allOps = append(allOps, op)
 		}
+		have[op] = struct{}{}
+		allOps = append(allOps, op)
 		for _, startOp := range set.ops {
 			go s.startDiffOp(ctx, startOp)
 		}
@@ -425,13 +486,7 @@ func (s *Server) startDiffOp(ctx context.Context, op *diffOp) {
 
 		// clear references to this op from the map
 		s.diffLock.Lock()
-		for _, sop := range op.sops {
-			for _, i := range sop.reqInfo {
-				if s.diffMap[i.loc] == reqOp(op) {
-					delete(s.diffMap, i.loc)
-				}
-			}
-		}
+		s.unregisterDiffOp(op)
 		// update recentRead timers
 		for _, rr := range op.rrs[:] {
 			if rr != nil {
@@ -449,13 +504,64 @@ func (s *Server) startDiffOp(ctx context.Context, op *diffOp) {
 	} else {
 		s.stats.diffReqs.Add(1)
 	}
-	if op.err = s.diffSem.Acquire(ctx, 1); op.err == nil {
-		defer s.diffSem.Release(1)
-		op.err = s.doDiffOp(ctx, op)
+
+	// Read bases before taking a diffSem slot. Base reads go through the kernel, and if a base
+	// isn't actually in the cache, the kernel asks us for it, and fetching that takes a
+	// diffSem slot. With every slot held by an op waiting on such a read, nothing could make
+	// progress. baseSem limits how many ops hold base data while waiting for a slot.
+	var bases [][]byte
+	if op.anyHasBase() {
+		if op.err = s.baseSem.Acquire(ctx, 1); op.err != nil {
+			return
+		}
+		bases, op.err = s.readDiffBases(op)
+		if op.err == nil {
+			op.err = s.diffSem.Acquire(ctx, 1)
+		}
+		s.baseSem.Release(1)
+	} else {
+		op.err = s.diffSem.Acquire(ctx, 1)
+	}
+	if op.err != nil {
+		return
+	}
+	defer s.diffSem.Release(1)
+	op.err = s.doDiffOp(ctx, op, bases)
+}
+
+// unregisterDiffOp removes op's entries from diffMap. call with diffLock held
+func (s *Server) unregisterDiffOp(op *diffOp) {
+	for _, sop := range op.sops {
+		for _, i := range sop.reqInfo {
+			if s.diffMap[i.loc] == reqOp(op) {
+				delete(s.diffMap, i.loc)
+			}
+		}
 	}
 }
 
-func (s *Server) doDiffOp(ctx context.Context, op *diffOp) error {
+// readDiffBases reads the base data for each sub-op of op (nil for those without a base).
+func (s *Server) readDiffBases(op *diffOp) ([][]byte, error) {
+	bases := make([][]byte, len(op.sops))
+	for idx, sop := range op.sops {
+		if !sop.hasBase() {
+			continue
+		}
+		data := make([]byte, sop.baseSize)
+		p := data
+		for _, i := range sop.baseInfo {
+			var part []byte
+			part, p = takePart(p, i.size)
+			if err := s.getKnownChunk(i.loc, part); err != nil {
+				return nil, fmt.Errorf("getKnownChunk error: %w", err)
+			}
+		}
+		bases[idx] = data
+	}
+	return bases, nil
+}
+
+func (s *Server) doDiffOp(ctx context.Context, op *diffOp, bases [][]byte) error {
 	diff, lens, err := s.getChunkDiff(ctx, op.sops)
 	if err != nil {
 		return fmt.Errorf("getChunkDiff: %w", err)
@@ -464,23 +570,13 @@ func (s *Server) doDiffOp(ctx context.Context, op *diffOp) error {
 
 	baseDatas := make([][]byte, 0, len(op.sops))
 
-	for _, sop := range op.sops {
+	for idx, sop := range op.sops {
 		if !sop.hasBase() {
 			continue
 		}
 
-		data := make([]byte, sop.baseSize)
-		p := data
-		for _, i := range sop.baseInfo {
-			var part []byte
-			part, p = takePart(p, i.size)
-			if err := s.getKnownChunk(i.loc, part); err != nil {
-				return fmt.Errorf("getKnownChunk error: %w", err)
-			}
-		}
-
 		// decompress if needed
-		data, err = doDiffDecompress(ctx, data, sop.recompress)
+		data, err := doDiffDecompress(ctx, bases[idx], sop.recompress)
 		if err != nil {
 			return fmt.Errorf("decompress error: %w", err)
 		}
@@ -490,10 +586,15 @@ func (s *Server) doDiffOp(ctx context.Context, op *diffOp) error {
 
 	baseData := common.ContiguousBytes(baseDatas)
 
-	// decompress from diff
+	// decompress from diff. digests are only checked after this, so don't read more than
+	// the requested data can be.
+	maxSize, err := maxDiffSize(op.sops, lens)
+	if err != nil {
+		return err
+	}
 	diffCounter := countReader{r: diff}
 	zr := zstd.NewReaderPatcher(&diffCounter, baseData)
-	reqData, err := io.ReadAll(zr)
+	reqData, err := common.ReadAllLimit(zr, maxSize)
 	zr.Close() // frees the C decompression stream
 	if err != nil {
 		return fmt.Errorf("expandChunkDiff error: %w", err)
@@ -552,6 +653,23 @@ func (s *Server) doDiffOp(ctx context.Context, op *diffOp) error {
 	}
 
 	return nil
+}
+
+// maxDiffSize checks the lengths header of a chunk diff and returns the most data the diff
+// can expand to: the requested data plus the stats.
+func maxDiffSize(sops []subOp, lens []int64) (int64, error) {
+	total := int64(maxDiffStatsBytes)
+	for i, sop := range sops {
+		limit := int64(sop.reqSize)
+		if len(sop.recompress) > 0 {
+			limit = maxRecompressBytes
+		}
+		if lens[i] < 0 || lens[i] > limit {
+			return 0, fmt.Errorf("bad length %d for chunk diff part %d (limit %d)", lens[i], i, limit)
+		}
+		total += lens[i]
+	}
+	return total, nil
 }
 
 // Returns a dup of the slab's write fd, so that a CLOSE can't close it (and let the number
@@ -736,7 +854,7 @@ func (s *Server) getDigestsFromImage(tx *bbolt.Tx, sph Sph, isManifest bool) ([]
 	// read chunks if needed
 	data := entry.InlineData
 	if len(data) == 0 {
-		locs, err := s.lookupLocs(tx, cdig.FromSliceAlias(entry.Digests))
+		locs, err := s.lookupLocs(tx, cdig.FromSliceAlias(entry.Digests), true)
 		if err != nil {
 			return nil, err
 		}
@@ -770,7 +888,7 @@ func (s *Server) getManifestLocal(tx *bbolt.Tx, sphStr string) (*pb.Manifest, []
 	data := entry.InlineData
 	mdigs := cdig.FromSliceAlias(entry.Digests)
 	if len(data) == 0 {
-		locs, err := s.lookupLocs(tx, mdigs)
+		locs, err := s.lookupLocs(tx, mdigs, true)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -816,8 +934,8 @@ func (s *Server) locPresent(tx *bbolt.Tx, loc erofs.SlabLoc) bool {
 	return sb.Get(addrKey(loc.Addr|presentMask)) != nil
 }
 
-func (s *Server) digestLoc(tx *bbolt.Tx, digest cdig.CDig) erofs.SlabLoc {
-	v := tx.Bucket(chunkBucket).Get(digest[:])
+func (s *Server) digestLoc(tx *bbolt.Tx, digest cdig.CDig, isManifest bool) erofs.SlabLoc {
+	v := chunkBucketFor(tx, isManifest).Get(digest[:])
 	if v == nil {
 		log.Println("missing chunk entry in digestLoc", digest)
 		return erofs.SlabLoc{} // shouldn't happen
@@ -825,8 +943,8 @@ func (s *Server) digestLoc(tx *bbolt.Tx, digest cdig.CDig) erofs.SlabLoc {
 	return loadLoc(v)
 }
 
-func (s *Server) digestPresent(tx *bbolt.Tx, digest cdig.CDig) (erofs.SlabLoc, bool) {
-	loc := s.digestLoc(tx, digest)
+func (s *Server) digestPresent(tx *bbolt.Tx, digest cdig.CDig, isManifest bool) (erofs.SlabLoc, bool) {
+	loc := s.digestLoc(tx, digest, isManifest)
 	return loc, s.locPresent(tx, loc)
 }
 
@@ -863,7 +981,7 @@ func (s *Server) appendRemanifestReqs(reqs []MountReq, op reqOp) []MountReq {
 		switch op := op.(type) {
 		case *singleOp:
 			// we didn't look up sph before, so do it now
-			loc := tx.Bucket(chunkBucket).Get(op.digest[:])
+			loc := chunkBucketFor(tx, isManifestSlab(op.loc.SlabId)).Get(op.digest[:])
 			if loc == nil {
 				return nil
 			}
@@ -882,7 +1000,13 @@ func (s *Server) appendRemanifestReqs(reqs []MountReq, op reqOp) []MountReq {
 
 	_ = s.db.View(func(tx *bbolt.Tx) error {
 		ib := tx.Bucket(imageBucket)
+		crb := tx.Bucket(catalogRBucket)
 		for sph := range getSphsFromOp(tx) {
+			if strings.HasPrefix(string(crb.Get(sph[:])), isManifestPrefix) {
+				// manifest chunks are catalogued under the manifest sph. remanifest the image
+				// it belongs to (makeManifestSph is its own inverse).
+				sph = makeManifestSph(sph)
+			}
 			sphStr := sph.String()
 			if slices.ContainsFunc(reqs, func(r MountReq) bool { return r.StorePath == sphStr }) {
 				continue
@@ -916,28 +1040,8 @@ func (s *Server) doRemanifestReqs(ctx context.Context, reqs []MountReq) error {
 	var success atomic.Int64
 	for _, req := range reqs {
 		eg.Go(func() error {
-			rr, ok := s.remanifestCache.GetOrPut(req.StorePath, &remanifestCacheEntry{
-				when: time.Now(),
-				done: make(chan struct{}),
-			})
-			if ok {
-				<-rr.done
-				if rr.err == nil {
-					success.Add(1)
-				}
-				return nil
-			}
-
-			_, err := s.getManifestFromManifester(ctx, req.Upstream, req.StorePath, req.NarSize)
-
-			rr.err = err
-			close(rr.done)
-			s.remanifestCache.WithValue(req.StorePath, func(rr *remanifestCacheEntry) { rr.when = time.Now() })
-
-			if err == nil {
+			if s.remanifest(ctx, req) == nil {
 				success.Add(1)
-			} else {
-				log.Printf("remanifest of %s failed: %v", req.StorePath, err)
 			}
 			return nil // don't cancel others
 		})
@@ -946,6 +1050,108 @@ func (s *Server) doRemanifestReqs(ctx context.Context, reqs []MountReq) error {
 		return errors.New("no remanifest succeeded")
 	}
 	return nil
+}
+
+// remanifest asks the manifester to rebuild req's manifest. Concurrent callers share one
+// request, and its result is cached for remanifestCacheExpiry. The request runs on its own
+// context, so one caller going away doesn't fail it for the others: it's cancelled only
+// when every caller waiting on it has gone, and then its result isn't cached.
+func (s *Server) remanifest(ctx context.Context, req MountReq) error {
+	for {
+		reqCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), remanifestTimeout)
+		rr, loaded := s.remanifestCache.GetOrPut(req.StorePath, &remanifestCacheEntry{
+			when:   time.Now(),
+			done:   make(chan struct{}),
+			cancel: cancel,
+		})
+		if loaded {
+			cancel()
+		} else {
+			go s.runRemanifest(reqCtx, req, rr)
+		}
+
+		joined := rr.join()
+		select {
+		case <-rr.done:
+		case <-ctx.Done():
+			if joined {
+				rr.leave()
+			}
+			return ctx.Err()
+		}
+		if joined {
+			rr.leave()
+		}
+		if rr.err == errRemanifestAbandoned {
+			// everyone waiting on that one left before it finished; start another
+			continue
+		}
+		return rr.err
+	}
+}
+
+func (s *Server) runRemanifest(ctx context.Context, req MountReq, rr *remanifestCacheEntry) {
+	defer rr.cancel()
+
+	// skip the manifest cache: the cached manifest is what refers to the missing chunks
+	_, buildReq, err := s.manifestReqs(req.Upstream, req.StorePath)
+	if err == nil {
+		_, err = s.requestNewManifest(ctx, buildReq, req.NarSize)
+	}
+
+	if err != nil && ctx.Err() != nil {
+		// cancelled or timed out: don't cache that
+		s.remanifestCache.Modify(req.StorePath, func(have *remanifestCacheEntry, ok bool) (*remanifestCacheEntry, bool) {
+			return have, ok && have != rr
+		})
+		rr.mu.Lock()
+		if rr.abandoned {
+			err = errRemanifestAbandoned
+		}
+		rr.mu.Unlock()
+	}
+	if err != nil && err != errRemanifestAbandoned {
+		log.Printf("remanifest of %s failed: %v", req.StorePath, err)
+	}
+
+	rr.err = err
+	close(rr.done)
+	s.remanifestCache.WithValue(req.StorePath, func(have *remanifestCacheEntry) {
+		if have == rr {
+			have.when = time.Now()
+		}
+	})
+}
+
+// remanifest cache entry
+
+var errRemanifestAbandoned = errors.New("remanifest abandoned")
+
+// join registers a waiter. It returns false if the request was already abandoned.
+func (rr *remanifestCacheEntry) join() bool {
+	rr.mu.Lock()
+	defer rr.mu.Unlock()
+	if rr.abandoned {
+		return false
+	}
+	rr.waiters++
+	return true
+}
+
+// leave unregisters a waiter, and cancels the request if it was the last one and the request
+// hasn't finished.
+func (rr *remanifestCacheEntry) leave() {
+	rr.mu.Lock()
+	defer rr.mu.Unlock()
+	if rr.waiters--; rr.waiters > 0 {
+		return
+	}
+	select {
+	case <-rr.done:
+	default:
+		rr.abandoned = true
+		rr.cancel()
+	}
 }
 
 // single op
@@ -1121,6 +1327,38 @@ func (set *opSet) subOpFits(sop subOp) bool {
 		(set.op.reqTotalSize+sop.reqSize) <= MaxOpBytes
 }
 
+// build runs buildDiff and returns the op that will fetch the chunk at loc. If that fails
+// or panics, it unregisters every op it added to diffMap, since nothing will start them and
+// anyone waiting on one would wait forever.
+// call with diffLock held
+func (set *opSet) build(
+	tx *bbolt.Tx,
+	loc erofs.SlabLoc,
+	targetDigest cdig.CDig,
+	sphps []SphPrefix,
+	useRR bool,
+) (op reqOp, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			// buildDiff works from db contents and manifests, so treat a panic as bad data,
+			// like startDiffOp does: callers can still fall back to a single read.
+			log.Printf("panic in buildDiff: %v\n%s", r, debug.Stack())
+			op, err = nil, fmt.Errorf("panic in buildDiff: %v", r)
+		}
+		if err != nil {
+			for _, op := range set.ops {
+				set.s.unregisterDiffOp(op)
+			}
+		}
+	}()
+	if err = set.buildDiff(tx, targetDigest, sphps, useRR); err != nil {
+		return nil, err
+	} else if op = set.s.diffMap[loc]; op == nil {
+		return nil, errors.New("buildDiff did not include requested chunk") // shouldn't happen
+	}
+	return op, nil
+}
+
 // call with diffLock held
 func (set *opSet) buildDiff(
 	tx *bbolt.Tx,
@@ -1232,7 +1470,7 @@ func (set *opSet) buildExtendDiff(
 	changed := false
 	newFile := true
 	for {
-		if newFile && res.usingBase() {
+		if newFile && res.usingBase() && !isManifest { // recompress is only for data files
 			if args := getRecompressArgs(reqIter.ent()); len(args) > 0 {
 				if newBaseIter, newReqIter, err := set.buildRecompress(tx, res, args, baseIter, reqIter); err == nil {
 					baseIter, reqIter = newBaseIter, newReqIter
@@ -1249,7 +1487,7 @@ func (set *opSet) buildExtendDiff(
 
 		reqDigest := reqIter.digest()
 		if reqDigest != cdig.Zero && !set.fullReq() && !set.isUsing(reqDigest) {
-			reqLoc, reqPresent := set.s.digestPresent(tx, reqDigest)
+			reqLoc, reqPresent := set.s.digestPresent(tx, reqDigest, isManifest)
 			if !reqPresent && reqLoc.Addr > 0 && set.s.diffMap[reqLoc] == nil {
 				set.markUsing(reqDigest)
 				set.checkReq()
@@ -1262,7 +1500,7 @@ func (set *opSet) buildExtendDiff(
 		// fill base only if room in this op, don't make more ops just for base
 		baseDigest := baseIter.digest()
 		if baseDigest != cdig.Zero && int(set.op.baseTotalChunks) < set.maxOpSize && set.op.baseTotalSize < MaxOpBytes && !set.isUsing(baseDigest) {
-			baseLoc, basePresent := set.s.digestPresent(tx, baseDigest)
+			baseLoc, basePresent := set.s.digestPresent(tx, baseDigest, isManifest)
 			if basePresent {
 				set.markUsing(baseDigest)
 				set.op.addBase(res.baseHash, baseDigest, baseIter.size(), baseLoc)
@@ -1338,7 +1576,7 @@ func (set *opSet) buildRecompress(
 
 	for baseIter.toFileStart(); baseIter.ent() == baseEnt; baseIter.next(1) {
 		baseDigest := baseIter.digest()
-		baseLoc, basePresent := set.s.digestPresent(tx, baseDigest)
+		baseLoc, basePresent := set.s.digestPresent(tx, baseDigest, false)
 		if baseLoc.Addr == 0 {
 			retErr = errors.New("digest in entry of base digest is not mapped")
 			return
@@ -1353,7 +1591,7 @@ func (set *opSet) buildRecompress(
 
 	for reqIter.toFileStart(); reqIter.ent() == reqEnt; reqIter.next(1) {
 		reqDigest := reqIter.digest()
-		reqLoc := set.s.digestLoc(tx, reqDigest)
+		reqLoc := set.s.digestLoc(tx, reqDigest, false)
 		if reqLoc.Addr == 0 {
 			retErr = errors.New("digest in entry of req digest is not mapped")
 			return
@@ -1370,10 +1608,13 @@ func (set *opSet) buildRecompress(
 	set.op.addRecompress(sphs, sop)
 
 	// For recompress diff we need to ask for the whole file so we may include chunks we
-	// already have, or are already being diffed (though that's very unlikely). In that case
-	// just leave the existing entry.
+	// already have, or are already being diffed (though that's very unlikely). Only register
+	// the missing ones that nobody is fetching yet. In particular, don't register present
+	// chunks: a kernel read for one means its data isn't really there, and it may be a base
+	// that another op is reading while holding a baseSem slot. That read would wait on this
+	// op, which may need a baseSem slot too.
 	for _, i := range sop.reqInfo {
-		if set.s.diffMap[i.loc] == nil {
+		if set.s.diffMap[i.loc] == nil && !set.s.locPresent(tx, i.loc) {
 			set.s.diffMap[i.loc] = set.op
 		}
 	}

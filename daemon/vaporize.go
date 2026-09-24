@@ -362,7 +362,7 @@ func (s *Server) preallocateBatch(ctx context.Context, blocks []uint16, digests 
 	out := make([]erofs.SlabLoc, n)
 	wasAllocated := make([]bool, n)
 	err := s.db.Update(func(tx *bbolt.Tx) error {
-		cb := tx.Bucket(chunkBucket)
+		cb := chunkBucketFor(tx, forManifest)
 		a, err := s.newSlabAllocator(tx.Bucket(slabBucket), firstSlab(forManifest))
 		if err != nil {
 			return err
@@ -391,7 +391,7 @@ func (s *Server) preallocateBatch(ctx context.Context, blocks []uint16, digests 
 
 // next (after caller has written/cloned), associate with chunks
 func (s *Server) commitPreallocated(ctx context.Context, blocks []uint16, digests []cdig.CDig, locs []erofs.SlabLoc, wasAllocated []bool) error {
-	sph, _, ok := fromAllocateCtx(ctx)
+	sph, forManifest, ok := fromAllocateCtx(ctx)
 	if !ok {
 		return errors.New("missing allocate context")
 	}
@@ -400,7 +400,7 @@ func (s *Server) commitPreallocated(ctx context.Context, blocks []uint16, digest
 		return errors.New("mismatched lengths")
 	}
 	return s.db.Update(func(tx *bbolt.Tx) error {
-		cb, slabroot := tx.Bucket(chunkBucket), tx.Bucket(slabBucket)
+		cb, slabroot := chunkBucketFor(tx, forManifest), tx.Bucket(slabBucket)
 
 		for i, loc := range locs {
 			digest := digests[i][:]

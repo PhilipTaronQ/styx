@@ -29,16 +29,18 @@ type (
 		*GcResp
 		tx *bbolt.Tx
 
-		ib, cb, mb *bbolt.Bucket
+		ib, mb *bbolt.Bucket
 
 		keepImage map[string]struct{}    // sph string
 		keepSphps map[SphPrefix]struct{} // sph prefix
-		keepDig   map[cdig.CDig]struct{}
+		keepDig   map[cdig.CDig]struct{} // data chunks
+		keepMDig  map[cdig.CDig]struct{} // manifest chunks
 	}
 
-	rewriteChunk struct {
-		d cdig.CDig
-		v []byte
+	gcChunk struct {
+		cb *bbolt.Bucket // chunkBucket or mchunkBucket
+		d  cdig.CDig
+		v  []byte // new value, for rewrites
 	}
 	locWithEnd struct {
 		erofs.SlabLoc
@@ -68,11 +70,11 @@ func (s *Server) handleGcReq(ctx context.Context, r *GcReq) (*GcResp, error) {
 		GcResp:    resp,
 		tx:        tx,
 		ib:        tx.Bucket(imageBucket),
-		cb:        tx.Bucket(chunkBucket),
 		mb:        tx.Bucket(manifestBucket),
 		keepImage: make(map[string]struct{}, 1000),
 		keepSphps: make(map[SphPrefix]struct{}, 1000),
 		keepDig:   make(map[cdig.CDig]struct{}, 100000),
+		keepMDig:  make(map[cdig.CDig]struct{}, 1000),
 	}
 
 	// use image bucket as roots
@@ -122,37 +124,45 @@ func (s *Server) handleGcReq(ctx context.Context, r *GcReq) (*GcResp, error) {
 	}
 
 	// find all chunks to delete
-	var delChunks []cdig.CDig
+	var delChunks []gcChunk
 	var delLocs []erofs.SlabLoc
-	var rewriteChunks []rewriteChunk
-	cbcur := g.cb.Cursor()
-	for k, v := cbcur.First(); k != nil; k, v = cbcur.Next() {
-		d := cdig.FromBytes(k)
-		if _, ok := g.keepDig[d]; !ok {
-			delChunks = append(delChunks, d)
-			delLocs = append(delLocs, loadLoc(v))
-			continue
-		}
-		g.RemainHaveChunks++
-		sphps := sphpsFromLoc(v)
-		if g.keepAllSphps(sphps) {
-			continue
-		}
-		newv := make([]byte, 6, len(v))
-		copy(newv, v)
-		for _, sphp := range sphps {
-			if _, ok := g.keepSphps[sphp]; ok {
-				newv = append(newv, sphp[:]...)
+	var rewriteChunks []gcChunk
+	for _, chunks := range []struct {
+		cb   *bbolt.Bucket
+		keep map[cdig.CDig]struct{}
+	}{
+		{tx.Bucket(chunkBucket), g.keepDig},
+		{tx.Bucket(mchunkBucket), g.keepMDig},
+	} {
+		cbcur := chunks.cb.Cursor()
+		for k, v := cbcur.First(); k != nil; k, v = cbcur.Next() {
+			d := cdig.FromBytes(k)
+			if _, ok := chunks.keep[d]; !ok {
+				delChunks = append(delChunks, gcChunk{cb: chunks.cb, d: d})
+				delLocs = append(delLocs, loadLoc(v))
+				continue
 			}
+			g.RemainHaveChunks++
+			sphps := sphpsFromLoc(v)
+			if g.keepAllSphps(sphps) {
+				continue
+			}
+			newv := make([]byte, 6, len(v))
+			copy(newv, v)
+			for _, sphp := range sphps {
+				if _, ok := g.keepSphps[sphp]; ok {
+					newv = append(newv, sphp[:]...)
+				}
+			}
+			rewriteChunks = append(rewriteChunks, gcChunk{cb: chunks.cb, d: d, v: newv})
 		}
-		rewriteChunks = append(rewriteChunks, rewriteChunk{d: d, v: newv})
 	}
 
 	g.DeleteImages = len(delImages)
 	g.DeleteManifests = len(delManifests)
 	g.DeleteChunks = len(delChunks)
 	g.RemainImages = len(g.keepImage)
-	g.RemainRefChunks = len(g.keepDig)
+	g.RemainRefChunks = len(g.keepDig) + len(g.keepMDig)
 	g.RewriteChunks = len(rewriteChunks)
 
 	log.Printf("gc: will delete:")
@@ -255,13 +265,13 @@ func (s *Server) handleGcReq(ctx context.Context, r *GcReq) (*GcResp, error) {
 	}
 
 	// chunks delete
-	for _, d := range delChunks {
-		g.cb.Delete(d[:])
+	for _, del := range delChunks {
+		del.cb.Delete(del.d[:])
 	}
 
 	// chunks rewrite
 	for _, rew := range rewriteChunks {
-		g.cb.Put(rew.d[:], rew.v)
+		rew.cb.Put(rew.d[:], rew.v)
 	}
 
 	// catalog
@@ -355,7 +365,7 @@ func (s *Server) gcTraceImage(g *gcCtx, sphStr string, img *pb.DbImage) error {
 	}
 
 	for _, mdig := range mdigs {
-		g.keepDig[mdig] = struct{}{}
+		g.keepMDig[mdig] = struct{}{}
 	}
 	for _, e := range m.Entries {
 		for _, d := range cdig.FromSliceAlias(e.Digests) {

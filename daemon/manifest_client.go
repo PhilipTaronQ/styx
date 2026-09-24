@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"path"
@@ -29,17 +28,6 @@ func (s *Server) getManifestAndBuildImage(ctx context.Context, req *MountReq) (*
 	sph, sphStr, spName, err := ParseSphAndName(req.StorePath)
 	if err != nil {
 		return nil, nil, err
-	}
-
-	// handle generic tarball manifests that are being substituted from our fake binary cache
-	if strings.Contains(req.Upstream, fakeCacheBind) {
-		data, err := s.getFakeCacheData(sphStr)
-		if err != nil {
-			return nil, nil, fmt.Errorf("couldn't find upstream for %s; re-run 'styx tarball'", sphStr)
-		}
-		nreq := *req
-		nreq.Upstream = data.Upstream
-		req = &nreq
 	}
 
 	// use a separate "sph" for the manifest itself (a single entry). only used if manifest is chunked.
@@ -161,18 +149,48 @@ func (s *Server) getManifestAndBuildImage(ctx context.Context, req *MountReq) (*
 	return &m, image.Bytes(), nil
 }
 
-func (s *Server) getManifestFromManifester(ctx context.Context, upstream, sph string, narSize int64) ([]byte, error) {
-	mReq := manifester.ManifestReq{
+func newManifestReq(upstream, sph string) manifester.ManifestReq {
+	return manifester.ManifestReq{
 		Upstream:      upstream,
 		StorePathHash: sph,
 		DigestAlgo:    cdig.Algo,
 		DigestBits:    int(cdig.Bits),
 		// SmallFileCutoff: s.cfg.SmallFileCutoff,
 	}
+}
+
+// manifestReqs returns the requests that look up the manifest for sph from upstream in the
+// manifest cache, and that build it. Tarball images are substituted from our fake binary
+// cache, which the manifester can't read. For those, it builds the tarball they came from
+// again, and caches the result as if it came from a binary cache at the tarball's url.
+func (s *Server) manifestReqs(upstream, sph string) (cacheReq, buildReq manifester.ManifestReq, err error) {
+	if !strings.Contains(upstream, fakeCacheBind) {
+		req := newManifestReq(upstream, sph)
+		return req, req, nil
+	}
+	data, err := s.getFakeCacheData(sph)
+	if err != nil {
+		return cacheReq, buildReq, fmt.Errorf("couldn't find upstream for %s; re-run 'styx tarball'", sph)
+	}
+	cacheReq = newManifestReq(data.Upstream, sph)
+	buildReq = manifester.ManifestReq{
+		Upstream:   data.Upstream,
+		BuildMode:  manifester.ModeGenericTarball,
+		DigestAlgo: cdig.Algo,
+		DigestBits: int(cdig.Bits),
+	}
+	return cacheReq, buildReq, nil
+}
+
+func (s *Server) getManifestFromManifester(ctx context.Context, upstream, sph string, narSize int64) ([]byte, error) {
+	cacheReq, buildReq, err := s.manifestReqs(upstream, sph)
+	if err != nil {
+		return nil, err
+	}
 
 	// check cache
 	s.stats.manifestCacheReqs.Add(1)
-	if b, err := s.p().mcread.Get(ctx, mReq.CacheKey(), nil); err == nil {
+	if b, err := s.p().mcread.Get(ctx, cacheReq.CacheKey(), nil); err == nil {
 		log.Printf("got manifest for %s from cache", sph)
 		s.stats.manifestCacheHits.Add(1)
 		return b, nil
@@ -181,6 +199,13 @@ func (s *Server) getManifestFromManifester(ctx context.Context, upstream, sph st
 	}
 
 	// not found cached, request it
+	return s.requestNewManifest(ctx, buildReq, narSize)
+}
+
+// requestNewManifest asks the manifester to build a manifest, without looking in the manifest
+// cache. The manifester uploads any chunks the chunk store is missing, so this is also how we
+// recover from missing chunks.
+func (s *Server) requestNewManifest(ctx context.Context, mReq manifester.ManifestReq, narSize int64) ([]byte, error) {
 	s.stats.manifestReqs.Add(1)
 	shards := s.calcShards(narSize)
 	b, err := s.getNewManifest(ctx, mReq, shards)
@@ -217,21 +242,16 @@ func (s *Server) getNewManifest(ctx context.Context, req manifester.ManifestReq,
 			if err != nil {
 				return err
 			}
-			res, err := common.RetryHttpRequest(egCtx, http.MethodPost, url, common.CTJson, reqBytes)
+			// no attempt timeout: building a manifest can take a while
+			maxBody := int64(zstd.CompressBound(manifester.MaxEnvelopeBytes))
+			b, _, err := common.RetryHttpRequestBody(egCtx, http.MethodPost, url, common.CTJson, reqBytes, maxBody, 0)
 			if err != nil {
 				return fmt.Errorf("manifester http error: %w", err)
 			}
-			defer res.Body.Close()
 			if i == 0 {
-				zr := zstd.NewReader(res.Body)
-				defer zr.Close() // frees the C decompression stream
-				if b, err := io.ReadAll(zr); err != nil {
-					return err
-				} else {
-					shard0 = b
+				if shard0, err = common.DecompressLimit(b, manifester.MaxEnvelopeBytes); err != nil {
+					return fmt.Errorf("manifester response: %w", err)
 				}
-			} else {
-				io.Copy(io.Discard, res.Body)
 			}
 			return nil
 		})

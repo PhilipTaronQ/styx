@@ -15,10 +15,8 @@ import (
 	"github.com/dnr/styx/pb"
 )
 
-const slabTestStorePath = "qa22bifihaxyvn6q2a6w9m0nklqrk9wh-opusfile-0.12"
-
 func slabTestSph(t *testing.T) Sph {
-	sph, _, _, err := ParseSphAndName(slabTestStorePath)
+	sph, _, _, err := ParseSphAndName(testSpX)
 	require.NoError(t, err)
 	return sph
 }

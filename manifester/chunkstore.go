@@ -13,12 +13,24 @@ import (
 	"strings"
 	"time"
 
+	"github.com/DataDog/zstd"
+
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	s3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 
 	"github.com/dnr/styx/common"
+	"github.com/dnr/styx/common/shift"
+)
+
+const (
+	// Signed manifest envelopes are small: manifests over SmallManifestCutoff are chunked,
+	// so the envelope holds only their digests and metadata. This is a generous limit.
+	MaxEnvelopeBytes = 16 << 20
+
+	// Each attempt at reading a chunk or manifest envelope gets this long.
+	readAttemptTimeout = time.Minute
 )
 
 // RefreshAge is how old an existing object must be for PutIfNotExists to refresh its
@@ -59,8 +71,10 @@ type (
 	}
 
 	urlChunkStoreRead struct {
-		url string
-		zp  *common.ZstdCtxPool
+		url     string
+		zp      *common.ZstdCtxPool
+		maxSize int64 // of the data
+		maxBody int64 // of the response body
 	}
 )
 
@@ -215,39 +229,40 @@ func NewChunkStoreReadUrl(url, path string) ChunkStoreRead {
 	if path != ChunkReadPath && path != ManifestCachePath {
 		panic("path must be ChunkReadPath or ManifestCachePath")
 	}
+	maxSize := shift.MaxChunkShift.Size()
+	if path == ManifestCachePath {
+		maxSize = MaxEnvelopeBytes
+	}
 	return &urlChunkStoreRead{
-		url: strings.TrimSuffix(url, "/") + path,
-		zp:  common.GetZstdCtxPool(),
+		url:     strings.TrimSuffix(url, "/") + path,
+		zp:      common.GetZstdCtxPool(),
+		maxSize: maxSize,
+		maxBody: int64(zstd.CompressBound(int(maxSize))),
 	}
 }
 
 func (s *urlChunkStoreRead) Get(ctx context.Context, key string, dst []byte) ([]byte, error) {
-	url := s.url + key
-	res, err := common.RetryHttpRequest(ctx, http.MethodGet, url, "", nil)
+	b, hdr, err := common.RetryHttpRequestBody(ctx, http.MethodGet, s.url+key, "", nil, s.maxBody, readAttemptTimeout)
 	if err != nil {
 		return nil, err
 	}
-	defer res.Body.Close()
-	if res.StatusCode != http.StatusOK {
-		return nil, common.HttpErrorFromRes(res)
-	}
-	b, err := io.ReadAll(res.Body)
-	if err != nil {
-		return nil, err
-	}
-	if res.Header.Get("Content-Encoding") == "zstd" {
-		z := s.zp.Get()
-		defer s.zp.Put(z)
+	// the caller checks the digest only after this, so don't trust the body to decompress to
+	// a reasonable size
+	if hdr.Get("Content-Encoding") == "zstd" {
 		if dst == nil {
-			return z.Decompress(nil, b)
+			return common.DecompressLimit(b, s.maxSize)
 		} else {
-			// fast path, assume buffer is big enough
+			// fast path, assume buffer is big enough (this can't write past its capacity)
+			z := s.zp.Get()
+			defer s.zp.Put(z)
 			n, err := z.DecompressInto(dst[len(dst):cap(dst)], b)
 			if err != nil {
 				return nil, err
 			}
 			return dst[:len(dst)+n], nil
 		}
+	} else if int64(len(b)) > s.maxSize {
+		return nil, fmt.Errorf("%w: %d bytes", common.ErrTooLarge, len(b))
 	} else if dst == nil {
 		return b, nil
 	} else {
