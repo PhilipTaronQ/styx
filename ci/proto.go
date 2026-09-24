@@ -61,14 +61,11 @@ type (
 		// build args
 		RelID      string
 		StyxCommit string
-		SkipGC     bool `json:",omitempty"` // the workflow runs HeavyGC itself
 	}
 	buildRes struct {
 		FakeError     string
 		Names         []string
 		ManifestStats manifester.Stats
-		NewLastGC     int64  `json:",omitempty"`
-		GCSummary     string `json:",omitempty"`
 	}
 	buildErrDetails struct {
 		Logs string

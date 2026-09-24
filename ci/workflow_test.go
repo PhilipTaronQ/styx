@@ -60,9 +60,6 @@ func TestCiWorkflowNotifyAlwaysFails(t *testing.T) {
 	env.OnActivity(new(heavyActivities).HeavyBuild, mock.Anything, mock.Anything).Return(
 		func(ctx context.Context, req *buildReq) (*buildRes, error) {
 			builds.Add(1)
-			if !req.SkipGC {
-				t.Error("HeavyBuild asked to run GC")
-			}
 			return &buildRes{Names: []string{"hello-2.12"}}, nil
 		})
 	env.OnActivity(new(heavyActivities).HeavyGC, mock.Anything, mock.Anything).Return(

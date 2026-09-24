@@ -9,14 +9,13 @@ import (
 
 type (
 	StartConfig struct {
-		TemporalParams   string
-		CompressPayloads bool
-		Args             CiArgs
+		TemporalParams string
+		Args           CiArgs
 	}
 )
 
 func Start(ctx context.Context, cfg StartConfig) error {
-	c, _, err := getTemporalClient(ctx, cfg.TemporalParams, cfg.CompressPayloads)
+	c, _, err := getTemporalClient(ctx, cfg.TemporalParams)
 	if err != nil {
 		return err
 	}

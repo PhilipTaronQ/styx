@@ -44,9 +44,8 @@ import (
 
 type (
 	WorkerConfig struct {
-		TemporalParams   string
-		SmtpParams       string
-		CompressPayloads bool
+		TemporalParams string
+		SmtpParams     string
 
 		RunWorker      bool
 		RunScaler      bool
@@ -132,7 +131,7 @@ func RunWorker(ctx context.Context, cfg WorkerConfig) error {
 		return errors.New("must run either worker or heavy worker")
 	}
 
-	c, namespace, err := getTemporalClient(ctx, cfg.TemporalParams, cfg.CompressPayloads)
+	c, namespace, err := getTemporalClient(ctx, cfg.TemporalParams)
 	if err != nil {
 		return err
 	}
@@ -251,16 +250,12 @@ func ci(ctx workflow.Context, args *CiArgs) error {
 			continue
 		}
 
-		// Version 1 runs GC in its own activity after the build, instead of in HeavyBuild.
-		gcSeparate := workflow.GetVersion(ctx, "gc-activity", workflow.DefaultVersion, 1) == 1
-
 		buildStart := workflow.Now(ctx)
 		l.Info("building", "relid", args.LastRelID, "styx", args.LastStyxCommit)
 		bres, err := ciBuild(ctx, &buildReq{
 			Args:       args,
 			RelID:      args.LastRelID,
 			StyxCommit: args.LastStyxCommit,
-			SkipGC:     gcSeparate,
 		})
 		workflow.UpsertMemo(ctx, map[string]any{
 			memoKeyBuildFailed: err != nil || bres.FakeError != "",
@@ -287,11 +282,8 @@ func ci(ctx workflow.Context, args *CiArgs) error {
 		buildElapsed := workflow.Now(ctx).Sub(buildStart).Round(time.Second)
 		prevNames := args.PrevNames
 		args.PrevNames = bres.Names
-		if bres.NewLastGC > 0 {
-			args.LastGC = bres.NewLastGC
-		}
-		gcSummary := bres.GCSummary
-		if gcSeparate && workflow.Now(ctx).Unix()-args.LastGC > int64(gcInterval.Seconds()) {
+		var gcSummary string
+		if workflow.Now(ctx).Unix()-args.LastGC > int64(gcInterval.Seconds()) {
 			if gres, err := ciGC(ctx); err != nil {
 				l.Error("gc error", "error", err)
 				gcSummary = "gc error: " + err.Error()
@@ -487,7 +479,7 @@ func (s *scaler) getInfo() (scalerInfo, error) {
 		}
 		if p := desc.WorkflowExecutionInfo.GetMemo().GetFields()[memoKeyBuildFailed]; p != nil {
 			var failed bool
-			if getDataConverter(false).FromPayload(p, &failed) == nil {
+			if getDataConverter().FromPayload(p, &failed) == nil {
 				info.failed = info.failed || failed
 			}
 		}
@@ -838,8 +830,7 @@ func (a *heavyActivities) HeavyBuild(ctx context.Context, req *buildReq) (retBui
 	// write root
 
 	btime := time.Now()
-	var gcSummary strings.Builder
-	gc := a.newGC(btime, &gcSummary, stage)
+	gc := a.newGC(btime, new(strings.Builder), stage)
 
 	stage("WRITE ROOT")
 	root := &pb.BuildRoot{
@@ -863,15 +854,6 @@ func (a *heavyActivities) HeavyBuild(ctx context.Context, req *buildReq) (retBui
 		return nil, err
 	}
 
-	// gc (only for workflows started before HeavyGC existed)
-
-	newLastGC := req.Args.LastGC
-	if !req.SkipGC && btime.Unix()-req.Args.LastGC > int64(gcInterval.Seconds()) {
-		if err := gc.run(ctx); err == nil {
-			newLastGC = btime.Unix()
-		}
-	}
-
 	slices.Sort(names)
 	names = slices.Compact(names)
 
@@ -879,8 +861,6 @@ func (a *heavyActivities) HeavyBuild(ctx context.Context, req *buildReq) (retBui
 	return &buildRes{
 		Names:         names,
 		ManifestStats: a.b.Stats(),
-		NewLastGC:     newLastGC,
-		GCSummary:     gcSummary.String(),
 	}, nil
 }
 

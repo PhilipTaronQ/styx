@@ -20,18 +20,12 @@ import (
 	"github.com/dnr/styx/common"
 )
 
-// getDataConverter returns a data converter that decodes zstd-compressed payloads, and
-// compresses payloads it encodes if compress is set.
-//
-// Deploy ordering: payloads were never actually compressed before, and a process with an
-// older binary can't decode compressed ones. So enable compress (--compress_payloads) only
-// once every worker and client that reads this namespace's payloads runs a binary with this
-// decoder. Decoding accepts uncompressed payloads, so that's safe in any order.
-func getDataConverter(compress bool) converter.DataConverter {
-	return converter.NewCodecDataConverter(converter.GetDefaultDataConverter(), zstdcodec{compress: compress})
+// getDataConverter returns a data converter that zstd-compresses payloads.
+func getDataConverter() converter.DataConverter {
+	return converter.NewCodecDataConverter(converter.GetDefaultDataConverter(), zstdcodec{})
 }
 
-func getTemporalClient(ctx context.Context, paramSrc string, compress bool) (client.Client, string, error) {
+func getTemporalClient(ctx context.Context, paramSrc string) (client.Client, string, error) {
 	params, err := getParams(paramSrc)
 	if err != nil {
 		return nil, "", err
@@ -42,7 +36,7 @@ func getTemporalClient(ctx context.Context, paramSrc string, compress bool) (cli
 	}
 	hostPort, namespace, apiKey := parts[0], parts[1], parts[2]
 
-	dc := getDataConverter(compress)
+	dc := getDataConverter()
 	fc := temporal.NewDefaultFailureConverter(temporal.DefaultFailureConverterOptions{DataConverter: dc})
 
 	co := client.Options{
@@ -77,17 +71,14 @@ func getTemporalClient(ctx context.Context, paramSrc string, compress bool) (cli
 	return c, namespace, err
 }
 
-type zstdcodec struct {
-	compress bool // Encode compresses; Decode always decompresses
-}
+// zstdcodec compresses each payload that compression shrinks, and marks it in its
+// metadata. Decode decompresses only the marked ones.
+type zstdcodec struct{}
 
-func (c zstdcodec) Encode(payloads []*commonpb.Payload) ([]*commonpb.Payload, error) {
-	out := slices.Clone(payloads)
-	if !c.compress {
-		return out, nil
-	}
+func (zstdcodec) Encode(payloads []*commonpb.Payload) ([]*commonpb.Payload, error) {
 	z := common.GetZstdCtxPool().Get()
 	defer common.GetZstdCtxPool().Put(z)
+	out := slices.Clone(payloads)
 	for i, p := range payloads {
 		zd, err := z.Compress(nil, p.Data)
 		if err != nil {
