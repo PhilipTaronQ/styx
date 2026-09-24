@@ -1,6 +1,7 @@
 package manifester
 
 import (
+	"archive/tar"
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -158,6 +159,51 @@ func TestChunkDiffGzipErrorLeaksFetchGoroutines(t *testing.T) {
 	after := waitGoroutines(marker, before, 3*time.Second)
 	assert.LessOrEqual(t, after, before,
 		"%d chunk-series goroutines still blocked after the request finished and its context was cancelled", after-before)
+}
+
+// The upstream allow-list was checked for the first URL only: http.DefaultClient follows up
+// to 10 redirects to any host, for narinfos, nars and tarballs.
+func TestUpstreamRedirectToDisallowedHost(t *testing.T) {
+	sk, pk := upstreamKeys(t)
+	allowed := newFakeUpstream(t)
+	other := newFakeUpstream(t)
+	cs := &mockChunkStore{data: make(map[string][]byte)}
+	mb := newTestBuilder(t, cs, pk, 0)
+	srv, err := NewManifestServer(Config{AllowedUpstreams: []string{allowed.host()}, ChunkDiffParallel: 4}, mb)
+	require.NoError(t, err)
+
+	request := func(r ManifestReq) *httptest.ResponseRecorder {
+		r.DigestAlgo, r.DigestBits = cdig.Algo, int(cdig.Bits)
+		body, err := json.Marshal(r)
+		require.NoError(t, err)
+		rec := httptest.NewRecorder()
+		srv.handleManifest(rec, httptest.NewRequest(http.MethodPost, ManifestPath, bytes.NewReader(body)))
+		return rec
+	}
+
+	// narinfo redirected to another host
+	sph := other.addPath(t, sk, "elsewhere", []narFile{{"/f", 1000}}, narinfoOpts{})
+	allowed.redirect("/"+sph+".narinfo", other.url()+sph+".narinfo")
+	rec := request(ManifestReq{Upstream: allowed.url(), StorePathHash: sph})
+	assert.NotEqual(t, http.StatusOK, rec.Code)
+
+	// tarball redirected to another host
+	other.set("/t.tar", makeTar(t, []tarFile{{"f", tar.TypeReg, "hello"}}))
+	allowed.redirect("/t.tar", other.url()+"t.tar")
+	rec = request(ManifestReq{Upstream: allowed.url() + "t.tar", BuildMode: ModeGenericTarball})
+	assert.NotEqual(t, http.StatusOK, rec.Code)
+
+	assert.Zero(t, other.requestCount(), "manifester followed a redirect to a disallowed host")
+
+	// redirects within allowed hosts are fine
+	sph = allowed.addPath(t, sk, "moved", []narFile{{"/f", 1000}}, narinfoOpts{})
+	allowed.mu.Lock()
+	ni := allowed.files["/"+sph+".narinfo"]
+	allowed.mu.Unlock()
+	allowed.set("/moved/"+sph+".narinfo", ni)
+	allowed.redirect("/"+sph+".narinfo", "/moved/"+sph+".narinfo")
+	rec = request(ManifestReq{Upstream: allowed.url(), StorePathHash: sph})
+	assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 }
 
 // An unauthenticated caller can send only shard 0 of N. Shard 0 used to write the manifest to

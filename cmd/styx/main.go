@@ -115,6 +115,10 @@ func withManifesterConfig(c *cobra.Command) *manifester.Config {
 			"releases.nixos.org",
 			"channels.nixos.org",
 			"github.com",
+			// redirects are checked too: github archives and release downloads go here
+			"codeload.github.com",
+			"objects.githubusercontent.com",
+			"release-assets.githubusercontent.com",
 			"gitlab.com",
 			"bitbucket.org",
 			"codeberg.org",

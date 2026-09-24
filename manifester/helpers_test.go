@@ -108,18 +108,25 @@ func makeNarinfo(t *testing.T, sk signature.SecretKey, sph, name string, narData
 
 // a fake binary cache
 type fakeUpstream struct {
-	ts    *httptest.Server
-	mu    sync.Mutex
-	files map[string][]byte
+	ts        *httptest.Server
+	mu        sync.Mutex
+	files     map[string][]byte
+	redirects map[string]string
+	requests  int
 }
 
 func newFakeUpstream(t *testing.T) *fakeUpstream {
-	u := &fakeUpstream{files: make(map[string][]byte)}
+	u := &fakeUpstream{files: make(map[string][]byte), redirects: make(map[string]string)}
 	u.ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		u.mu.Lock()
+		u.requests++
 		body, ok := u.files[r.URL.Path]
+		target, redirect := u.redirects[r.URL.Path]
 		u.mu.Unlock()
-		if !ok {
+		if redirect {
+			http.Redirect(w, r, target, http.StatusFound)
+			return
+		} else if !ok {
 			http.NotFound(w, r)
 			return
 		}
@@ -133,6 +140,18 @@ func (u *fakeUpstream) set(p string, b []byte) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	u.files[p] = b
+}
+
+func (u *fakeUpstream) redirect(p, target string) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.redirects[p] = target
+}
+
+func (u *fakeUpstream) requestCount() int {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.requests
 }
 
 func (u *fakeUpstream) url() string { return u.ts.URL + "/" }
