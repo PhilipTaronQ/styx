@@ -503,7 +503,9 @@ func (b *ManifestBuilder) buildFromNar(ctx context.Context, args *BuildArgs, r i
 		err = nil
 	}
 
-	return common.ValOrErr(m, cmp.Or(err, egCtx.Wait()))
+	// a failed chunk upload cancels egCtx, so the loop may have stopped with a context
+	// error: report the upload's error instead
+	return common.ValOrErr(m, cmp.Or(egCtx.Wait(), err))
 }
 
 var errBuildStopped = errors.New("manifest build stopped")
@@ -534,7 +536,7 @@ func (b *ManifestBuilder) ManifestAsEntry(ctx context.Context, args *BuildArgs, 
 	egCtx := errgroup.WithContext(ctx)
 	entry.Digests, err = b.chunkData(egCtx, args, int64(len(mb)), shift.ManifestChunkShift, bytes.NewReader(mb))
 
-	return common.ValOrErr(entry, cmp.Or(err, egCtx.Wait()))
+	return common.ValOrErr(entry, cmp.Or(egCtx.Wait(), err))
 }
 
 func (b *ManifestBuilder) entry(egCtx *errgroup.Group, args *BuildArgs, m *pb.Manifest, nr *nar.Reader) error {
