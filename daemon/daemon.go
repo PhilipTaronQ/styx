@@ -196,6 +196,9 @@ func (s *Server) postInit(params *pb.DaemonParams, keys []signature.PublicKey) e
 	return nil
 }
 
+// for tests
+var renameFile = os.Rename
+
 func (s *Server) openDb() (err error) {
 	opts := bbolt.Options{
 		NoFreelistSync: true,
@@ -214,9 +217,17 @@ func (s *Server) openDb() (err error) {
 				if err := bbolt.Compact(newDb, oldDb, 4<<20); err == nil {
 					oldDb.Close()
 					newDb.Close()
-					if os.Rename(dbPath, cmpPath) == nil {
-						os.Rename(newPath, dbPath)
-						log.Println("compacted db, old file in", cmpPath)
+					if renameFile(dbPath, cmpPath) == nil {
+						if err := renameFile(newPath, dbPath); err != nil {
+							// put the old db back, or bbolt would create an empty one below
+							log.Println("compacted db rename error:", err)
+							if err := renameFile(cmpPath, dbPath); err != nil {
+								return fmt.Errorf("db compaction left no db; restore it from %s: %w", cmpPath, err)
+							}
+							_ = os.Remove(newPath)
+						} else {
+							log.Println("compacted db, old file in", cmpPath)
+						}
 					}
 				} else {
 					log.Println("bolt compact error:", err)

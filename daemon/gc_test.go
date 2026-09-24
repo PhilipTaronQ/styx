@@ -314,6 +314,43 @@ func TestPresentNotRecordedAfterGc(t *testing.T) {
 	}))
 }
 
+// openDb's compaction renamed the old db aside, then ignored a failure to rename the
+// compacted one into place, so bbolt created an empty db.
+func TestCompactionKeepsDb(t *testing.T) {
+	cfg := Config{CachePath: t.TempDir(), ErofsBlockShift: 12, FdStore: gcTestFdStore{}}
+	sphStr := gcTestSph('c')
+	s := NewServer(cfg)
+	require.NoError(t, s.openDb())
+	require.NoError(t, s.imageTx(sphStr, func(img *pb.DbImage) error {
+		img.StorePath = gcTestStorePath('c', "pkg-1.0")
+		return nil
+	}))
+	require.NoError(t, s.db.Close())
+
+	reopen := func() {
+		t.Helper()
+		require.NoError(t, os.WriteFile(filepath.Join(cfg.CachePath, compactFile), nil, 0o644))
+		s = NewServer(cfg)
+		require.NoError(t, s.openDb())
+		require.NotNil(t, gcTestGetImage(t, s, sphStr), "compaction lost the db")
+		require.NoError(t, s.db.Close())
+	}
+
+	calls := 0
+	renameFile = func(from, to string) error {
+		if calls++; calls == 2 {
+			return errors.New("injected rename failure")
+		}
+		return os.Rename(from, to)
+	}
+	t.Cleanup(func() { renameFile = os.Rename })
+	reopen()
+	require.Equal(t, 3, calls, "rename aside, rename into place (fails), rename back")
+
+	renameFile = os.Rename
+	reopen()
+}
+
 func TestSyncSlab(t *testing.T) {
 	s := newGcTestServer(t)
 	fd, err := unix.Open(filepath.Join(t.TempDir(), "slab"), unix.O_RDWR|unix.O_CREAT, 0o600)
