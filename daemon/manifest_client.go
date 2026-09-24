@@ -199,21 +199,44 @@ func (s *Server) getManifestFromManifester(ctx context.Context, upstream, sph st
 	}
 
 	// not found cached, request it
-	return s.requestNewManifest(ctx, buildReq, narSize)
+	return s.requestNewManifest(ctx, sph, buildReq, narSize)
 }
 
-// requestNewManifest asks the manifester to build a manifest, without looking in the manifest
-// cache. The manifester uploads any chunks the chunk store is missing, so this is also how we
-// recover from missing chunks.
-func (s *Server) requestNewManifest(ctx context.Context, mReq manifester.ManifestReq, narSize int64) ([]byte, error) {
+// requestNewManifest asks the manifester to build the manifest for sph, without looking in the
+// manifest cache. The manifester uploads any chunks the chunk store is missing, so this is also
+// how we recover from missing chunks.
+func (s *Server) requestNewManifest(ctx context.Context, sph string, mReq manifester.ManifestReq, narSize int64) ([]byte, error) {
 	s.stats.manifestReqs.Add(1)
 	shards := s.calcShards(narSize)
 	b, err := s.getNewManifest(ctx, mReq, shards)
+	if err == nil && mReq.BuildMode == manifester.ModeGenericTarball {
+		err = checkTarballManifest(b, sph, mReq.Upstream)
+	}
 	if err != nil {
 		s.stats.manifestErrs.Add(1)
 		return nil, err
 	}
 	return b, nil
+}
+
+// checkTarballManifest checks that a manifest built from a tarball url is for sph. A tarball
+// image's store path is named for the tarball's contents, so if what's behind the url has
+// changed since 'styx tarball' was run on it, rebuilding it makes a manifest for some other
+// store path, and uploads that one's chunks instead of the image's. The signature is
+// checked where the manifest is used; this only compares it with what we asked for.
+func checkTarballManifest(envelope []byte, sph, url string) error {
+	var sm pb.SignedMessage
+	if err := proto.Unmarshal(envelope, &sm); err != nil {
+		return fmt.Errorf("tarball manifest for %s: %w", url, err)
+	}
+	storePath := strings.TrimPrefix(sm.GetMsg().GetPath(), common.ManifestContext+"/")
+	if _, got, err := ParseSph(storePath); err != nil {
+		return fmt.Errorf("tarball manifest for %s has bad store path %q: %w", url, storePath, err)
+	} else if got != sph {
+		return fmt.Errorf("the tarball at %s has changed since 'styx tarball' was run on it: it now "+
+			"builds %s, not %s, so the missing data of %s can't be recovered from it", url, storePath, sph, sph)
+	}
+	return nil
 }
 
 func (s *Server) getNewManifest(ctx context.Context, req manifester.ManifestReq, shards int) ([]byte, error) {

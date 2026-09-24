@@ -219,8 +219,44 @@ func TestTarballImageManifestCacheMissRebuildsTarball(t *testing.T) {
 	e.putFakeCacheData(testSpX[:32])
 	req := MountReq{StorePath: testSpX, Upstream: "http://" + fakeCacheBind + "/", NarSize: 1000}
 
-	// the test manifester's response isn't a real envelope, so this fails after the request
+	// the test manifester's envelope isn't signed, so this fails after the request
 	_, _, err := e.s.getManifestAndBuildImage(context.Background(), &req)
 	require.Error(t, err)
 	e.requireTarballReqs()
+}
+
+// If the tarball behind the recorded url has changed, rebuilding it makes the manifest of
+// another store path and uploads that one's chunks. Remanifesting "succeeded", the retried
+// read failed with NotFound again, and nothing said why. It should fail and say so.
+func TestRemanifestTarballChangedUnderUrl(t *testing.T) {
+	e := newFetchEnv(t)
+	e.tarballStorePath = testSpB // what the url builds now
+	sphStr := testSpX[:32]
+	e.putFakeCacheData(sphStr)
+	req := MountReq{StorePath: sphStr, Upstream: "http://" + fakeCacheBind + "/", NarSize: 1000}
+
+	err := e.s.remanifest(context.Background(), req)
+	require.ErrorContains(t, err, "has changed")
+	require.ErrorContains(t, err, testTarballUrl)
+	require.ErrorContains(t, err, testSpB)
+	require.Error(t, e.s.doRemanifestReqs(context.Background(), []MountReq{req}))
+	e.requireTarballReqs()
+
+	// mounting it again on a manifest cache miss says the same
+	_, _, err = e.s.getManifestAndBuildImage(context.Background(), &MountReq{
+		StorePath: testSpX, Upstream: req.Upstream, NarSize: 1000,
+	})
+	require.ErrorContains(t, err, "has changed")
+}
+
+// The same store path rebuilt from the url passes the check.
+func TestCheckTarballManifest(t *testing.T) {
+	env := func(sp string) []byte {
+		b, err := proto.Marshal(&pb.SignedMessage{Msg: &pb.Entry{Path: common.ManifestContext + "/" + sp}})
+		require.NoError(t, err)
+		return b
+	}
+	require.NoError(t, checkTarballManifest(env(testSpX), testSpX[:32], testTarballUrl))
+	require.ErrorContains(t, checkTarballManifest(env(testSpB), testSpX[:32], testTarballUrl), "has changed")
+	require.Error(t, checkTarballManifest([]byte("not a message"), testSpX[:32], testTarballUrl))
 }

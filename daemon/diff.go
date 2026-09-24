@@ -1099,7 +1099,7 @@ func (s *Server) runRemanifest(ctx context.Context, req MountReq, rr *remanifest
 	// skip the manifest cache: the cached manifest is what refers to the missing chunks
 	_, buildReq, err := s.manifestReqs(req.Upstream, req.StorePath)
 	if err == nil {
-		_, err = s.requestNewManifest(ctx, buildReq, req.NarSize)
+		_, err = s.requestNewManifest(ctx, req.StorePath, buildReq, req.NarSize)
 	}
 
 	if err != nil && ctx.Err() != nil {

@@ -52,6 +52,7 @@ type fetchEnv struct {
 	manifestStarted  chan struct{} // closed when the first manifester request arrives
 	manifestPosts    atomic.Int32
 	manifestReqs     []manifester.ManifestReq // requests the manifester got (under mu)
+	tarballStorePath string                   // what a tarball build makes (default: testSpX)
 	quit             chan struct{}            // closed at cleanup so hanging handlers return
 }
 
@@ -204,7 +205,21 @@ func (e *fetchEnv) handleManifester(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	comp, err := zstd.Compress(nil, []byte("rebuilt envelope"))
+	envelope := []byte("rebuilt envelope")
+	if mreq.BuildMode == manifester.ModeGenericTarball {
+		// the daemon checks what a tarball built into, so this one has to parse
+		sp := e.tarballStorePath
+		if sp == "" {
+			sp = testSpX
+		}
+		var err error
+		envelope, err = proto.Marshal(&pb.SignedMessage{Msg: &pb.Entry{Path: common.ManifestContext + "/" + sp}})
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+	comp, err := zstd.Compress(nil, envelope)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
