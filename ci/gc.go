@@ -40,11 +40,13 @@ type (
 		age     time.Duration
 		lim     struct{ trace, chunk, list, del, batch int }
 
+		summaryMu    sync.Mutex // guards summary
 		toDelete     sync.Map
 		delCount     atomic.Int64
 		delSize      atomic.Int64
 		totalCount   atomic.Int64
 		totalSize    atomic.Int64
+		delErrors    atomic.Int64
 		traced       sync.Map
 		goodNi       sync.Map
 		goodNar      sync.Map
@@ -83,12 +85,17 @@ func GCLocal(ctx context.Context, cfg GCConfig) error {
 	return gc.run(ctx)
 }
 
+// logln and logf may be called concurrently.
 func (gc *gc) logln(args ...any) {
 	log.Println(args...)
+	gc.summaryMu.Lock()
+	defer gc.summaryMu.Unlock()
 	fmt.Fprintln(gc.summary, args...)
 }
 func (gc *gc) logf(msg string, args ...any) {
 	log.Printf(msg, args...)
+	gc.summaryMu.Lock()
+	defer gc.summaryMu.Unlock()
 	fmt.Fprintf(gc.summary, msg+"\n", args...)
 }
 
@@ -420,7 +427,6 @@ func (gc *gc) remove(ctx context.Context) error {
 	gc.logf("remove: %9d objects, %14d bytes", gc.delCount.Load(), gc.delSize.Load())
 	gc.logf("keep  : %9d objects, %14d bytes", gc.totalCount.Load()-gc.delCount.Load(), gc.totalSize.Load()-gc.delSize.Load())
 
-	delerrors := 0
 	eg := errgroup.WithContext(ctx)
 	eg.SetLimit(cmp.Or(gc.lim.del, 20))
 	bsize := cmp.Or(gc.lim.batch, 100)
@@ -437,7 +443,7 @@ func (gc *gc) remove(ctx context.Context) error {
 				Delete: del,
 			})
 			if res != nil {
-				delerrors += len(res.Errors)
+				gc.delErrors.Add(int64(len(res.Errors)))
 			}
 			return err
 		})
@@ -451,8 +457,8 @@ func (gc *gc) remove(ctx context.Context) error {
 	})
 	flush()
 	err := eg.Wait()
-	if delerrors > 0 {
-		gc.logf("delete errors: %d", delerrors)
+	if n := gc.delErrors.Load(); n > 0 {
+		gc.logf("delete errors: %d", n)
 	}
 	return err
 }
