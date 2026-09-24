@@ -107,7 +107,7 @@ index 9027349..7fb87ed 100644
      maintainRunningSubstitutions.reset();
  
 diff --git a/src/libstore/gc.cc b/src/libstore/gc.cc
-index 8e997c8..a1ba117 100644
+index 8e997c8..9cff3bb 100644
 --- a/src/libstore/gc.cc
 +++ b/src/libstore/gc.cc
 @@ -12,6 +12,7 @@
@@ -118,16 +118,43 @@ index 8e997c8..a1ba117 100644
  
  #include "store-config-private.hh"
  
-@@ -559,6 +560,9 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
+@@ -557,6 +558,10 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
+             }
+         }
  
++        /* A styx mount is read-only, so it has to go first. */
++        if (!removeStyxMount(realPath.string(), std::string(baseName)))
++            return;
++
          printInfo("deleting '%1%'", path);
  
-+        if (isStyxMount(realPath.string()))
-+            deleteStyxMount(std::string(baseName));
-+
          results.paths.insert(path);
- 
-         uint64_t bytesFreed;
+@@ -713,6 +718,9 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
+             }
+         }
+         for (auto & path : topoSortPaths(visited)) {
++            /* Kept alive below, or referenced by a path that was. */
++            if (alive.contains(path))
++                continue;
+             if (!dead.insert(path).second)
+                 continue;
+             if (shouldDelete) {
+@@ -743,6 +751,15 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
+                     wakeup.notify_all();
+                 });
+                 try {
++                    /* Remove a styx mount before invalidating the path, so
++                       that a mount that can't be removed leaves it valid. */
++                    if (!removeStyxMount(
++                            (config->realStoreDir.get() / std::string(path.to_string())).string(),
++                            std::string(path.to_string()))) {
++                        dead.erase(path);
++                        markAlive(path);
++                        continue;
++                    }
+                     invalidatePathChecked(path);
+                     deleteFromStore(path.to_string(), true);
+                     referrersCache.erase(path);
 diff --git a/src/libstore/include/nix/store/globals.hh b/src/libstore/include/nix/store/globals.hh
 index 34eab7f..91d940a 100644
 --- a/src/libstore/include/nix/store/globals.hh
@@ -194,10 +221,10 @@ index 3ccf0ad..7be7bb9 100644
    'worker-protocol-impl.hh',
 diff --git a/src/libstore/include/nix/store/styx.hh b/src/libstore/include/nix/store/styx.hh
 new file mode 100644
-index 0000000..0c3caf0
+index 0000000..1362f45
 --- /dev/null
 +++ b/src/libstore/include/nix/store/styx.hh
-@@ -0,0 +1,22 @@
+@@ -0,0 +1,28 @@
 +#pragma once
 +///@file
 +
@@ -217,6 +244,12 @@ index 0000000..0c3caf0
 +void makeStyxMaterialize(const std::string upstream, const std::string storePath, const std::string dest, uint64_t narSize);
 +bool isStyxMount(const std::string path);
 +void deleteStyxMount(const std::string path);
++/**
++ * Make sure there is no styx mount at `realPath`, for GC. Returns false if
++ * one is still there, and then the path must not be deleted or
++ * invalidated. Never throws, so that a failure can't abort GC.
++ */
++bool removeStyxMount(const std::string & realPath, const std::string & storePath);
 +void tryStyxGC();
 +
 +}  // namespace nix
@@ -309,10 +342,10 @@ index c266f05..1456916 100644
    'worker-protocol.cc',
 diff --git a/src/libstore/styx.cc b/src/libstore/styx.cc
 new file mode 100644
-index 0000000..21c5ea7
+index 0000000..bd33a11
 --- /dev/null
 +++ b/src/libstore/styx.cc
-@@ -0,0 +1,155 @@
+@@ -0,0 +1,192 @@
 +
 +#include "nix/util/error.hh"
 +#include "nix/util/file-system.hh"
@@ -321,8 +354,10 @@ index 0000000..21c5ea7
 +#include "nix/store/styx.hh"
 +
 +#include <cerrno>
++#include <cstring>
 +#include <regex>
 +#include <map>
++#include <sys/mount.h>
 +#include <sys/stat.h>
 +#include <sys/vfs.h>
 +
@@ -451,6 +486,41 @@ index 0000000..21c5ea7
 +    styxRequest("/umount", req);
 +    // note: this does not delete the mountpoint, but collectGarbage will do
 +    // that right after calling this
++}
++
++static bool stillStyxMount(const std::string & realPath)
++{
++    try {
++        return isStyxMount(realPath);
++    } catch (std::exception & e) {
++        printError("cannot check whether '%s' is a styx mount: %s", realPath, e.what());
++        return true;
++    }
++}
++
++bool removeStyxMount(const std::string & realPath, const std::string & storePath)
++{
++    if (!stillStyxMount(realPath))
++        return true;
++    try {
++        deleteStyxMount(storePath);
++    } catch (std::exception & e) {
++        warn("styx could not unmount '%s': %s", realPath, e.what());
++    }
++    if (!stillStyxMount(realPath))
++        return true;
++    // The daemon is down or has no record of this mount, so detach it
++    // ourselves, as the daemon would have. When the daemon restores its
++    // mounts, it forgets the ones whose mount point is gone.
++    if (umount2(realPath.c_str(), MNT_DETACH) == -1) {
++        printError("not deleting '%s': cannot unmount it: %s", realPath, strerror(errno));
++        return false;
++    }
++    if (stillStyxMount(realPath)) {
++        printError("not deleting '%s': it is still a styx mount", realPath);
++        return false;
++    }
++    return true;
 +}
 +
 +void tryStyxGC()
