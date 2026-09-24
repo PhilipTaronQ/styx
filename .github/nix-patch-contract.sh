@@ -84,7 +84,7 @@ nixstore --store "$work/s2b" "${styxopts[@]}" --option styx-ondemand 'nomatch' -
 # (mkdir -p, overwrite files, keep whatever else is there).
 cat > "$work/fakedaemon.py" <<'EOF'
 import http.server, json, os, shutil, socketserver, sys
-sock, log, src = sys.argv[1:4]
+sock, log, src, corrupt = sys.argv[1:5]
 class H(http.server.BaseHTTPRequestHandler):
     def address_string(self):
         return "unix"
@@ -96,6 +96,9 @@ class H(http.server.BaseHTTPRequestHandler):
         code, res = 200, {"Success": True}
         if self.path == "/materialize":
             shutil.copytree(src, req["DestPath"], symlinks=True, dirs_exist_ok=True)
+            if os.path.exists(corrupt):
+                with open(os.path.join(req["DestPath"], "data.txt"), "w") as f:
+                    f.write("corrupted\n")
         elif self.path == "/umount":
             code, res = 404, {"Error": "not mounted"}
         out = json.dumps(res).encode()
@@ -112,7 +115,7 @@ srv = S(sock, H)
 os.chmod(sock, 0o777)
 srv.serve_forever()
 EOF
-python3 "$work/fakedaemon.py" "$work/fake.sock" "$work/fake.log" "$work/src/pkg" &
+python3 "$work/fakedaemon.py" "$work/fake.sock" "$work/fake.log" "$work/src/pkg" "$work/fake-corrupt" &
 fakepid=$!
 trap 'kill $fakepid 2>/dev/null; sudo umount "$work/s5$P" 2>/dev/null; true' EXIT
 for _ in $(seq 50); do [ -S "$work/fake.sock" ] && break; sleep 0.1; done
@@ -157,6 +160,35 @@ elif nixstore --store "$work/s4" --verify-path "$P"; then
     pass "materialized path verifies"
 else
     nfail "materialized path does not match its NAR hash; contents: $(ls -A "$work/s4$P" | tr '\n' ' ')"
+fi
+
+section "materialize that doesn't match the NAR hash"
+# Expected: Nix checks what the daemon wrote, and falls back to a regular
+# copy instead of registering it.
+touch "$work/fake-corrupt"
+nixstore --store "$work/s4b" "${fakeopts[@]}" --option styx-materialize '.*' --realise "$P" > "$work/s4b.log" 2>&1
+s4brc=$?
+rm -f "$work/fake-corrupt"
+if [ "$s4brc" != 0 ]; then
+    nfail "realise after a corrupt materialize failed: $(tail -n 3 "$work/s4b.log" | tr '\n' ' ')"
+elif ! nixstore --store "$work/s4b" --verify-path "$P"; then
+    nfail "Nix registered a materialized path that does not match its NAR hash: $(cat "$work/s4b$P/data.txt")"
+elif ! grep -q "falling back to substitution" "$work/s4b.log"; then
+    nfail "styx was not used, or did not fail: $(tail -n 3 "$work/s4b.log" | tr '\n' ' ')"
+else
+    pass "a corrupt materialize fell back to substitution"
+fi
+
+section "invalid styx-exclude regex"
+# Expected: an exclusion that can't be evaluated keeps styx away from every
+# path, and substitution still works.
+nmount=$(grep -c '^/mount' "$work/fake.log")
+if ! nixstore --store "$work/s6" "${fakeopts[@]}" --option styx-ondemand '.*' --option styx-exclude '*' --realise "$P" > "$work/s6.log" 2>&1; then
+    nfail "styx-exclude = '*' makes substitution fail: $(tail -n 3 "$work/s6.log" | tr '\n' ' ')"
+elif [ "$(grep -c '^/mount' "$work/fake.log")" != "$nmount" ]; then
+    nfail "styx-exclude = '*' did not keep styx away: $(tail -n 1 "$work/fake.log")"
+else
+    pass "substitution without styx with styx-exclude = '*'"
 fi
 
 # The rest needs root and a loop-mounted EROFS image over a valid path.
