@@ -213,19 +213,23 @@ func (s *urlChunkStoreRead) Get(ctx context.Context, key string, dst []byte) ([]
 	if err != nil {
 		return nil, err
 	}
+	// the caller checks the digest only after this, so don't trust the body to decompress to
+	// a reasonable size
 	if hdr.Get("Content-Encoding") == "zstd" {
-		z := s.zp.Get()
-		defer s.zp.Put(z)
 		if dst == nil {
-			return z.Decompress(nil, b)
+			return common.DecompressLimit(b, s.maxSize)
 		} else {
-			// fast path, assume buffer is big enough
+			// fast path, assume buffer is big enough (this can't write past its capacity)
+			z := s.zp.Get()
+			defer s.zp.Put(z)
 			n, err := z.DecompressInto(dst[len(dst):cap(dst)], b)
 			if err != nil {
 				return nil, err
 			}
 			return dst[:len(dst)+n], nil
 		}
+	} else if int64(len(b)) > s.maxSize {
+		return nil, fmt.Errorf("%w: %d bytes", common.ErrTooLarge, len(b))
 	} else if dst == nil {
 		return b, nil
 	} else {

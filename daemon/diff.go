@@ -44,6 +44,11 @@ const (
 	MaxSources = 3
 	// start doubling on any file RRs, but require two extra image RRs
 	ImageRROffset = 2
+
+	// the manifester pads the json stats after chunk diff data to 256 bytes
+	maxDiffStatsBytes = 4096
+	// limit on the expanded size of a recompressed file in a chunk diff
+	maxRecompressBytes = 256 << 20
 )
 
 type (
@@ -490,10 +495,15 @@ func (s *Server) doDiffOp(ctx context.Context, op *diffOp) error {
 
 	baseData := common.ContiguousBytes(baseDatas)
 
-	// decompress from diff
+	// decompress from diff. digests are only checked after this, so don't read more than
+	// the requested data can be.
+	maxSize, err := maxDiffSize(op.sops, lens)
+	if err != nil {
+		return err
+	}
 	diffCounter := countReader{r: diff}
 	zr := zstd.NewReaderPatcher(&diffCounter, baseData)
-	reqData, err := io.ReadAll(zr)
+	reqData, err := common.ReadAllLimit(zr, maxSize)
 	zr.Close() // frees the C decompression stream
 	if err != nil {
 		return fmt.Errorf("expandChunkDiff error: %w", err)
@@ -552,6 +562,23 @@ func (s *Server) doDiffOp(ctx context.Context, op *diffOp) error {
 	}
 
 	return nil
+}
+
+// maxDiffSize checks the lengths header of a chunk diff and returns the most data the diff
+// can expand to: the requested data plus the stats.
+func maxDiffSize(sops []subOp, lens []int64) (int64, error) {
+	total := int64(maxDiffStatsBytes)
+	for i, sop := range sops {
+		limit := int64(sop.reqSize)
+		if len(sop.recompress) > 0 {
+			limit = maxRecompressBytes
+		}
+		if lens[i] < 0 || lens[i] > limit {
+			return 0, fmt.Errorf("bad length %d for chunk diff part %d (limit %d)", lens[i], i, limit)
+		}
+		total += lens[i]
+	}
+	return total, nil
 }
 
 func (s *Server) getWriteFdForSlab(slabId uint16) (int, error) {

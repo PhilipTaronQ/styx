@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"path"
@@ -220,12 +219,8 @@ func (s *Server) getNewManifest(ctx context.Context, req manifester.ManifestReq,
 				return fmt.Errorf("manifester http error: %w", err)
 			}
 			if i == 0 {
-				zr := zstd.NewReader(bytes.NewReader(b))
-				defer zr.Close() // frees the C decompression stream
-				if b, err := io.ReadAll(zr); err != nil {
-					return err
-				} else {
-					shard0 = b
+				if shard0, err = common.DecompressLimit(b, manifester.MaxEnvelopeBytes); err != nil {
+					return fmt.Errorf("manifester response: %w", err)
 				}
 			}
 			return nil
