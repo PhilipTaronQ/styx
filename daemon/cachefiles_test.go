@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"net/http"
 	"net/http/httptest"
@@ -133,4 +134,44 @@ func TestCloseOfOldSlabObjectKeepsNewState(t *testing.T) {
 	require.Equal(t, uint32(newFd), st.writeFd)
 	require.Equal(t, slabFds{readFd, cacheFd}, fds)
 	require.NoError(t, fcntlErr, "CLOSE of the old slab object closed the current slab image read fd")
+}
+
+// Once the first (private) mount has written the image, the real mount's object must not
+// hold another copy of it: the kernel finds the data in the backing file and never sends
+// the READ that would drop it.
+func TestImageDataNotRetainedAfterWrite(t *testing.T) {
+	s := newTestServer(t, 2, true)
+	devA, devB := testDevnode(t)
+	t.Cleanup(func() { unix.Close(devA); unix.Close(devB) })
+	s.devnode.Store(int32(devA))
+
+	sphStr := testSph('2')
+	image := bytes.Repeat([]byte{0xab}, 64<<10)
+	mctx := &mountContext{imageSize: int64(len(image)), imageData: image}
+	s.mountCtxMap.Put(sphStr, withMountContext(context.Background(), mctx))
+	volume := []byte("erofs," + testDomain + "\x00")
+
+	// first mount at CachePath/initial/<sph>: OPEN, READ (whole image written), CLOSE
+	fdA := testTempFd(t)
+	require.NoError(t, s.handleOpen(1, 10, uint32(fdA), 0, volume, []byte(sphStr)))
+	require.Equal(t, "copen 1,65536", readDevnodeReply(t, devB, 5*time.Second))
+	_ = s.handleRead(2, 10, 4096, 0) // READ_COMPLETE ioctl fails on a temp file; the pwrite has happened
+	got := make([]byte, len(image))
+	_, err := unix.Pread(fdA, got, 0)
+	require.NoError(t, err)
+	require.Equal(t, image, got, "first mount wrote the image")
+	require.NoError(t, s.handleClose(3, 10))
+
+	// real mount: OPEN; no READ follows because the backing file already has the data
+	fdB := testTempFd(t)
+	require.NoError(t, s.handleOpen(4, 11, uint32(fdB), 0, volume, []byte(sphStr)))
+	require.Equal(t, "copen 4,65536", readDevnodeReply(t, devB, 5*time.Second))
+	s.mountCtxMap.Delete(sphStr) // tryMount returns
+
+	s.stateLock.Lock()
+	st := s.cacheState[11]
+	s.stateLock.Unlock()
+	require.NotNil(t, st)
+	require.Nil(t, st.imageData,
+		"mounted image object still holds %d bytes of image data that was already written", len(st.imageData))
 }

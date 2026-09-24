@@ -122,7 +122,8 @@ type (
 		slabId uint16
 
 		// for store images
-		imageData []byte // data from manifester to be written
+		imageData []byte        // data from manifester to be written
+		mountCtx  *mountContext // holds another reference to imageData
 	}
 
 	slabFds struct {
@@ -672,7 +673,10 @@ func (s *Server) tryMount(ctx context.Context, req *MountReq, haveImageSize int6
 	var mountErr error
 	opts := fmt.Sprintf("domain_id=%s,fsid=%s", s.cfg.CacheDomain, sphStr)
 
-	if mountCtx.imageData != nil {
+	mountCtx.lock.Lock()
+	newImage := mountCtx.imageData != nil
+	mountCtx.lock.Unlock()
+	if newImage {
 		// first mount somewhere private, then unmount to force cachefiles to flush the image to disk.
 		// this is gross, there should be a better way to control cachefiles flushing.
 		firstMp := filepath.Join(s.cfg.CachePath, "initial", sphStr)
@@ -680,6 +684,10 @@ func (s *Server) tryMount(ctx context.Context, req *MountReq, haveImageSize int6
 		mountErr = unix.Mount("none", firstMp, "erofs", 0, opts)
 		_ = unix.Unmount(firstMp, 0)
 		_ = os.Remove(firstMp)
+		// the image is written now, so the real mount mustn't get another copy
+		mountCtx.lock.Lock()
+		mountCtx.imageData = nil
+		mountCtx.lock.Unlock()
 	}
 
 	if mountErr == nil {
@@ -1194,6 +1202,7 @@ func (s *Server) handleOpenImage(msgId, objectId, fd, flags uint32, cookie strin
 		writeFd:   fd,
 		tp:        typeImage,
 		imageData: imageData,
+		mountCtx:  mountCtx,
 	}
 	s.cacheState[objectId] = state
 	return imageSize, nil
@@ -1283,16 +1292,27 @@ func (s *Server) handleRead(msgId, objectId uint32, ln, off uint64) (retErr erro
 }
 
 func (s *Server) handleReadImage(state *openFileState, _, _ uint64) error {
-	if state.imageData == nil {
+	s.stateLock.Lock()
+	imageData := state.imageData
+	s.stateLock.Unlock()
+	if imageData == nil {
 		return errors.New("got read request when already written image")
 	}
 	// always write whole thing
 	// TODO: does this have to be page-aligned?
-	_, err := unix.Pwrite(int(state.writeFd), state.imageData, 0)
+	_, err := unix.Pwrite(int(state.writeFd), imageData, 0)
 	if err != nil {
 		return err
 	}
+	// the image is in the backing file now, so drop both references to it
+	s.stateLock.Lock()
 	state.imageData = nil
+	s.stateLock.Unlock()
+	if mctx := state.mountCtx; mctx != nil {
+		mctx.lock.Lock()
+		mctx.imageData = nil
+		mctx.lock.Unlock()
+	}
 	return nil
 }
 
