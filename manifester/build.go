@@ -488,18 +488,12 @@ func (b *ManifestBuilder) buildFromNar(ctx context.Context, args *BuildArgs, r i
 		SmallFileCutoff: int32(args.SmallFileCutoff),
 	}
 
-	ar := &abortableReader{r: r}
-	nr, err := nar.NewReader(ar)
+	nr, err := nar.NewReader(r)
 	if err != nil {
 		return nil, err
 	}
-	defer func() {
-		// if we stopped early, go-nix's parser goroutine is still waiting for a Next call
-		// (Close alone doesn't stop it). make its reads fail and let it run to the end.
-		ar.aborted.Store(true)
-		nr.Next()
-		nr.Close()
-	}()
+	// stops the parser goroutine if we stop early
+	defer nr.Close()
 
 	egCtx := errgroup.WithContext(ctx)
 	for err == nil && egCtx.Err() == nil {
@@ -513,18 +507,6 @@ func (b *ManifestBuilder) buildFromNar(ctx context.Context, args *BuildArgs, r i
 }
 
 var errBuildStopped = errors.New("manifest build stopped")
-
-type abortableReader struct {
-	r       io.Reader
-	aborted atomic.Bool
-}
-
-func (a *abortableReader) Read(p []byte) (int, error) {
-	if a.aborted.Load() {
-		return 0, errBuildStopped
-	}
-	return a.r.Read(p)
-}
 
 func (b *ManifestBuilder) ManifestAsEntry(ctx context.Context, args *BuildArgs, path string, manifest *pb.Manifest) (*pb.Entry, error) {
 	mb, err := proto.Marshal(manifest)

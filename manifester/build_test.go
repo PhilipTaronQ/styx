@@ -1,12 +1,14 @@
 package manifester
 
 import (
+	"bytes"
 	"context"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/nix-community/go-nix/pkg/narinfo"
+	"github.com/nix-community/go-nix/pkg/wire"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -105,7 +107,7 @@ func TestNarinfoManyReferencesIsQuadratic(t *testing.T) {
 	assert.ErrorContains(t, err, "larger than")
 }
 
-// When a chunk upload failed mid-nar, buildFromNar returned without stopping go-nix's parser
+// When a chunk upload failed mid-nar, buildFromNar returned without stopping the nar parser
 // goroutine, which stayed parked forever (Lambda reuses the process across invocations).
 func TestFailedNarBuildLeaksNarReaderGoroutine(t *testing.T) {
 	sk, pk := upstreamKeys(t)
@@ -120,6 +122,37 @@ func TestFailedNarBuildLeaksNarReaderGoroutine(t *testing.T) {
 	require.Error(t, err)
 	after := waitGoroutines(marker, before, 3*time.Second)
 	assert.LessOrEqual(t, after, before, "nar reader goroutine leaked after a failed build")
+}
+
+// A nar whose entries are out of order: go-nix's reader rejected the second entry, and then
+// its parser goroutine could never be stopped (Close only let it read on until it blocked
+// handing over the next header).
+func TestOutOfOrderNarLeaksNoGoroutine(t *testing.T) {
+	var buf bytes.Buffer
+	for _, tok := range []string{"nix-archive-1", "(", "type", "directory",
+		"entry", "(", "name", "b", "node", "(", "type", "regular", "contents", "bbb", ")", ")",
+		"entry", "(", "name", "a", "node", "(", "type", "regular", "contents", "aaa", ")", ")",
+		"entry", "(", "name", "c", "node", "(", "type", "regular", "contents", "ccc", ")", ")",
+		")"} {
+		require.NoError(t, wire.WriteString(&buf, tok))
+	}
+	narData := buf.Bytes()
+
+	sk, pk := upstreamKeys(t)
+	up := newFakeUpstream(t)
+	sph := sphOf("order")
+	up.set("/"+sph+".narinfo", []byte(makeNarinfo(t, sk, sph, "test-order", narData, narinfoOpts{})))
+	up.set("/nar/"+sph+".nar", narData)
+	mb := newTestBuilder(t, &mockChunkStore{data: make(map[string][]byte)}, pk, 0)
+
+	const marker = "styx/common/nar.NewReader"
+	before := countGoroutines(marker)
+	for range 10 {
+		_, err := mb.BuildFromNar(context.Background(), up.url(), sph, 0, 0, "", false)
+		require.ErrorContains(t, err, "wrong order")
+	}
+	after := waitGoroutines(marker, before, 5*time.Second)
+	assert.LessOrEqual(t, after, before, "nar reader goroutines leaked after out-of-order nars")
 }
 
 func TestNarinfoFingerprint(t *testing.T) {

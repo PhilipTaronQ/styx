@@ -1,14 +1,17 @@
 // Copied from github.com/nix-community/go-nix pkg/nar at commit 4bdde671e0a1
 // (v0.0.0-20250101154619-4bdde671e0a1). Licensed under the Apache License 2.0, see LICENSE.
+// Modified: Close stops the parser goroutine, which could otherwise block forever.
 
 package nar
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"math"
 	"path"
+	"sync"
 
 	"github.com/nix-community/go-nix/pkg/wire"
 )
@@ -27,6 +30,9 @@ const (
 
 // Reader implements io.ReadCloser.
 var _ io.ReadCloser = &Reader{}
+
+// ErrClosed is returned by Next after Close.
+var ErrClosed = errors.New("nar reader closed")
 
 // Reader providers sequential access to the contents of a NAR archive.
 // Reader.Next advances to the next file in the archive (including the first),
@@ -47,6 +53,11 @@ type Reader struct {
 
 	// NarReader uses this to resume the parser
 	next chan bool
+
+	// closed by Close. The parser gives up wherever it waits for the consumer, without
+	// reading any more, so it never outlives the Reader.
+	done      chan struct{}
+	closeOnce sync.Once
 
 	// keep a record of the previously received hdr.Path.
 	// Only read and updated in the Next() method, receiving from the channel
@@ -75,22 +86,23 @@ func NewReader(r io.Reader) (*Reader, error) {
 		errors:  make(chan error),
 		err:     nil,
 		next:    make(chan bool),
+		done:    make(chan struct{}),
 	}
 
 	// kick off the goroutine
 	go func() {
-		// wait for the first Next() call
-		next := <-narReader.next
-		// immediate Close(), without ever calling Next()
-		if !next {
+		// wait for the first Next() call, or an immediate Close()
+		if !narReader.waitNext() {
 			return
 		}
 
 		err := narReader.parseNode("/")
-		if err != nil {
-			narReader.errors <- err
-		} else {
-			narReader.errors <- io.EOF
+		if err == nil {
+			err = io.EOF
+		}
+		select {
+		case narReader.errors <- err:
+		case <-narReader.done:
 		}
 
 		close(narReader.headers)
@@ -163,18 +175,15 @@ func (nr *Reader) parseNode(p string) error {
 
 		nr.contentReader = contentReader
 
-		nr.headers <- &Header{
+		// yield back the header, and wait for the Next() call
+		if !nr.yield(&Header{
 			Path:       p,
 			Type:       TypeRegular,
 			LinkTarget: "",
 			Size:       int64(contentLength),
 			Executable: executable,
-		}
-
-		// wait for the Next() call
-		next := <-nr.next
-		if !next {
-			return nil
+		}) {
+			return ErrClosed
 		}
 
 		// seek to the end of the bytes field - the consumer might not have read all of it
@@ -205,19 +214,15 @@ func (nr *Reader) parseNode(p string) error {
 		// set nr.contentReader to a empty reader, we can't read from symlinks!
 		nr.contentReader = io.NopCloser(io.LimitReader(bytes.NewReader([]byte{}), 0))
 
-		// yield back the header
-		nr.headers <- &Header{
+		// yield back the header, and wait for the Next() call
+		if !nr.yield(&Header{
 			Path:       p,
 			Type:       TypeSymlink,
 			LinkTarget: target,
 			Size:       0,
 			Executable: false,
-		}
-
-		// wait for the Next() call
-		next := <-nr.next
-		if !next {
-			return nil
+		}) {
+			return ErrClosed
 		}
 
 		// consume the next token
@@ -229,18 +234,15 @@ func (nr *Reader) parseNode(p string) error {
 	case "directory":
 		// set nr.contentReader to a empty reader, we can't read from directories!
 		nr.contentReader = io.NopCloser(io.LimitReader(bytes.NewReader([]byte{}), 0))
-		nr.headers <- &Header{
+		// yield back the header, and wait for the Next() call
+		if !nr.yield(&Header{
 			Path:       p,
 			Type:       TypeDirectory,
 			LinkTarget: "",
 			Size:       0,
 			Executable: false,
-		}
-
-		// wait for the Next() call
-		next := <-nr.next
-		if !next {
-			return nil
+		}) {
+			return ErrClosed
 		}
 
 		// there can be none, one or multiple `entry ( name foo node <Node> )`
@@ -359,13 +361,38 @@ func (nr *Reader) Read(b []byte) (int, error) {
 }
 
 // Close does all internal cleanup. It doesn't close the underlying reader (which can be any io.Reader).
+// The parser goroutine stops without reading any more of it, whatever state the Reader is in
+// (including after Next returned an error). Next returns ErrClosed after Close, unless it
+// already returned an error. Close may be called more than once, but not concurrently with
+// Next or Read.
 func (nr *Reader) Close() error {
-	if nr.err != io.EOF {
-		// Signal the parser there won't be any next.
-		close(nr.next)
+	nr.closeOnce.Do(func() { close(nr.done) })
+	if nr.err == nil {
+		nr.err = ErrClosed
 	}
 
 	return nil
+}
+
+// waitNext waits for the consumer to call Next, and returns false if it calls Close instead.
+func (nr *Reader) waitNext() bool {
+	select {
+	case <-nr.next:
+		return true
+	case <-nr.done:
+		return false
+	}
+}
+
+// yield hands hdr to Next, then waits for the next Next call. It returns false if the
+// consumer calls Close instead.
+func (nr *Reader) yield(hdr *Header) bool {
+	select {
+	case nr.headers <- hdr:
+		return nr.waitNext()
+	case <-nr.done:
+		return false
+	}
 }
 
 // expectString reads a string field from a reader, expecting a certain result,
