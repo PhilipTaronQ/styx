@@ -114,7 +114,7 @@ func TestFailedNarBuildLeaksNarReaderGoroutine(t *testing.T) {
 	cs := failingStore{&mockChunkStore{data: make(map[string][]byte)}}
 	mb := newTestBuilder(t, cs, pk, 1)
 
-	const marker = "go-nix/pkg/nar.NewReader"
+	const marker = "styx/common/nar.NewReader"
 	before := countGoroutines(marker)
 	_, err := mb.BuildFromNar(context.Background(), up.url(), sph, 0, 0, "", false)
 	require.Error(t, err)

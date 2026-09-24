@@ -19,13 +19,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nix-community/go-nix/pkg/nar"
 	"github.com/nix-community/go-nix/pkg/narinfo"
 	"github.com/nix-community/go-nix/pkg/narinfo/signature"
 	"github.com/nix-community/go-nix/pkg/nixbase32"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/dnr/styx/common/nar"
 	"github.com/dnr/styx/pb"
 )
 

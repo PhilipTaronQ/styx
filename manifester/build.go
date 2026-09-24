@@ -23,7 +23,6 @@ import (
 	"time"
 
 	"github.com/DataDog/zstd"
-	"github.com/nix-community/go-nix/pkg/nar"
 	"github.com/nix-community/go-nix/pkg/narinfo"
 	"github.com/nix-community/go-nix/pkg/narinfo/signature"
 	"github.com/nix-community/go-nix/pkg/nixbase32"
@@ -35,6 +34,7 @@ import (
 	"github.com/dnr/styx/common"
 	"github.com/dnr/styx/common/cdig"
 	"github.com/dnr/styx/common/errgroup"
+	"github.com/dnr/styx/common/nar"
 	"github.com/dnr/styx/common/shift"
 	"github.com/dnr/styx/pb"
 )

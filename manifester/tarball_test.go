@@ -129,7 +129,7 @@ func TestFailedTarballBuildLeaksWriteNarGoroutine(t *testing.T) {
 	require.NoError(t, err)
 
 	const marker = "manifester.(*ManifestBuilder).writeNar"
-	const narMarker = "go-nix/pkg/nar.NewReader"
+	const narMarker = "styx/common/nar.NewReader"
 	before, narBefore := countGoroutines(marker), countGoroutines(narMarker)
 	_, err = mb.BuildFromTarball(context.Background(), up.ts.URL+"/leak.tar", 0, 0, "", false)
 	require.Error(t, err)

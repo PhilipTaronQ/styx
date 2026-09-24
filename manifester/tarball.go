@@ -19,9 +19,9 @@ import (
 
 	"github.com/dnr/styx/common"
 	"github.com/dnr/styx/common/cdig"
+	"github.com/dnr/styx/common/nar"
 	"github.com/dnr/styx/common/resolve"
 	"github.com/dnr/styx/pb"
-	"github.com/nix-community/go-nix/pkg/nar"
 	"github.com/nix-community/go-nix/pkg/nixbase32"
 	"github.com/nix-community/go-nix/pkg/nixhash"
 	"github.com/nix-community/go-nix/pkg/storepath"
