@@ -307,10 +307,10 @@ index c266f05..1456916 100644
    'worker-protocol.cc',
 diff --git a/src/libstore/styx.cc b/src/libstore/styx.cc
 new file mode 100644
-index 0000000..5fe46bf
+index 0000000..21c5ea7
 --- /dev/null
 +++ b/src/libstore/styx.cc
-@@ -0,0 +1,142 @@
+@@ -0,0 +1,155 @@
 +
 +#include "nix/util/error.hh"
 +#include "nix/util/file-system.hh"
@@ -318,8 +318,10 @@ index 0000000..5fe46bf
 +#include "nix/util/logging.hh"
 +#include "nix/store/styx.hh"
 +
++#include <cerrno>
 +#include <regex>
 +#include <map>
++#include <sys/stat.h>
 +#include <sys/vfs.h>
 +
 +#include <nlohmann/json.hpp>
@@ -421,6 +423,17 @@ index 0000000..5fe46bf
 +
 +bool isStyxMount(const std::string mountPoint)
 +{
++    // A valid path may be missing on disk (GC tolerates that), and statfs
++    // follows symlinks, so a symlink into a styx mount would look like one.
++    struct stat lst;
++    if (lstat(mountPoint.c_str(), &lst)) {
++        if (errno == ENOENT)
++            return false;
++        throw SysError("getting status of '%s'", mountPoint);
++    }
++    if (S_ISLNK(lst.st_mode))
++        return false;
++
 +    struct statfs st;
 +    if (statfs(mountPoint.c_str(), &st))
 +        throw SysError("getting filesystem info about '%s'", mountPoint);
