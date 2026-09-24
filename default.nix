@@ -203,17 +203,17 @@ rec {
   # TODO: maybe we can build this into our binary to reduce the total size?
   axiom-lambda-extension =
     let
-      version = "v11";
+      version = "v16";
     in
     pkgs.buildGoModule {
       pname = "axiom-lambda-extension";
       inherit version;
-      vendorHash = "sha256-f+Z5ETHFNuM+QimZFySmFtSVG0Qaw5HAI9032rNyXqc=";
+      vendorHash = "sha256-DAcm+GtfR/0yg0wFkv4QfC2azid6P8AxSvb5yr6BT8w=";
       src = pkgs.fetchFromGitHub {
         owner = "axiomhq";
         repo = "axiom-lambda-extension";
         rev = version;
-        hash = "sha256-lax5MvyF0u6susJNjddIFQuciYEhQxuYmdYelcdupb0=";
+        hash = "sha256-a8tWeC9uI0ONYzu2An/5eZQFWTI0QxmBhRHMYEDyxGQ=";
       };
       postInstall = ''
         cd $out
