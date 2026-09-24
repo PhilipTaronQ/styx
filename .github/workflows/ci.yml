@@ -168,6 +168,8 @@ jobs:
         with:
           primary-key: nix-build-${{ runner.arch }}-${{ hashFiles('**/*.nix', 'Pins.json', 'go.sum') }}
           restore-prefixes-first-match: nix-build-${{ runner.arch }}-
+      - name: vendorHash is current
+        run: .github/check-vendor-hash.sh
       - name: nix-build
         run: nix-build --no-out-link $(printf -- '-A %s ' ${{ matrix.attrs }})
 
@@ -228,6 +230,8 @@ jobs:
         with:
           primary-key: nix-suite-${{ matrix.variant }}-${{ hashFiles('**/*.nix', 'Pins.json', 'go.sum') }}
           restore-prefixes-first-match: nix-suite-${{ matrix.variant }}-
+      - name: vendorHash is current
+        run: .github/check-vendor-hash.sh
       - name: Build test binary and tools
         run: |
           nix-build -o styxtest -A ${{ matrix.variant }}
