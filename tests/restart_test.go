@@ -77,5 +77,5 @@ func checkDiffAfterRestart(t *testing.T, tb *testBase) {
 	require.Zero(t, d2.Stats.SingleReqs-d1.Stats.SingleReqs)
 	require.Zero(t, d2.Stats.BatchReqs-d1.Stats.BatchReqs)
 	require.NotZero(t, d2.Stats.DiffReqs-d1.Stats.DiffReqs)
-	require.Zero(t, d2.Stats.SingleErrs+d2.Stats.BatchErrs+d2.Stats.DiffErrs)
+	require.Zero(t, d2.Stats.TotalErrs())
 }
