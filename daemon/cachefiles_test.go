@@ -176,6 +176,23 @@ func TestImageDataNotRetainedAfterWrite(t *testing.T) {
 		"mounted image object still holds %d bytes of image data that was already written", len(st.imageData))
 }
 
+// handleReadSlabImage must not write a buffer that SlabImageRead failed to fill.
+func TestSlabImageReadErrorIsReturned(t *testing.T) {
+	s := newTestServer(t, 2, true)
+	fd := testTempFd(t)
+	t.Cleanup(func() { unix.Close(fd) })
+	state := &openFileState{writeFd: uint32(fd), tp: typeSlabImage}
+
+	require.Error(t, s.handleReadSlabImage(state, 4096, 4096), "slab image reads must start at 0")
+	var st unix.Stat_t
+	require.NoError(t, unix.Fstat(fd, &st))
+	require.Zero(t, st.Size, "wrote data after SlabImageRead failed")
+
+	require.NoError(t, s.handleReadSlabImage(state, 4096, 0))
+	require.NoError(t, unix.Fstat(fd, &st))
+	require.EqualValues(t, 4096, st.Size)
+}
+
 type restoreFdStore struct {
 	fd      int
 	removed bool

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -1340,8 +1341,7 @@ func (s *Server) handleReadImage(state *openFileState, _, _ uint64) error {
 	}
 	// always write whole thing
 	// TODO: does this have to be page-aligned?
-	_, err := unix.Pwrite(int(state.writeFd), imageData, 0)
-	if err != nil {
+	if err := pwriteFull(int(state.writeFd), imageData, 0); err != nil {
 		return err
 	}
 	// the image is in the backing file now, so drop both references to it
@@ -1366,9 +1366,24 @@ func (s *Server) handleReadSlabImage(state *openFileState, ln, off uint64) error
 	defer s.chunkPool.Put(buf)
 
 	b := buf[:ln]
-	erofs.SlabImageRead(devid, slabBytes, s.blockShift, off, b)
-	_, err := unix.Pwrite(int(state.writeFd), b, int64(off))
-	return err
+	if err := erofs.SlabImageRead(devid, slabBytes, s.blockShift, off, b); err != nil {
+		return err
+	}
+	return pwriteFull(int(state.writeFd), b, int64(off))
+}
+
+// Like pwrite, but writes all of b or fails.
+func pwriteFull(fd int, b []byte, off int64) error {
+	for len(b) > 0 {
+		n, err := unix.Pwrite(fd, b, off)
+		if err != nil {
+			return err
+		} else if n <= 0 {
+			return io.ErrShortWrite
+		}
+		b, off = b[n:], off+int64(n)
+	}
+	return nil
 }
 
 func (s *Server) handleReadSlab(state *openFileState, ln, off uint64) (retErr error) {
