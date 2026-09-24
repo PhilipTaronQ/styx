@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -722,4 +723,92 @@ func TestChunkWriteAfterGcPunchIsFreed(t *testing.T) {
 	require.Eventually(t, func() bool { return gcTestIsHole(fd, off, int64(len(data))) }, 10*time.Second, 10*time.Millisecond,
 		"data written after gc punched the chunk's space is still there")
 	require.False(t, gcTestPresentInDb(s, loc))
+}
+
+// Makes cachefiles report the backing file of sphStr in use while busy returns true, and
+// signals asked the first time gc asks.
+func gcTestInUse(t *testing.T, sphStr string, busy func() bool) (asked <-chan struct{}) {
+	ch := make(chan struct{})
+	var once sync.Once
+	orig := cachefilesFileCmd
+	t.Cleanup(func() { cachefilesFileCmd = orig })
+	cachefilesFileCmd = func(_ int, cmd, _, name string) error {
+		if cmd == "inuse" && name == "D"+sphStr {
+			once.Do(func() { close(ch) })
+			if busy() {
+				return unix.EBUSY
+			}
+		}
+		return nil
+	}
+	return ch
+}
+
+// gc waited up to a second for a busy image to become free inside its write transaction, so
+// every db writer (a mount recording its image, a fetch recording chunks present) stalled.
+func TestGcWaitsForBusyImageUnlocked(t *testing.T) {
+	s := newGcTestServer(t)
+	initGcTestServer(t, s, "http://localhost:1")
+	gcTestDevnode(t, s)
+	gcTestImage(t, s, 'k', "pkg-1.0", pb.MountState_Unmounted, gcTestDigest(40))
+	asked := gcTestInUse(t, gcTestSph('k'), func() bool { return true })
+
+	type result struct {
+		res *GcResp
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		res, err := s.handleGcReq(context.Background(), &GcReq{GcByState: gcDefault})
+		done <- result{res, err}
+	}()
+	select {
+	case <-asked:
+	case <-time.After(10 * time.Second):
+		t.Fatal("gc never asked whether the image is in use")
+	}
+
+	start := time.Now()
+	require.NoError(t, s.imageTx(gcTestSph('l'), func(img *pb.DbImage) error {
+		img.StorePath = gcTestStorePath('l', "pkg-2.0")
+		img.MountState = pb.MountState_Requested
+		return nil
+	}))
+	elapsed := time.Since(start)
+
+	r := <-done
+	require.NoError(t, r.err)
+	require.Zero(t, r.res.DeleteImages, "gc deleted an image in use")
+	require.Less(t, elapsed, 500*time.Millisecond, "a db write waited for gc to wait for a busy image")
+}
+
+// gc waits for busy images before its write transaction, so it checks again inside it: an
+// image found free then may be in use by the time gc would delete it.
+func TestGcKeepsImageBusyAfterWait(t *testing.T) {
+	s := newGcTestServer(t)
+	initGcTestServer(t, s, "http://localhost:1")
+	gcTestDevnode(t, s)
+	gcTestImage(t, s, 'n', "pkg-1.0", pb.MountState_Unmounted, gcTestDigest(41))
+	var asks atomic.Int32
+	gcTestInUse(t, gcTestSph('n'), func() bool { return asks.Add(1) > 1 })
+
+	res, err := s.handleGcReq(context.Background(), &GcReq{GcByState: gcDefault})
+	require.NoError(t, err)
+	require.Zero(t, res.DeleteImages, "gc deleted an image in use")
+	require.True(t, gcTestHasChunk(t, s, gcTestDigest(41)))
+}
+
+// The kernel releases an unmounted image's file asynchronously, so gc waits a moment for it.
+func TestGcWaitsForImageRelease(t *testing.T) {
+	s := newGcTestServer(t)
+	initGcTestServer(t, s, "http://localhost:1")
+	gcTestDevnode(t, s)
+	gcTestImage(t, s, 'p', "pkg-1.0", pb.MountState_Unmounted, gcTestDigest(42))
+	var asks atomic.Int32
+	gcTestInUse(t, gcTestSph('p'), func() bool { return asks.Add(1) <= 3 })
+
+	res, err := s.handleGcReq(context.Background(), &GcReq{GcByState: gcDefault})
+	require.NoError(t, err)
+	require.Equal(t, 1, res.DeleteImages)
+	require.False(t, gcTestHasChunk(t, s, gcTestDigest(42)))
 }

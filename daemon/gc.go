@@ -77,6 +77,14 @@ func (s *Server) handleGcReq(ctx context.Context, r *GcReq) (*GcResp, error) {
 		return nil, mwErr(http.StatusPreconditionFailed, "styx is not initialized, call 'styx init --params=...'")
 	}
 
+	// Give images that are still in use a moment to be released before we look, without
+	// holding the db: waiting in the write transaction stalled every db writer.
+	settling, err := s.gcCandidates(r)
+	if err != nil {
+		return nil, err
+	}
+	s.waitImagesFree(settling)
+
 	tx, err := s.db.Begin(true)
 	if err != nil {
 		return nil, err
@@ -138,7 +146,11 @@ func (s *Server) handleGcReq(ctx context.Context, r *GcReq) (*GcResp, error) {
 		}
 	}
 	// umount detaches lazily, so an Unmounted image can still be in use through open files.
-	// Freeing its chunks would give those readers EIO, or SIGBUS for a running binary.
+	// Freeing its chunks would give those readers EIO, or SIGBUS for a running binary. We
+	// waited for them above; check again now, without waiting, since one may have been
+	// mounted and unmounted since. A mount that starts now can't make an image busy before we
+	// commit: handleMountReq records the image Requested first, which waits for us.
+	// (restoreMount doesn't, but only for Mounted images, which "styx gc" never deletes.)
 	busy := s.imagesInUse(candidates)
 	for _, sphStr := range candidates {
 		img := candidateImgs[sphStr]
@@ -525,43 +537,76 @@ func (s *Server) cachefilesFileCmds(cmd string, fsids []string) []error {
 		}
 		for i, fsid := range fsids {
 			p := filepath.Join(s.cfg.CachePath, fscachePath(s.cfg.CacheDomain, fsid))
-			if errs[i] = unix.Chdir(filepath.Dir(p)); errs[i] == nil {
-				_, errs[i] = unix.Write(devfd, []byte(cmd+" "+filepath.Base(p)))
-			}
+			errs[i] = cachefilesFileCmd(devfd, cmd, filepath.Dir(p), filepath.Base(p))
 		}
 	}()
 	<-done
 	return errs
 }
 
-// imagesInUse returns which of the images cachefiles has open, from the kernel's own record
-// (so it holds across daemon restarts). A file stays open until the last user of a lazily
-// detached mount goes away, and for a moment after a plain unmount, since the kernel
-// releases it asynchronously; so wait up to a second for busy ones to become free.
-func (s *Server) imagesInUse(sphs []string) map[string]bool {
-	busy := make(map[string]bool)
-	deadline := time.Now().Add(time.Second)
-	for len(sphs) > 0 {
-		var again []string
-		for i, err := range s.cachefilesFileCmds("inuse", sphs) {
-			switch {
-			case err == nil, errors.Is(err, unix.ENOENT), errors.Is(err, errNoDevnode):
-				delete(busy, sphs[i])
-			case errors.Is(err, unix.EBUSY):
-				busy[sphs[i]] = true
-				again = append(again, sphs[i])
-			default:
-				log.Printf("gc: can't tell if image %s is in use, keeping it: %v", sphs[i], err)
-				busy[sphs[i]] = true
+// cachefilesFileCmd runs cmd on the file name in dir. Call it only on a thread with a working
+// directory of its own. A variable for tests.
+var cachefilesFileCmd = func(devfd int, cmd, dir, name string) error {
+	if err := unix.Chdir(dir); err != nil {
+		return err
+	}
+	_, err := unix.Write(devfd, []byte(cmd+" "+name))
+	return err
+}
+
+// gcCandidates returns the images gc would delete if they aren't in use.
+func (s *Server) gcCandidates(r *GcReq) ([]string, error) {
+	held := make(map[string]bool)
+	for _, sphStr := range s.gcHolds() {
+		held[sphStr] = true
+	}
+	var candidates []string
+	err := s.db.View(func(tx *bbolt.Tx) error {
+		cur := tx.Bucket(imageBucket).Cursor()
+		for k, v := cur.First(); k != nil; k, v = cur.Next() {
+			var img pb.DbImage
+			if proto.Unmarshal(v, &img) == nil && r.GcByState[img.MountState] && !held[string(k)] {
+				candidates = append(candidates, string(k))
 			}
 		}
-		if len(again) == 0 || time.Now().After(deadline) {
-			break
+		return nil
+	})
+	return candidates, err
+}
+
+// imagesInUse returns which of the images cachefiles has open, from the kernel's own record
+// (so it holds across daemon restarts). A file stays open until the last user of a lazily
+// detached mount goes away.
+func (s *Server) imagesInUse(sphs []string) map[string]bool {
+	busy := make(map[string]bool)
+	for i, err := range s.cachefilesFileCmds("inuse", sphs) {
+		switch {
+		case err == nil, errors.Is(err, unix.ENOENT), errors.Is(err, errNoDevnode):
+		case errors.Is(err, unix.EBUSY):
+			busy[sphs[i]] = true
+		default:
+			log.Printf("gc: can't tell if image %s is in use, keeping it: %v", sphs[i], err)
+			busy[sphs[i]] = true
 		}
-		sphs = again
-		time.Sleep(20 * time.Millisecond)
 	}
 	return busy
+}
+
+// waitImagesFree waits up to a second for those of the images that are in use to be released.
+// The kernel releases an image's file asynchronously after a plain unmount, so it can be busy
+// for a moment after.
+func (s *Server) waitImagesFree(sphs []string) {
+	for deadline := time.Now().Add(time.Second); len(sphs) > 0 && time.Now().Before(deadline); {
+		var busy []string
+		for i, err := range s.cachefilesFileCmds("inuse", sphs) {
+			if errors.Is(err, unix.EBUSY) {
+				busy = append(busy, sphs[i])
+			}
+		}
+		if sphs = busy; len(sphs) > 0 {
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
 }
 
 // cullImageFiles removes the cachefiles backing files of images that aren't in use.
