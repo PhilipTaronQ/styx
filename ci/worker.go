@@ -44,8 +44,9 @@ import (
 
 type (
 	WorkerConfig struct {
-		TemporalParams string
-		SmtpParams     string
+		TemporalParams   string
+		SmtpParams       string
+		CompressPayloads bool
 
 		RunWorker      bool
 		RunScaler      bool
@@ -124,7 +125,7 @@ func RunWorker(ctx context.Context, cfg WorkerConfig) error {
 		return errors.New("must run either worker or heavy worker")
 	}
 
-	c, namespace, err := getTemporalClient(ctx, cfg.TemporalParams)
+	c, namespace, err := getTemporalClient(ctx, cfg.TemporalParams, cfg.CompressPayloads)
 	if err != nil {
 		return err
 	}
@@ -460,7 +461,7 @@ func (s *scaler) getInfo() (scalerInfo, error) {
 		}
 		if p := desc.WorkflowExecutionInfo.GetMemo().GetFields()[memoKeyBuildFailed]; p != nil {
 			var failed bool
-			if getDataConverter().FromPayload(p, &failed) == nil {
+			if getDataConverter(false).FromPayload(p, &failed) == nil {
 				info.failed = info.failed || failed
 			}
 		}
