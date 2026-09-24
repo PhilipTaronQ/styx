@@ -106,18 +106,17 @@ rec {
       skipFlakyNixTests
     ).nix-everything;
 
-  # Nix's own functional tests that flake in CI's sandbox, unrelated to the styx patch:
-  # - build.sh's cancelled-builds case fails intermittently on x86_64 and aarch64 with
-  #   "/cancelled-builds-fifo/fifo: No such file or directory": the fifo it passes through
-  #   extra-sandbox-paths isn't visible to the builders in the sandbox. Only that block is
-  #   turned off; the rest of main/build still runs.
-  # - ca/new-build-cmd fails intermittently on x86_64 and aarch64.
+  # A case in Nix's own functional tests that flakes in CI's sandbox, unrelated to the styx
+  # patch: build.sh's cancelled-builds case fails intermittently on x86_64 and aarch64 with
+  # "/cancelled-builds-fifo/fifo: No such file or directory": the fifo it passes through
+  # extra-sandbox-paths isn't visible to the builders in the sandbox. Only that block is
+  # turned off; the rest of build.sh still runs, in main/build and in ca/new-build-cmd,
+  # which sources it.
   skipFlakyNixTests = final: prev: {
     nix-functional-tests = prev.nix-functional-tests.overrideAttrs (old: {
       postPatch = (old.postPatch or "") + ''
         substituteInPlace build.sh \
           --replace-fail 'if isDaemonNewer "2.34pre" && canUseSandbox; then' 'if false; then # skipped, see default.nix'
-        substituteInPlace ca/meson.build --replace-fail "'new-build-cmd.sh'," ""
       '';
     });
   };
