@@ -19,6 +19,7 @@ import (
 
 	"github.com/dnr/styx/common/client"
 	"github.com/dnr/styx/daemon"
+	"github.com/dnr/styx/pb"
 )
 
 const (
@@ -149,6 +150,22 @@ func TestRestoreAfterLostImageFile(t *testing.T) {
 			img.Image.GetMountState(), img.Image.GetLastMountError(), img.Image.GetImageSize())
 	}
 	require.Equal(t, lcOpusfileHash, tb.nixHash(mp), "store path after restart with a lost image file")
+}
+
+// After something else unmounted a store path, umount got EINVAL from umount2 and failed
+// forever, leaving the image UnmountRequested.
+func TestUmountAfterExternalUnmount(t *testing.T) {
+	tb := newTestBase(t)
+	tb.startAll()
+
+	mp := tb.mount(lcOpusfile)
+	require.Equal(t, lcOpusfileHash, tb.nixHash(mp))
+	require.NoError(t, unix.Unmount(mp, 0))
+
+	tb.umount(lcOpusfile)
+	d := tb.debug(daemon.DebugReq{IncludeImages: []string{lcOpusfileSph}})
+	require.Contains(t, d.Images, lcOpusfile)
+	require.Equal(t, pb.MountState_Unmounted, d.Images[lcOpusfile].Image.GetMountState())
 }
 
 // umount detaches lazily and records Unmounted right away, so gc used to free the image

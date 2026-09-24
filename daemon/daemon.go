@@ -784,6 +784,14 @@ func (s *Server) handleUmountReq(ctx context.Context, r *UmountReq) (*Status, er
 	}
 
 	umountErr := unix.Unmount(mp, unix.MNT_DETACH)
+	if umountErr == unix.EINVAL || umountErr == unix.ENOENT {
+		// Not a mount point (EINVAL) or gone (ENOENT): someone else unmounted it. If no
+		// erofs is there, the unmount we wanted has happened.
+		if mounted, err := isErofsMount(mp); err != nil || !mounted {
+			log.Printf("umount %s: %v, already unmounted", mp, umountErr)
+			umountErr = nil
+		}
+	}
 
 	if umountErr == nil {
 		_ = s.imageTx(sphStr, func(img *pb.DbImage) error {
