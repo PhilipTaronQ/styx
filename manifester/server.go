@@ -236,7 +236,7 @@ func (s *server) handleChunkDiff(w http.ResponseWriter, req *http.Request) {
 	stats.ReqBytes = int(reqDataLen)
 	stats.DiffBytes = cw.c
 	stats.DlTotalMs = dlDone.Sub(start).Milliseconds()
-	stats.ZstdMs = time.Now().Sub(dlDone).Milliseconds()
+	stats.ZstdMs = time.Since(dlDone).Milliseconds()
 	statsEnc, err := json.Marshal(stats)
 	if err != nil || len(statsEnc) > statsSpace {
 		statsEnc = []byte("{}")
