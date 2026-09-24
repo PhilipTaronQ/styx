@@ -538,7 +538,7 @@ with `nix-shell -p ...` and see what happens.
 
 ```nix
    imports = [
-     "${fetchTarball "https://github.com/dnr/styx/archive/release.tar.gz"}/module"
+     "${fetchTarball "https://github.com/<owner>/styx/archive/<rev>.tar.gz"}/module"
      # or use your preferred pinning method
    ];
    # This enables all features and patches.

@@ -916,7 +916,7 @@ func makeNixexprsUrl(channel, relid string) string {
 	return "https://releases.nixos.org/" + strings.ReplaceAll(channel, "-", "/") + "/" + relid + "/nixexprs.tar.xz"
 }
 func makeGithubUrl(repoConfig RepoConfig, commit string) string {
-	// make url like: "https://github.com/dnr/styx/archive/7da079581765d13a37a2e0c27b4a461693384f20.tar.gz"
+	// make url like: "https://github.com/<owner>/styx/archive/7da079581765d13a37a2e0c27b4a461693384f20.tar.gz"
 	return strings.TrimSuffix(repoConfig.Repo, "/") + "/archive/" + commit + ".tar.gz"
 }
 
