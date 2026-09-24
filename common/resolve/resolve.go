@@ -145,6 +145,8 @@ func ResolveUrl(ctx context.Context, input string) (Result, error) {
 		res, err := resolveWithHander(ctx, h, input, false)
 		if err == errNoMatch {
 			continue
+		} else if err != nil {
+			return Result{}, fmt.Errorf("using %s url pattern: %w", h.name, err)
 		}
 
 		// pass through again to check that it's idempotent
