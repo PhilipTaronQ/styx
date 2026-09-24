@@ -239,13 +239,50 @@ func (s *Server) requestPrefetch(ctx context.Context, reqs []cdig.CDig) error {
 
 	if len(remanifestReqs) > 0 {
 		log.Println("chunk not found, remanifesting")
+		ctx = context.WithValue(ctx, triedRemanifest{}, true)
 		if s.doRemanifestReqs(ctx, remanifestReqs) == nil {
-			ctx = context.WithValue(ctx, triedRemanifest{}, true)
 			return s.requestPrefetch(ctx, reqs)
 		}
 	}
 
+	if err != nil && ctx.Err() == nil {
+		// like requestChunk, fall back to plain reads of whatever is still missing
+		log.Printf("prefetch failed (%v), doing plain reads", err)
+		return s.prefetchSingle(ctx, reqs)
+	}
 	return err
+}
+
+// prefetchSingle reads the missing chunks in reqs one at a time.
+func (s *Server) prefetchSingle(ctx context.Context, reqs []cdig.CDig) error {
+	var locs []erofs.SlabLoc
+	var digests []cdig.CDig
+	err := s.db.View(func(tx *bbolt.Tx) error {
+		cb := tx.Bucket(chunkBucket)
+		for _, req := range reqs {
+			loc := cb.Get(req[:])
+			if loc == nil {
+				return errors.New("missing digest->loc reference")
+			}
+			if l := loadLoc(loc); !s.locPresent(tx, l) {
+				locs = append(locs, l)
+				digests = append(digests, req)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	eg := errgroup.WithContext(ctx)
+	eg.SetLimit(max(s.cfg.Workers, 1))
+	for i := range locs {
+		eg.Go(func() error {
+			return s.requestChunk(eg, locs[i], digests[i], nil)
+		})
+	}
+	return eg.Wait()
 }
 
 func (s *Server) buildAndStartPrefetch(ctx context.Context, reqs []cdig.CDig) ([]reqOp, error) {

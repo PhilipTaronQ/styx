@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"net/http"
 	"testing"
 	"time"
 
@@ -108,6 +109,32 @@ func TestPanicInBuildDiffDoesNotWedge(t *testing.T) {
 
 	// and later requests still work
 	requestChunkWithin(t, e.s, locs[1], digests[1], e.sphps(digests[1]), 10*time.Second)
+}
+
+// requestChunk recovers from a failed diff op by reading the chunk directly.
+// requestPrefetch (styx prefetch, and materialize) had no fallback, so the same chunk
+// differ failure failed the whole request even though every chunk could be read directly.
+// ("recompress mismatch", which doDiffOp says should "fall back to single", is the
+// deterministic version of this.)
+func TestPrefetchFallsBackWhenDiffFails(t *testing.T) {
+	e := newFetchEnv(t)
+	chunks := testChunks(4, 2)
+	e.serveChunks(chunks)
+	digests, locs := e.addImage(testSpX, chunks)
+	e.diffStatus.Store(http.StatusInternalServerError)
+
+	requestChunkWithin(t, e.s, locs[0], digests[0], e.sphps(digests[0]), 10*time.Second)
+	require.EqualValues(t, 1, e.diffCalls.Load(), "requestChunk should have tried a diff first")
+
+	err := e.s.requestPrefetch(context.Background(), digests[1:])
+	require.EqualValues(t, 2, e.diffCalls.Load(), "requestPrefetch should have tried a diff")
+	require.NoError(t, err, "prefetch failed although every chunk is readable directly")
+	require.NoError(t, e.s.db.View(func(tx *bbolt.Tx) error {
+		for _, loc := range locs {
+			require.True(t, e.s.locPresent(tx, loc))
+		}
+		return nil
+	}))
 }
 
 // Chunk diffs are checked against their digests only after decompressing, so a small zstd
