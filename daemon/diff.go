@@ -492,7 +492,9 @@ func (s *Server) doDiffOp(ctx context.Context, op *diffOp) error {
 
 	// decompress from diff
 	diffCounter := countReader{r: diff}
-	reqData, err := io.ReadAll(zstd.NewReaderPatcher(&diffCounter, baseData))
+	zr := zstd.NewReaderPatcher(&diffCounter, baseData)
+	reqData, err := io.ReadAll(zr)
+	zr.Close() // frees the C decompression stream
 	if err != nil {
 		return fmt.Errorf("expandChunkDiff error: %w", err)
 	}
