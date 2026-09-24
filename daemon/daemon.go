@@ -1303,10 +1303,36 @@ func (s *Server) mountSlabImage(slabId uint16) error {
 
 	cacheFd, err := s.openSlabBackingFile(slabId)
 	if err != nil {
+		// DEBUG(gha-debug-slab): dump cache tree and poll for the backing file.
+		dumpTree := func(when string) {
+			_ = filepath.Walk(filepath.Join(s.cfg.CachePath, "cache"), func(p string, fi os.FileInfo, err error) error {
+				if err == nil && !fi.IsDir() {
+					log.Printf("DEBUG %s: %s (%d bytes)", when, p, fi.Size())
+				}
+				return nil
+			})
+		}
+		tag, _ := s.SlabInfo(slabId)
+		log.Printf("DEBUG expected %s", fscachePath(s.cfg.CacheDomain, tag))
+		dumpTree("at failure")
+		start := time.Now()
+		for time.Since(start) < 5*time.Second {
+			time.Sleep(10 * time.Millisecond)
+			if cacheFd, err = s.openSlabBackingFile(slabId); err == nil {
+				log.Printf("DEBUG backing file appeared after %v", time.Since(start))
+				break
+			}
+		}
+		if err == nil {
+			goto ok
+		}
+		log.Printf("DEBUG backing file still missing after %v", time.Since(start))
+		dumpTree("after poll")
 		_ = unix.Close(slabFd)
 		_ = unix.Unmount(mountPoint, 0)
 		return fmt.Errorf("error opening slab backing file %s: %w", mountPoint, err)
 	}
+ok:
 
 	s.stateLock.Lock()
 	s.readfdBySlab[slabId] = slabFds{slabFd, cacheFd}
