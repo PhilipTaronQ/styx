@@ -84,8 +84,9 @@ func withStartConfig(c *cobra.Command) *ci.StartConfig {
 
 func withGCConfig(c *cobra.Command) *ci.GCConfig {
 	var cfg ci.GCConfig
-	c.Flags().StringVar(&cfg.Bucket, "bucket", "styx-1", "s3 bucket")
+	c.Flags().StringVar(&cfg.Bucket, "bucket", "", "s3 bucket (required)")
 	c.Flags().DurationVar(&cfg.MaxAge, "max_age", 210*24*time.Hour, "gc age")
+	c.Flags().BoolVar(&cfg.DryRun, "dry_run", true, "only log what would be deleted; pass --dry_run=false to delete")
 	return &cfg
 }
 

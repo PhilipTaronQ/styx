@@ -39,8 +39,9 @@ type (
 		bucket  string
 		age     time.Duration
 		// Objects modified less than grace before now are never deleted.
-		grace time.Duration
-		lim   struct{ trace, chunk, list, del, batch int }
+		grace  time.Duration
+		dryRun bool // report what would be deleted, but don't
+		lim    struct{ trace, chunk, list, del, batch int }
 
 		summaryMu    sync.Mutex // guards summary
 		toDelete     sync.Map   // key -> size
@@ -63,6 +64,7 @@ type (
 	GCConfig struct {
 		Bucket string
 		MaxAge time.Duration
+		DryRun bool
 	}
 )
 
@@ -73,6 +75,9 @@ type (
 const gcGrace = 2 * manifester.RefreshAge
 
 func GCLocal(ctx context.Context, cfg GCConfig) error {
+	if cfg.Bucket == "" {
+		return errors.New("bucket is required")
+	}
 	var sb strings.Builder
 	s3, err := getS3Cli()
 	if err != nil {
@@ -87,6 +92,7 @@ func GCLocal(ctx context.Context, cfg GCConfig) error {
 		bucket:  cfg.Bucket,
 		age:     cfg.MaxAge,
 		grace:   gcGrace,
+		dryRun:  cfg.DryRun,
 		lim: struct{ trace, chunk, list, del, batch int }{
 			trace: 10,
 			chunk: 3,
@@ -230,6 +236,8 @@ const (
 	phaseLeaves        // chunks, nars and anything unexpected
 	numPhases
 )
+
+var phaseNames = [numPhases]string{"build roots", "manifests and narinfos", "chunks, nars and other files"}
 
 // cutoff is the latest modification time of an object that GC may delete.
 func (gc *gc) cutoff() time.Time { return gc.now.Add(-gc.grace) }
@@ -501,6 +509,13 @@ func (gc *gc) removePhases(ctx context.Context, phases [numPhases][]string) erro
 			return live
 		})
 		slices.Sort(keys)
+		if gc.dryRun {
+			gc.logf("dry run: would delete %d %s", len(keys), phaseNames[phase])
+			for _, key := range keys[:min(len(keys), 10)] {
+				gc.logln("  e.g.", key)
+			}
+			continue
+		}
 		failed, err := gc.deleteKeys(ctx, keys)
 		if err != nil {
 			// Some of this phase's deletes may or may not have happened, so don't touch

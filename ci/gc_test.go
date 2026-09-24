@@ -564,6 +564,27 @@ func TestGCSkipsUnreadableChunkedManifest(t *testing.T) {
 	require.True(t, f.has(testChunkKey(okDig)))
 }
 
+func TestGCDryRunDeletesNothing(t *testing.T) {
+	f := newFakeS3()
+	g, sb := newTestGC(t, f)
+	g.dryRun = true
+	chunk := testChunkKey(testDigest(1))
+	f.putOld(chunk, []byte("chunk"))
+	man := testManifestKey("v1-stale")
+	f.putOld(man, testManifestObj(t, testDigest(1)))
+
+	require.NoError(t, g.run(context.Background()))
+	t.Log(sb.String())
+	require.Contains(t, sb.String(), "dry run: would delete 1 manifests and narinfos")
+	require.Contains(t, sb.String(), "dry run: would delete 1 chunks, nars and other files")
+	require.True(t, f.has(chunk))
+	require.True(t, f.has(man))
+}
+
+func TestGCLocalRequiresBucket(t *testing.T) {
+	require.ErrorContains(t, GCLocal(context.Background(), GCConfig{MaxAge: gcMaxAge}), "bucket is required")
+}
+
 // remove() runs DeleteObjects batches concurrently and counts the per-key errors of each.
 // Run with -race.
 func TestGCRemoveConcurrentDeleteErrors(t *testing.T) {
