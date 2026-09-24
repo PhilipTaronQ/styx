@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime/pprof"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -62,6 +63,14 @@ type (
 		daemon     *daemon.Server
 		fdstore    map[string]int
 		startFds   map[string]string // see checkLeaks
+
+		initialized bool        // initDaemon succeeded
+		mounts      []testMount // from tb.mount, less those tb.umount'ed
+		collected   bool        // see collect
+	}
+
+	testMount struct {
+		mp, storePath string
 	}
 )
 
@@ -113,6 +122,8 @@ func newTestBase(t *testing.T) *testBase {
 }
 
 func (tb *testBase) cleanup() {
+	// if the test mounted anything this already ran, from the last mount's cleanup
+	tb.collect()
 	// Stop the daemon before the manifester: a fetch still in flight retries
 	// forever against a stopped manifester, and Stop waits for it.
 	if tb.daemon != nil {
@@ -249,6 +260,7 @@ func (tb *testBase) initDaemon() {
 			ChunkDiffUrl:     tb.manifesterAddr,
 		},
 	}, &res)
+	tb.initialized = true
 	tb.t.Log("daemon initialized")
 }
 
@@ -287,6 +299,9 @@ func (tb *testBase) tryCall(path string, req, res any) error {
 func (tb *testBase) mount(storePath string) string {
 	mp := tb.t.TempDir()
 	tb.t.Cleanup(func() {
+		// cleanups run last first, so the first of these to run sees every
+		// mount still in place
+		tb.collect()
 		// if the test unmounted already this will just fail
 		_ = unix.Unmount(mp, 0)
 	})
@@ -296,6 +311,7 @@ func (tb *testBase) mount(storePath string) string {
 		StorePath:  storePath,
 		MountPoint: mp,
 	}, &res)
+	tb.mounts = append(tb.mounts, testMount{mp: mp, storePath: storePath})
 	return mp
 }
 
@@ -304,6 +320,10 @@ func (tb *testBase) umount(storePath string) {
 	tb.call(daemon.UmountPath, daemon.UmountReq{
 		StorePath: storePath,
 	}, &res)
+	hash, _, _ := strings.Cut(storePath, "-")
+	tb.mounts = slices.DeleteFunc(tb.mounts, func(m testMount) bool {
+		return strings.HasPrefix(m.storePath, hash)
+	})
 }
 
 func (tb *testBase) materialize(storePath string) string {
@@ -413,10 +433,16 @@ func checkGcResp(res *daemon.GcResp) error {
 }
 
 func (tb *testBase) dropCaches() {
+	require.NoError(tb.t, dropCaches())
+}
+
+func dropCaches() error {
 	fd, err := unix.Open("/proc/sys/vm/drop_caches", unix.O_WRONLY, 0)
-	require.NoError(tb.t, err)
+	if err != nil {
+		return err
+	}
 	unix.Write(fd, []byte("3"))
-	unix.Close(fd)
+	return unix.Close(fd)
 }
 
 // implement systemd.FdStore
