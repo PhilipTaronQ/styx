@@ -1,0 +1,64 @@
+# One-off probe: does the GHA runner kernel support what styx needs
+# (CACHEFILES_ONDEMAND + EROFS_FS_ONDEMAND)? If so, the test suite can run
+# directly on the runner instead of in a VM with a custom kernel.
+name: kernel-probe
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [gha-probe]
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-26.04, ubuntu-24.04]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    steps:
+      - name: Kernel config
+        run: |
+          set -u
+          kver=$(uname -r)
+          echo "## ${{ matrix.runner }}: $kver" >> "$GITHUB_STEP_SUMMARY"
+          if [ -r "/boot/config-$kver" ]; then
+            cfg() { cat "/boot/config-$kver"; }
+          elif [ -r /proc/config.gz ]; then
+            cfg() { zcat /proc/config.gz; }
+          else
+            echo "no kernel config found" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          {
+            echo '```'
+            for opt in FSCACHE NETFS_SUPPORT CACHEFILES CACHEFILES_ONDEMAND EROFS_FS EROFS_FS_ONDEMAND; do
+              cfg | grep -E "^(# )?CONFIG_${opt}[= ]" || echo "CONFIG_${opt} (absent)"
+            done
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Modules
+        run: |
+          {
+            echo '```'
+            for m in cachefiles erofs; do
+              if sudo modprobe "$m"; then echo "modprobe $m: ok"; else echo "modprobe $m: FAILED"; fi
+            done
+            ls -l /dev/cachefiles 2>&1 || true
+            grep -w erofs /proc/filesystems || echo "erofs not in /proc/filesystems"
+            sudo fuser -v /dev/cachefiles 2>&1 || echo "/dev/cachefiles not in use"
+            apt-cache policy "linux-modules-extra-$(uname -r)" 2>&1 | head -3
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Runner resources
+        run: |
+          {
+            echo '```'
+            echo "nproc: $(nproc)"
+            free -h | head -2
+            df -hT / /tmp | uniq
+            ls -l /dev/kvm 2>&1 || true
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
