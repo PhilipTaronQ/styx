@@ -102,7 +102,26 @@ rec {
 
   # nixVersions.latest; bump together with patches/nix_*.patch
   patchedNix =
-    (pkgs.nixVersions.nixComponents_2_35.appendPatches [ ./patches/nix_2_35.patch ]).nix-everything;
+    ((pkgs.nixVersions.nixComponents_2_35.appendPatches [ ./patches/nix_2_35.patch ]).overrideScope
+      skipFlakyNixTests
+    ).nix-everything;
+
+  # Nix's own functional tests that flake in CI's sandbox, unrelated to the styx patch:
+  # - ca/new-build-cmd fails intermittently on x86_64 and aarch64.
+  # - main/build's cancelled-builds case hangs or fails on aarch64-linux: the fifo it
+  #   passes through extra-sandbox-paths isn't visible to the builders in the sandbox.
+  skipFlakyNixTests = final: prev: {
+    nix-functional-tests = prev.nix-functional-tests.overrideAttrs (old: {
+      postPatch =
+        (old.postPatch or "")
+        + ''
+          substituteInPlace ca/meson.build --replace-fail "'new-build-cmd.sh'," ""
+        ''
+        + pkgs.lib.optionalString (pkgs.stdenv.hostPlatform.system == "aarch64-linux") ''
+          substituteInPlace meson.build --replace-fail "'build.sh'," ""
+        '';
+    });
+  };
 
   testdata =
     let
