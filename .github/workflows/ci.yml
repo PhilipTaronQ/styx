@@ -201,9 +201,23 @@ jobs:
           nix-build -o styxtest -A ${{ matrix.variant }}
           # tools the tests exec from PATH (the VM test gets these from NixOS)
           nix-build -o tools -E 'with import (import ./Pins.nix).nixpkgs {}; buildEnv { name = "styxtest-tools"; paths = [ nix psmisc xz ]; }'
+      # Every test sets up its own daemon, cache and manifester, so shuffle the
+      # order (the seed is in the log; replay it with -test.shuffle=<seed>) and
+      # run everything twice to catch tests that depend on what ran before.
       - name: Run test suite
         working-directory: styxtest/bin
         run: |
+          set -o pipefail
           sudo env PATH="$GITHUB_WORKSPACE/tools/bin:$PATH" \
             ASAN_OPTIONS="detect_leaks=1" \
-            ./styxtest -test.v -test.timeout 30m
+            ./styxtest -test.v -test.timeout 30m -test.shuffle=on -test.count=2 \
+            2>&1 | tee "$RUNNER_TEMP/suite.log"
+      # The end-of-test checks log violations caused by known, unfixed bugs as
+      # warnings rather than failing (see tests/invariants_test.go); count them.
+      - name: Known-bug warnings
+        if: ${{ !cancelled() }}
+        run: |
+          grep -o '(known bug: [^)]*)' "$RUNNER_TEMP/suite.log" | sort | uniq -c |
+            while read -r n what; do
+              echo "::warning title=suite (${{ matrix.variant }})::$n warnings $what"
+            done
