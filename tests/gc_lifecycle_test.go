@@ -3,6 +3,8 @@ package tests
 import (
 	"bytes"
 	"encoding/json"
+	"io"
+	"io/fs"
 	"math/rand/v2"
 	"net/http"
 	"os"
@@ -11,6 +13,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 
 	"github.com/dnr/styx/common/client"
 	"github.com/dnr/styx/daemon"
@@ -54,6 +57,55 @@ func TestGcAfterFailedMount(t *testing.T) {
 	// what `styx gc` sends with no flags
 	code, body = tb.lcCall(daemon.GcPath, daemon.GcReq{DryRunFast: true, GcByState: gcUnmounted})
 	require.Equal(t, http.StatusOK, code, "default gc failed after an unrelated failed mount: %s", body)
+}
+
+// umount detaches lazily and records Unmounted right away, so gc used to free the image
+// while a process still had one of its files open.
+func TestGcWhileDetachedMountInUse(t *testing.T) {
+	tb := newTestBase(t)
+	tb.startAll()
+
+	mp := tb.mount(lcOpusfile)
+	var big string
+	var bigSize int64
+	require.NoError(t, filepath.WalkDir(mp, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.Type().IsRegular() {
+			if fi, err := d.Info(); err == nil && fi.Size() > bigSize {
+				big, bigSize = p, fi.Size()
+			}
+		}
+		return nil
+	}))
+	require.Greater(t, bigSize, int64(4096), "want a chunked file")
+
+	f, err := os.Open(big)
+	require.NoError(t, err)
+	defer f.Close()
+	want, err := io.ReadAll(f)
+	require.NoError(t, err)
+
+	tb.umount(lcOpusfile) // MNT_DETACH: f keeps the filesystem alive
+	gc := tb.gc(daemon.GcReq{GcByState: gcUnmounted})
+	t.Log("gc with a file open:", gc)
+	require.Zero(t, gc.DeleteImages, "gc deleted an image that is still in use")
+
+	unix.Sync()
+	tb.dropCaches()
+
+	got := make([]byte, len(want))
+	n, err := f.ReadAt(got, 0)
+	require.NoError(t, err, "reading still-open %s after umount and gc", big)
+	require.Equal(t, len(want), n)
+	require.True(t, bytes.Equal(want, got), "contents of still-open %s changed after umount and gc", big)
+
+	// once the last user is gone, the image can go
+	require.NoError(t, f.Close())
+	gc = tb.gc(daemon.GcReq{GcByState: gcUnmounted})
+	t.Log("gc after close:", gc)
+	require.Equal(t, 1, gc.DeleteImages)
 }
 
 // vaporize reserves slab space in one transaction (preallocateBatch) and links chunks to it

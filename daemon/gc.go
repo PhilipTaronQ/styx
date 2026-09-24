@@ -10,8 +10,11 @@ import (
 	"maps"
 	"math"
 	"net/http"
+	"path/filepath"
+	"runtime"
 	"slices"
 	"sync"
+	"time"
 
 	"github.com/dnr/styx/common"
 	"github.com/dnr/styx/common/cdig"
@@ -114,14 +117,34 @@ func (s *Server) handleGcReq(ctx context.Context, r *GcReq) (*GcResp, error) {
 	reserved := s.gcReserved()
 
 	// use image bucket as roots
+	var candidates []string
+	candidateImgs := make(map[string]*pb.DbImage)
 	ibcur := g.ib.Cursor()
 	for k, v := ibcur.First(); k != nil; k, v = ibcur.Next() {
-		var img pb.DbImage
-		if proto.Unmarshal(v, &img) == nil {
-			err := s.gcTraceImage(g, string(k), &img)
-			if err != nil {
-				return nil, err
-			}
+		img := &pb.DbImage{}
+		if proto.Unmarshal(v, img) != nil {
+			continue
+		}
+		sphStr := string(k)
+		if _, held := g.held[sphStr]; g.GcByState[img.MountState] && !held {
+			candidates = append(candidates, sphStr)
+			candidateImgs[sphStr] = img
+		} else if err := s.gcTraceImage(g, sphStr, img); err != nil {
+			return nil, err
+		}
+	}
+	// umount detaches lazily, so an Unmounted image can still be in use through open files.
+	// Freeing its chunks would give those readers EIO, or SIGBUS for a running binary.
+	busy := s.imagesInUse(candidates)
+	for _, sphStr := range candidates {
+		img := candidateImgs[sphStr]
+		if !busy[sphStr] {
+			g.DeleteImagesByState[img.MountState]++
+			continue
+		}
+		log.Printf("gc: keeping %s, its image is still in use", img.StorePath)
+		if err := s.gcTraceImage(g, sphStr, img); err != nil {
+			return nil, err
 		}
 	}
 
@@ -379,11 +402,6 @@ func (s *Server) gcTraceImage(g *gcCtx, sphStr string, img *pb.DbImage) error {
 	manifestSph := makeManifestSph(sph)
 	manifestSphPrefix := SphPrefixFromBytes(manifestSph[:])
 
-	if _, held := g.held[sphStr]; g.GcByState[img.MountState] && !held {
-		g.DeleteImagesByState[img.MountState]++
-		return nil
-	}
-
 	g.keepImage[sphStr] = struct{}{}
 	g.keepSphps[sphPrefix] = struct{}{}
 	g.keepSphps[manifestSphPrefix] = struct{}{}
@@ -430,6 +448,73 @@ func gcNeedsManifest(st pb.MountState) bool {
 	default:
 		return false
 	}
+}
+
+var errNoDevnode = errors.New("cachefiles device not open")
+
+// cachefilesFileCmds runs the cachefiles command cmd ("inuse" or "cull") on the backing file
+// of each fsid. The kernel looks the name up in the calling thread's working directory, so
+// this runs on a thread with a working directory of its own, which exits afterwards.
+func (s *Server) cachefilesFileCmds(cmd string, fsids []string) []error {
+	errs := make([]error, len(fsids))
+	devfd := int(s.devnode.Load())
+	if devfd == 0 || len(fsids) == 0 {
+		for i := range errs {
+			errs[i] = errNoDevnode
+		}
+		return errs
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		// Never unlocked, so the thread exits with this goroutine rather than run others
+		// in our working directory.
+		runtime.LockOSThread()
+		if err := unix.Unshare(unix.CLONE_FS); err != nil {
+			for i := range errs {
+				errs[i] = fmt.Errorf("unshare: %w", err)
+			}
+			return
+		}
+		for i, fsid := range fsids {
+			p := filepath.Join(s.cfg.CachePath, fscachePath(s.cfg.CacheDomain, fsid))
+			if errs[i] = unix.Chdir(filepath.Dir(p)); errs[i] == nil {
+				_, errs[i] = unix.Write(devfd, []byte(cmd+" "+filepath.Base(p)))
+			}
+		}
+	}()
+	<-done
+	return errs
+}
+
+// imagesInUse returns which of the images cachefiles has open, from the kernel's own record
+// (so it holds across daemon restarts). A file stays open until the last user of a lazily
+// detached mount goes away, and for a moment after a plain unmount, since the kernel
+// releases it asynchronously; so wait up to a second for busy ones to become free.
+func (s *Server) imagesInUse(sphs []string) map[string]bool {
+	busy := make(map[string]bool)
+	deadline := time.Now().Add(time.Second)
+	for len(sphs) > 0 {
+		var again []string
+		for i, err := range s.cachefilesFileCmds("inuse", sphs) {
+			switch {
+			case err == nil, errors.Is(err, unix.ENOENT), errors.Is(err, errNoDevnode):
+				delete(busy, sphs[i])
+			case errors.Is(err, unix.EBUSY):
+				busy[sphs[i]] = true
+				again = append(again, sphs[i])
+			default:
+				log.Printf("gc: can't tell if image %s is in use, keeping it: %v", sphs[i], err)
+				busy[sphs[i]] = true
+			}
+		}
+		if len(again) == 0 || time.Now().After(deadline) {
+			break
+		}
+		sphs = again
+		time.Sleep(20 * time.Millisecond)
+	}
+	return busy
 }
 
 // holdForGc makes gc keep sphStr's image, manifest and chunks until the returned function is
