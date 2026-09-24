@@ -127,7 +127,7 @@ index 8e997c8..a1ba117 100644
  
          uint64_t bytesFreed;
 diff --git a/src/libstore/include/nix/store/globals.hh b/src/libstore/include/nix/store/globals.hh
-index 34eab7f..1303149 100644
+index 34eab7f..91d940a 100644
 --- a/src/libstore/include/nix/store/globals.hh
 +++ b/src/libstore/include/nix/store/globals.hh
 @@ -421,6 +421,33 @@ public:
@@ -137,7 +137,7 @@ index 34eab7f..1303149 100644
 +    Setting<Strings> styxSubstituters{
 +        this, Strings{"https://cache.nixos.org/"}, "styx-substituters", "Use Styx for these substituters."};
 +
-+    Setting<int> styxMinSize{
++    Setting<uint64_t> styxMinSize{
 +        this, 64 * 1024, "styx-min-size", "Use Styx only for paths larger than this nar size."};
 +
 +    Setting<Strings> styxOndemand{
@@ -192,13 +192,14 @@ index 3ccf0ad..7be7bb9 100644
    'worker-protocol-impl.hh',
 diff --git a/src/libstore/include/nix/store/styx.hh b/src/libstore/include/nix/store/styx.hh
 new file mode 100644
-index 0000000..78ac36e
+index 0000000..0c3caf0
 --- /dev/null
 +++ b/src/libstore/include/nix/store/styx.hh
-@@ -0,0 +1,21 @@
+@@ -0,0 +1,22 @@
 +#pragma once
 +///@file
 +
++#include <cstdint>
 +#include <string>
 +
 +namespace nix {
@@ -209,9 +210,9 @@ index 0000000..78ac36e
 +    StyxMaterialize
 +} StyxMode;
 +
-+StyxMode canUseStyx(const std::string storeUri, int narSize, std::string name);
-+void makeStyxMount(const std::string upstream, const std::string storePath, const std::string mountPoint, int narSize);
-+void makeStyxMaterialize(const std::string upstream, const std::string storePath, const std::string dest, int narSize);
++StyxMode canUseStyx(const std::string storeUri, uint64_t narSize, std::string name);
++void makeStyxMount(const std::string upstream, const std::string storePath, const std::string mountPoint, uint64_t narSize);
++void makeStyxMaterialize(const std::string upstream, const std::string storePath, const std::string dest, uint64_t narSize);
 +bool isStyxMount(const std::string path);
 +void deleteStyxMount(const std::string path);
 +void tryStyxGC();
@@ -306,7 +307,7 @@ index c266f05..1456916 100644
    'worker-protocol.cc',
 diff --git a/src/libstore/styx.cc b/src/libstore/styx.cc
 new file mode 100644
-index 0000000..62691d2
+index 0000000..5fe46bf
 --- /dev/null
 +++ b/src/libstore/styx.cc
 @@ -0,0 +1,142 @@
@@ -364,7 +365,7 @@ index 0000000..62691d2
 +    }
 +}
 +
-+StyxMode canUseStyx(const std::string storeUri, int narSize, std::string name) {
++StyxMode canUseStyx(const std::string storeUri, uint64_t narSize, std::string name) {
 +    auto trim = [](std::string_view s) {
 +        return s.back() == '/' ? s.substr(0, s.size() - 1) : s;
 +    };
@@ -391,7 +392,7 @@ index 0000000..62691d2
 +    return StyxDisable;
 +}
 +
-+void makeStyxMount(const std::string upstream, const std::string storePath, const std::string mountPoint, int narSize)
++void makeStyxMount(const std::string upstream, const std::string storePath, const std::string mountPoint, uint64_t narSize)
 +{
 +    deletePath(mountPoint);
 +    createDirs(mountPoint);
@@ -406,7 +407,7 @@ index 0000000..62691d2
 +}
 +
 +
-+void makeStyxMaterialize(const std::string upstream, const std::string storePath, const std::string dest, int narSize)
++void makeStyxMaterialize(const std::string upstream, const std::string storePath, const std::string dest, uint64_t narSize)
 +{
 +    nlohmann::json req = {
 +        {"Upstream", upstream},
