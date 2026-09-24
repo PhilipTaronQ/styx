@@ -267,6 +267,8 @@ func (s *Server) openDb() (err error) {
 			return err
 		} else if _, err = tx.CreateBucketIfNotExists(chunkBucket); err != nil {
 			return err
+		} else if _, err = tx.CreateBucketIfNotExists(mchunkBucket); err != nil {
+			return err
 		} else if _, err = tx.CreateBucketIfNotExists(slabBucket); err != nil {
 			return err
 		} else if _, err = tx.CreateBucketIfNotExists(imageBucket); err != nil {
@@ -1261,7 +1263,7 @@ func (s *Server) handleReadSlab(state *openFileState, ln, off uint64) (retErr er
 		}
 
 		// look up digest to get store paths
-		loc := tx.Bucket(chunkBucket).Get(v)
+		loc := chunkBucketFor(tx, isManifestSlab(slabId)).Get(v)
 		if loc == nil {
 			return errors.New("missing digest->loc reference")
 		}
@@ -1442,7 +1444,7 @@ func (s *Server) AllocateBatch(ctx context.Context, blocks []uint16, digests []c
 	}
 	out := make([]erofs.SlabLoc, n)
 	err := s.db.Update(func(tx *bbolt.Tx) error {
-		cb, slabroot := tx.Bucket(chunkBucket), tx.Bucket(slabBucket)
+		cb, slabroot := chunkBucketFor(tx, forManifest), tx.Bucket(slabBucket)
 		var slabId uint16 = 0
 		if forManifest {
 			slabId = manifestSlabOffset
@@ -1492,10 +1494,27 @@ func (s *Server) SlabInfo(slabId uint16) (tag string, totalBlocks uint32) {
 	return slabPrefix + strconv.Itoa(int(slabId)), common.TruncU32(uint64(slabBytes) >> s.blockShift)
 }
 
+// chunkBucketFor returns the bucket that maps digests of data chunks, or of manifest chunks,
+// to their locs. They're kept apart so that a manifest chunk with the same bytes as a data
+// chunk still gets its own loc in the manifest slab, and vice versa. Manifest chunks are read
+// directly from the manifest slab file, sometimes under diffLock, while reads from data slabs
+// go through erofs, which calls back into the daemon for missing data. And erofs images can
+// only refer to data slabs.
+func chunkBucketFor(tx *bbolt.Tx, forManifest bool) *bbolt.Bucket {
+	if forManifest {
+		return tx.Bucket(mchunkBucket)
+	}
+	return tx.Bucket(chunkBucket)
+}
+
+func isManifestSlab(slabId uint16) bool {
+	return slabId >= manifestSlabOffset
+}
+
 // like AllocateBatch but only lookup
-func (s *Server) lookupLocs(tx *bbolt.Tx, digests []cdig.CDig) ([]erofs.SlabLoc, error) {
+func (s *Server) lookupLocs(tx *bbolt.Tx, digests []cdig.CDig, forManifest bool) ([]erofs.SlabLoc, error) {
 	out := make([]erofs.SlabLoc, len(digests))
-	cb := tx.Bucket(chunkBucket)
+	cb := chunkBucketFor(tx, forManifest)
 	for i := range out {
 		loc := cb.Get(digests[i][:])
 		if loc == nil {

@@ -839,7 +839,7 @@ func (s *Server) getDigestsFromImage(tx *bbolt.Tx, sph Sph, isManifest bool) ([]
 	// read chunks if needed
 	data := entry.InlineData
 	if len(data) == 0 {
-		locs, err := s.lookupLocs(tx, cdig.FromSliceAlias(entry.Digests))
+		locs, err := s.lookupLocs(tx, cdig.FromSliceAlias(entry.Digests), true)
 		if err != nil {
 			return nil, err
 		}
@@ -873,7 +873,7 @@ func (s *Server) getManifestLocal(tx *bbolt.Tx, sphStr string) (*pb.Manifest, []
 	data := entry.InlineData
 	mdigs := cdig.FromSliceAlias(entry.Digests)
 	if len(data) == 0 {
-		locs, err := s.lookupLocs(tx, mdigs)
+		locs, err := s.lookupLocs(tx, mdigs, true)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -918,8 +918,8 @@ func (s *Server) locPresent(tx *bbolt.Tx, loc erofs.SlabLoc) bool {
 	return sb.Get(addrKey(loc.Addr|presentMask)) != nil
 }
 
-func (s *Server) digestLoc(tx *bbolt.Tx, digest cdig.CDig) erofs.SlabLoc {
-	v := tx.Bucket(chunkBucket).Get(digest[:])
+func (s *Server) digestLoc(tx *bbolt.Tx, digest cdig.CDig, isManifest bool) erofs.SlabLoc {
+	v := chunkBucketFor(tx, isManifest).Get(digest[:])
 	if v == nil {
 		log.Println("missing chunk entry in digestLoc", digest)
 		return erofs.SlabLoc{} // shouldn't happen
@@ -927,8 +927,8 @@ func (s *Server) digestLoc(tx *bbolt.Tx, digest cdig.CDig) erofs.SlabLoc {
 	return loadLoc(v)
 }
 
-func (s *Server) digestPresent(tx *bbolt.Tx, digest cdig.CDig) (erofs.SlabLoc, bool) {
-	loc := s.digestLoc(tx, digest)
+func (s *Server) digestPresent(tx *bbolt.Tx, digest cdig.CDig, isManifest bool) (erofs.SlabLoc, bool) {
+	loc := s.digestLoc(tx, digest, isManifest)
 	return loc, s.locPresent(tx, loc)
 }
 
@@ -965,7 +965,7 @@ func (s *Server) appendRemanifestReqs(reqs []MountReq, op reqOp) []MountReq {
 		switch op := op.(type) {
 		case *singleOp:
 			// we didn't look up sph before, so do it now
-			loc := tx.Bucket(chunkBucket).Get(op.digest[:])
+			loc := chunkBucketFor(tx, isManifestSlab(op.loc.SlabId)).Get(op.digest[:])
 			if loc == nil {
 				return nil
 			}
@@ -1451,7 +1451,7 @@ func (set *opSet) buildExtendDiff(
 	changed := false
 	newFile := true
 	for {
-		if newFile && res.usingBase() {
+		if newFile && res.usingBase() && !isManifest { // recompress is only for data files
 			if args := getRecompressArgs(reqIter.ent()); len(args) > 0 {
 				if newBaseIter, newReqIter, err := set.buildRecompress(tx, res, args, baseIter, reqIter); err == nil {
 					baseIter, reqIter = newBaseIter, newReqIter
@@ -1468,7 +1468,7 @@ func (set *opSet) buildExtendDiff(
 
 		reqDigest := reqIter.digest()
 		if reqDigest != cdig.Zero && !set.fullReq() && !set.isUsing(reqDigest) {
-			reqLoc, reqPresent := set.s.digestPresent(tx, reqDigest)
+			reqLoc, reqPresent := set.s.digestPresent(tx, reqDigest, isManifest)
 			if !reqPresent && reqLoc.Addr > 0 && set.s.diffMap[reqLoc] == nil {
 				set.markUsing(reqDigest)
 				set.checkReq()
@@ -1481,7 +1481,7 @@ func (set *opSet) buildExtendDiff(
 		// fill base only if room in this op, don't make more ops just for base
 		baseDigest := baseIter.digest()
 		if baseDigest != cdig.Zero && int(set.op.baseTotalChunks) < set.maxOpSize && set.op.baseTotalSize < MaxOpBytes && !set.isUsing(baseDigest) {
-			baseLoc, basePresent := set.s.digestPresent(tx, baseDigest)
+			baseLoc, basePresent := set.s.digestPresent(tx, baseDigest, isManifest)
 			if basePresent {
 				set.markUsing(baseDigest)
 				set.op.addBase(res.baseHash, baseDigest, baseIter.size(), baseLoc)
@@ -1557,7 +1557,7 @@ func (set *opSet) buildRecompress(
 
 	for baseIter.toFileStart(); baseIter.ent() == baseEnt; baseIter.next(1) {
 		baseDigest := baseIter.digest()
-		baseLoc, basePresent := set.s.digestPresent(tx, baseDigest)
+		baseLoc, basePresent := set.s.digestPresent(tx, baseDigest, false)
 		if baseLoc.Addr == 0 {
 			retErr = errors.New("digest in entry of base digest is not mapped")
 			return
@@ -1572,7 +1572,7 @@ func (set *opSet) buildRecompress(
 
 	for reqIter.toFileStart(); reqIter.ent() == reqEnt; reqIter.next(1) {
 		reqDigest := reqIter.digest()
-		reqLoc := set.s.digestLoc(tx, reqDigest)
+		reqLoc := set.s.digestLoc(tx, reqDigest, false)
 		if reqLoc.Addr == 0 {
 			retErr = errors.New("digest in entry of req digest is not mapped")
 			return

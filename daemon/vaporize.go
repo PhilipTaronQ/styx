@@ -363,7 +363,7 @@ func (s *Server) preallocateBatch(ctx context.Context, blocks []uint16, digests 
 	out := make([]erofs.SlabLoc, n)
 	wasAllocated := make([]bool, n)
 	err := s.db.Update(func(tx *bbolt.Tx) error {
-		cb, slabroot := tx.Bucket(chunkBucket), tx.Bucket(slabBucket)
+		cb, slabroot := chunkBucketFor(tx, forManifest), tx.Bucket(slabBucket)
 		var slabId uint16 = 0
 		if forManifest {
 			slabId = manifestSlabOffset
@@ -414,7 +414,7 @@ func (s *Server) commitPreallocated(ctx context.Context, blocks []uint16, digest
 		return errors.New("mismatched lengths")
 	}
 	return s.db.Update(func(tx *bbolt.Tx) error {
-		cb, slabroot := tx.Bucket(chunkBucket), tx.Bucket(slabBucket)
+		cb, slabroot := chunkBucketFor(tx, forManifest), tx.Bucket(slabBucket)
 		var slabId uint16 = 0
 		if forManifest {
 			slabId = manifestSlabOffset
