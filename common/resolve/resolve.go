@@ -148,7 +148,7 @@ func ResolveUrl(ctx context.Context, input string) (Result, error) {
 		}
 
 		// pass through again to check that it's idempotent
-		res2, err := resolveWithHander(nil, h, res.Url, true)
+		res2, err := resolveWithHander(ctx, h, res.Url, true)
 		if err != nil {
 			return Result{}, fmt.Errorf("using %s url pattern: reresolve: %w", h.name, err)
 		} else if res2 != res {
