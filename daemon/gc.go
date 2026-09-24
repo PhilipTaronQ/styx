@@ -43,8 +43,15 @@ type (
 
 	// gcGuard tracks what in-progress operations need gc to leave alone.
 	gcGuard struct {
-		mu    sync.Mutex
-		holds map[string]int // sph string -> number of operations using it
+		mu       sync.Mutex
+		holds    map[string]int         // sph string -> number of operations using it
+		reserved map[slabRange]struct{} // slab space allocated without slab keys yet
+	}
+
+	// blocks [start, end) of a slab
+	slabRange struct {
+		slabId     uint16
+		start, end uint32
 	}
 
 	rewriteChunk struct {
@@ -104,6 +111,7 @@ func (s *Server) handleGcReq(ctx context.Context, r *GcReq) (*GcResp, error) {
 			g.keepSphps[sphp] = struct{}{}
 		}
 	}
+	reserved := s.gcReserved()
 
 	// use image bucket as roots
 	ibcur := g.ib.Cursor()
@@ -241,6 +249,7 @@ func (s *Server) handleGcReq(ctx context.Context, r *GcReq) (*GcResp, error) {
 		} else if end = addrFromKey(k); end&presentMask != 0 {
 			end = common.TruncU32(lsb.Sequence()) // also end of slab
 		}
+		end = clampToReserved(reserved, l, end)
 		// we're looking at locs in order, so if we're deleting two consecutive chunks,
 		// the first one should find the largest range to punch. if we found the same end we
 		// can ignore it.
@@ -448,6 +457,46 @@ func (s *Server) gcHolds() []string {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return slices.Collect(maps.Keys(g.holds))
+}
+
+// reserveForGc keeps gc from punching the given slab ranges until the returned function is
+// called. Call it inside the transaction that allocates them.
+func (s *Server) reserveForGc(ranges []slabRange) func() {
+	g := &s.gcGuard
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.reserved == nil {
+		g.reserved = make(map[slabRange]struct{})
+	}
+	ranges = slices.DeleteFunc(ranges, func(r slabRange) bool { return r.start >= r.end })
+	for _, r := range ranges {
+		g.reserved[r] = struct{}{}
+	}
+	return func() {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		for _, r := range ranges {
+			delete(g.reserved, r)
+		}
+	}
+}
+
+func (s *Server) gcReserved() []slabRange {
+	g := &s.gcGuard
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return slices.Collect(maps.Keys(g.reserved))
+}
+
+// A punch runs from a deleted chunk to the next slab key, or the end of the slab. Reserved
+// space has no keys yet, so stop at it.
+func clampToReserved(reserved []slabRange, l erofs.SlabLoc, end uint32) uint32 {
+	for _, r := range reserved {
+		if r.slabId == l.SlabId && r.start > l.Addr && r.start < end {
+			end = r.start
+		}
+	}
+	return end
 }
 
 func (g *gcCtx) anyHeld(sphps []SphPrefix) bool {

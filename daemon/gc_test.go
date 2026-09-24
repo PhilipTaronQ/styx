@@ -289,3 +289,51 @@ func TestGcKeepsHeldImage(t *testing.T) {
 	require.Equal(t, 1, res.DeleteImages)
 	require.False(t, gcTestHasChunk(t, s, d))
 }
+
+// vaporize reserves slab space in one transaction and links chunks to it in a later one,
+// and writes its image and manifest only at the end. gc used to punch the reservation as
+// part of the garbage chunk before it, and delete the chunks vaporize had committed.
+func TestGcDuringVaporizeKeepsItsSpace(t *testing.T) {
+	s := newGcTestServer(t)
+	initGcTestServer(t, s, "http://localhost:1")
+
+	// garbage at blocks 4-20: no image refers to it
+	garbageSph, _, err := ParseSph(gcTestSph('4'))
+	require.NoError(t, err)
+	dGarbage := gcTestDigest(4)
+	_, err = s.AllocateBatch(withAllocateCtx(context.Background(), garbageSph, false), []uint16{16}, []cdig.CDig{dGarbage})
+	require.NoError(t, err)
+
+	// a vaporize in progress: space reserved at 20-28 for one file, and a chunk of another
+	// file already committed after it, at 28-30
+	vapSph, vapSphStr, err := ParseSph(gcTestSph('5'))
+	require.NoError(t, err)
+	vapCtx := withAllocateCtx(context.Background(), vapSph, false)
+	unhold := s.holdForGc(vapSphStr)
+	defer unhold()
+	locs, _, unreserve, err := s.preallocateBatch(vapCtx, []uint16{8}, []cdig.CDig{gcTestDigest(50)})
+	require.NoError(t, err)
+	defer unreserve()
+	require.Equal(t, erofs.SlabLoc{SlabId: 0, Addr: 20}, locs[0])
+	dCommitted := gcTestDigest(51)
+	_, err = s.AllocateBatch(vapCtx, []uint16{2}, []cdig.CDig{dCommitted})
+	require.NoError(t, err)
+
+	res, err := s.handleGcReq(context.Background(), &GcReq{GcByState: gcDefault})
+	require.NoError(t, err)
+	require.Equal(t, 1, res.DeleteChunks)
+	require.False(t, gcTestHasChunk(t, s, dGarbage))
+	require.True(t, gcTestHasChunk(t, s, dCommitted), "gc deleted a chunk vaporize had committed")
+
+	// there's no slab fd here, so the punch is still pending in gcstate
+	var punches []locWithEnd
+	require.NoError(t, s.db.View(func(tx *bbolt.Tx) error {
+		cur := tx.Bucket(gcstateBucket).Cursor()
+		for k, _ := cur.First(); k != nil; k, _ = cur.Next() {
+			punches = append(punches, recFromPunchKey(k))
+		}
+		return nil
+	}))
+	require.Equal(t, []locWithEnd{{SlabLoc: erofs.SlabLoc{SlabId: 0, Addr: 4}, end: 20}}, punches,
+		"gc must punch the garbage chunk only, not the space reserved after it")
+}
