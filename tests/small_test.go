@@ -20,10 +20,13 @@ func TestSmallImage(t *testing.T) {
 	require.Zero(t, d1.Slabs[0].Stats.PresentBlocks)
 
 	require.Equal(t, "1rswindywkyq2jmfpxd6n772jii3z5xz6ypfbb63c17k5il39hfm", tb.nixHash(mp1))
-	time.Sleep(200 * time.Millisecond) // batch delay
-	d2 := tb.debug(daemon.DebugReq{IncludeSlabs: true})
-	require.NotZero(t, d2.Slabs[0].Stats.PresentChunks)
-	require.NotZero(t, d2.Slabs[0].Stats.PresentBlocks)
+	// present chunks are recorded in a bbolt batch (MaxBatchDelay 100ms), so
+	// poll rather than sleep: the commit can take much longer under -race.
+	var d2 *daemon.DebugResp
+	require.Eventually(t, func() bool {
+		d2 = tb.debug(daemon.DebugReq{IncludeSlabs: true})
+		return d2.Slabs[0].Stats.PresentChunks > 0 && d2.Slabs[0].Stats.PresentBlocks > 0
+	}, 10*time.Second, 50*time.Millisecond)
 
 	tb.dropCaches()
 
