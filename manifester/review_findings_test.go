@@ -554,3 +554,29 @@ func TestReviewFailedTarballBuildLeaksWriteNarGoroutine(t *testing.T) {
 	after := reviewWaitGoroutines(marker, before, 3*time.Second)
 	assert.LessOrEqual(t, after, before, "writeNar goroutine leaked after a failed tarball build")
 }
+
+// Tarball path depth is unbounded. A single entry at depth D creates D parent directories, and
+// sorting them with narPathLess costs O(D) per comparison, so a ~16KB path in a tiny tarball
+// costs seconds; a 1MiB PAX path (archive/tar's limit) keeps a Lambda busy until its timeout.
+func TestReviewTarballDeepPathIsSuperlinear(t *testing.T) {
+	const depth = 8000
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	name := strings.Repeat("a/", depth) + "f"
+	require.NoError(t, tw.WriteHeader(&tar.Header{Name: name, Typeflag: tar.TypeReg, Mode: 0o644, Size: 1}))
+	_, err := tw.Write([]byte("x"))
+	require.NoError(t, err)
+	require.NoError(t, tw.Close())
+
+	up := newReviewUpstream(t)
+	up.set("/deep.tar", buf.Bytes())
+	cs := &mockChunkStore{data: make(map[string][]byte)}
+	mb, err := NewManifestBuilder(ManifestBuilderConfig{}, cs)
+	require.NoError(t, err)
+
+	start := time.Now()
+	_, err = mb.BuildFromTarball(context.Background(), up.ts.URL+"/deep.tar", 0, 0, "", false)
+	elapsed := time.Since(start)
+	t.Logf("tarball of %d bytes (path depth %d): err=%v in %s", buf.Len(), depth, err, elapsed)
+	assert.Less(t, elapsed, time.Second, "a %d byte tarball took %s to process", buf.Len(), elapsed)
+}
