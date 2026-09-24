@@ -733,7 +733,7 @@ func (s *Server) getDigestsFromImage(tx *bbolt.Tx, sph Sph, isManifest bool) ([]
 			return nil, err
 		}
 		cshift := entry.ChunkShiftDef()
-		data, err = s.readChunks(nil, tx, entry.Size, cshift, locs, nil, nil, false)
+		data, err = s.readChunks(context.TODO(), tx, entry.Size, cshift, locs, nil, nil, false)
 		if err != nil {
 			return nil, err
 		}
@@ -767,7 +767,7 @@ func (s *Server) getManifestLocal(tx *bbolt.Tx, sphStr string) (*pb.Manifest, []
 			return nil, nil, err
 		}
 		cshift := entry.ChunkShiftDef()
-		data, err = s.readChunks(nil, tx, entry.Size, cshift, locs, nil, nil, false)
+		data, err = s.readChunks(context.TODO(), tx, entry.Size, cshift, locs, nil, nil, false)
 		if err != nil {
 			return nil, nil, err
 		}
