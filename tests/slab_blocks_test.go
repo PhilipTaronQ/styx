@@ -11,6 +11,8 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -131,6 +133,25 @@ func TestExactChunkMultipleVaporize(t *testing.T) {
 	dst := tb.materialize(name)
 	requireFileBytes(t, filepath.Join(dst, "a"), a)
 	requireFileBytes(t, filepath.Join(dst, "b"), b)
+}
+
+// Symlink targets of 4065 to 4095 bytes used to panic the image builder.
+func TestLongSymlink(t *testing.T) {
+	tb := newTestBase(t)
+	links := make(map[string]string)
+	for _, n := range []int{100, 4064, 4065, 4095} {
+		links["link"+strconv.Itoa(n)] = strings.Repeat("t", n-1) + "!"
+	}
+	url := tb.serveExtraTarball("longlink.tar", map[string][]byte{"f": []byte("hello")}, links)
+	tb.startAll()
+
+	_, mp := tb.mountExtraTarball(url)
+	for name, target := range links {
+		got, err := os.Readlink(filepath.Join(mp, name))
+		require.NoError(t, err)
+		require.Equal(t, target, got, "target of %s (%d bytes)", name, len(target))
+	}
+	requireFileBytes(t, filepath.Join(mp, "f"), []byte("hello"))
 }
 
 // A database written with the old allocation, where two chunks of an image share an address,

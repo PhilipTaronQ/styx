@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -80,4 +81,32 @@ func TestBuildExactMultipleChunkGetsBlocks(t *testing.T) {
 		require.Equal(t, want, a.blocks, "chunk %d: reserved %d blocks at %d, erofs will read %d", i, a.blocks, a.addr, want)
 	}
 	require.NotEqual(t, sm.allocs[0].addr, sm.allocs[1].addr, "two different chunks were given the same slab address")
+}
+
+// Symlink targets up to 4095 bytes are valid in a nar (go-nix pathLenMax). The ones too long
+// to share a block with their inode go in a block of their own.
+func TestBuildLongSymlink(t *testing.T) {
+	for _, n := range []int{4064, 4065, 4095} {
+		target := strings.Repeat("x", n-1) + "y"
+		m := &pb.Manifest{Entries: []*pb.Entry{
+			{Path: "/", Type: pb.EntryType_DIRECTORY},
+			{Path: "/link", Type: pb.EntryType_SYMLINK, InlineData: []byte(target)},
+			{Path: "/z", Type: pb.EntryType_SYMLINK, InlineData: []byte("target")},
+		}}
+		image, err := buildNoPanic(m, &bumpSlab{})
+		require.NoError(t, err, "symlink target of %d bytes", n)
+		off := bytes.Index(image, []byte(target))
+		require.GreaterOrEqual(t, off, 0, "symlink target of %d bytes not in image", n)
+		if n > 4064 {
+			require.Zero(t, off%4096, "symlink target of %d bytes should start a block", n)
+		}
+		require.Zero(t, len(image)%4096)
+	}
+
+	m := &pb.Manifest{Entries: []*pb.Entry{
+		{Path: "/", Type: pb.EntryType_DIRECTORY},
+		{Path: "/link", Type: pb.EntryType_SYMLINK, InlineData: []byte(strings.Repeat("x", 4096))},
+	}}
+	_, err := buildNoPanic(m, &bumpSlab{})
+	require.ErrorContains(t, err, "symlink target too long")
 }

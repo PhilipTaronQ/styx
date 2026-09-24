@@ -28,6 +28,10 @@ import (
 
 const (
 	BarePath = "/___bare___"
+
+	// longest symlink target the kernel can read back (PATH_MAX without the NUL), which is
+	// also the longest a nar can hold
+	maxSymlinkLen = 4095
 )
 
 // larger block sizes don't seem to work with erofs yet
@@ -277,8 +281,15 @@ func (b *Builder) BuildFromManifestWithSlab(
 		case pb.EntryType_SYMLINK:
 			fstype = EROFS_FT_SYMLINK
 			i.i.IMode = unix.S_IFLNK | 0777
-			i.i.ISize = common.TruncU32(len(e.InlineData))
-			i.taildata = e.InlineData
+			if n := int64(len(e.InlineData)); n > maxSymlinkLen {
+				return fmt.Errorf("%q: symlink target too long", e.Path)
+			} else if n == 0 || allowedTail(n) {
+				i.i.ISize = common.TruncU32(n)
+				i.taildata = e.InlineData
+			} else {
+				// too long to share a block with the inode, give it its own block
+				setDataOnInode(i, e.InlineData)
+			}
 
 		default:
 			return errors.New("unknown type")
