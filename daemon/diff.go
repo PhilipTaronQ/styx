@@ -156,14 +156,18 @@ func (s *Server) requestChunk(ctx context.Context, loc erofs.SlabLoc, digest cdi
 		// force single op
 	} else {
 		set := newOpSet(s)
-		err := s.db.View(func(tx *bbolt.Tx) error {
-			return set.buildDiff(tx, digest, sphps, true)
+		err := s.db.View(func(tx *bbolt.Tx) (err error) {
+			// If we already have it (another read of it was handled after the op that wrote it
+			// finished, or its present record outlived its data), don't build ops for its
+			// neighbours, just read it again directly.
+			if !s.locPresent(tx, loc) {
+				op, err = set.build(tx, loc, digest, sphps, true)
+			}
+			return
 		})
 		if err != nil {
 			log.Printf("buildDiff failed: %v", err)
-		} else if op = s.diffMap[loc]; op == nil {
-			log.Print("buildDiff did not include requested chunk") // shouldn't happen
-		} else {
+		} else if op != nil {
 			// TODO: if set is a single op, with a single req and no base, change to single
 
 			// note that op is left as diffMap[loc] to wait on
@@ -278,15 +282,12 @@ func (s *Server) buildAndStartPrefetch(ctx context.Context, reqs []cdig.CDig) ([
 		}
 		set := newOpSet(s)
 		set.maxOpSize = MaxOpSize // use larger ops immediately
-		err := set.buildDiff(tx, req, sphps, false)
+		op, err := set.build(tx, l, req, sphps, false)
 		if err != nil {
 			return nil, err
-		} else if op := s.diffMap[l]; op == nil {
-			return nil, errors.New("buildDiff did not include requested chunk")
-		} else {
-			have[op] = struct{}{}
-			allOps = append(allOps, op)
 		}
+		have[op] = struct{}{}
+		allOps = append(allOps, op)
 		for _, startOp := range set.ops {
 			go s.startDiffOp(ctx, startOp)
 		}
@@ -437,13 +438,7 @@ func (s *Server) startDiffOp(ctx context.Context, op *diffOp) {
 
 		// clear references to this op from the map
 		s.diffLock.Lock()
-		for _, sop := range op.sops {
-			for _, i := range sop.reqInfo {
-				if s.diffMap[i.loc] == reqOp(op) {
-					delete(s.diffMap, i.loc)
-				}
-			}
-		}
+		s.unregisterDiffOp(op)
 		// update recentRead timers
 		for _, rr := range op.rrs[:] {
 			if rr != nil {
@@ -464,6 +459,17 @@ func (s *Server) startDiffOp(ctx context.Context, op *diffOp) {
 	if op.err = s.diffSem.Acquire(ctx, 1); op.err == nil {
 		defer s.diffSem.Release(1)
 		op.err = s.doDiffOp(ctx, op)
+	}
+}
+
+// unregisterDiffOp removes op's entries from diffMap. call with diffLock held
+func (s *Server) unregisterDiffOp(op *diffOp) {
+	for _, sop := range op.sops {
+		for _, i := range sop.reqInfo {
+			if s.diffMap[i.loc] == reqOp(op) {
+				delete(s.diffMap, i.loc)
+			}
+		}
 	}
 }
 
@@ -1230,6 +1236,32 @@ func (set *opSet) subOpFits(sop subOp) bool {
 		(set.op.baseTotalSize+sop.baseSize) <= MaxOpBytes &&
 		int(set.op.reqTotalChunks)+len(sop.reqInfo) <= set.maxOpSize &&
 		(set.op.reqTotalSize+sop.reqSize) <= MaxOpBytes
+}
+
+// build runs buildDiff and returns the op that will fetch the chunk at loc. If that fails,
+// it unregisters every op it added to diffMap, since nothing will start them and anyone
+// waiting on one would wait forever.
+// call with diffLock held
+func (set *opSet) build(
+	tx *bbolt.Tx,
+	loc erofs.SlabLoc,
+	targetDigest cdig.CDig,
+	sphps []SphPrefix,
+	useRR bool,
+) (op reqOp, err error) {
+	defer func() {
+		if err != nil {
+			for _, op := range set.ops {
+				set.s.unregisterDiffOp(op)
+			}
+		}
+	}()
+	if err = set.buildDiff(tx, targetDigest, sphps, useRR); err != nil {
+		return nil, err
+	} else if op = set.s.diffMap[loc]; op == nil {
+		return nil, errors.New("buildDiff did not include requested chunk") // shouldn't happen
+	}
+	return op, nil
 }
 
 // call with diffLock held
