@@ -267,7 +267,7 @@ func (b *ManifestBuilder) BuildFromTarball(
 			broot.Manifest = append(broot.Manifest, etagCacheKey)
 		}
 		if brdata, err := proto.Marshal(broot); err == nil {
-			brkey := strings.Join([]string{"manifest", btime.Format(time.RFC3339), "m", "m"}, "@")
+			brkey := buildRootKey(btime, cacheKey)
 			if _, err = b.cs.PutIfNotExists(ctx, BuildRootPath, brkey, brdata); err != nil {
 				return nil, fmt.Errorf("%w: build root write error: %w", ErrInternal, err)
 			}

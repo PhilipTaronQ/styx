@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"crypto/rand"
 	_ "crypto/sha1" // for narinfo NarHash
 	"crypto/sha256"
 	_ "crypto/sha512" // for narinfo NarHash
@@ -427,7 +428,7 @@ func (b *ManifestBuilder) BuildFromNar(
 			Manifest: []string{cacheKey},
 		}
 		if brdata, err := proto.Marshal(broot); err == nil {
-			brkey := strings.Join([]string{"manifest", btime.Format(time.RFC3339), "m", "m"}, "@")
+			brkey := buildRootKey(btime, cacheKey)
 			if _, err = b.cs.PutIfNotExists(ctx, BuildRootPath, brkey, brdata); err != nil {
 				return nil, fmt.Errorf("%w: build root write error: %w", ErrInternal, err)
 			}
@@ -442,6 +443,13 @@ func (b *ManifestBuilder) BuildFromNar(
 		Sph:      storePathHash,
 		Bytes:    cmpSb,
 	}, nil
+}
+
+// buildRootKey returns a new key for the build root of an on-demand manifest. ci/gc.go reads
+// the build time from the second field. The cache key and a random suffix keep manifests
+// built in the same second from sharing a key (only the first would get a root).
+func buildRootKey(btime time.Time, cacheKey string) string {
+	return strings.Join([]string{"manifest", btime.Format(time.RFC3339), cacheKey, rand.Text()}, "@")
 }
 
 // narinfoFingerprint is ni.Fingerprint(), which builds the reference list with repeated
