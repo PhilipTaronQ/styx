@@ -785,6 +785,21 @@ func (s *Server) restoreMounts() {
 		return nil
 	})
 	for _, img := range toRestore {
+		if _, err := os.Lstat(img.MountPoint); errors.Is(err, os.ErrNotExist) {
+			// nix deleted the store path (e.g. GC while it wasn't mounted),
+			// so don't bring it back.
+			log.Print("restoring: ", img.StorePath, " mount point ", img.MountPoint, " is gone, marking unmounted")
+			_, sphStr, _ := ParseSph(img.StorePath)
+			_ = s.imageTx(sphStr, func(cur *pb.DbImage) error {
+				if cur.MountState != pb.MountState_Mounted || cur.MountPoint != img.MountPoint {
+					return errors.New("rollback")
+				}
+				cur.MountState = pb.MountState_Unmounted
+				cur.MountPoint = ""
+				return nil
+			})
+			continue
+		}
 		if mounted, err := isErofsMount(img.MountPoint); err == nil && mounted {
 			// log.Print("restoring: ", img.StorePath, " already mounted on ", img.MountPoint)
 			continue
