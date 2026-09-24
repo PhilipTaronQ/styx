@@ -139,6 +139,31 @@ jobs:
       - name: nix-build
         run: nix-build --no-out-link $(printf -- '-A %s ' ${{ matrix.attrs }})
 
+  # Nix with the styx patch, which the NixOS module installs as nix.package.
+  patched-nix:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    name: patched-nix (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
+      - uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-patched-${{ runner.arch }}-${{ hashFiles('default.nix', 'patches/**', 'Pins.json') }}
+          restore-prefixes-first-match: nix-patched-${{ runner.arch }}-
+      - name: nix-build patchedNix
+        run: nix-build -o patched-nix -A patchedNix
+      - name: styx settings are registered
+        run: |
+          ./patched-nix/bin/nix --version
+          for s in styx-substituters styx-min-size styx-ondemand styx-materialize styx-exclude styx-sock-path; do
+            printf '%s = ' "$s"; ./patched-nix/bin/nix --extra-experimental-features nix-command config show "$s"
+          done
+
   # The full privileged test suite on the host kernel, plain and instrumented.
   # Don't make the race detector halt on error here: the daemon runs in the
   # test process, and exiting while threads wait on its cachefiles reads hangs.
