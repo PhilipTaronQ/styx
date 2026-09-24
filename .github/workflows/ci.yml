@@ -243,17 +243,6 @@ jobs:
       - name: Run test suite
         working-directory: styxtest/bin
         run: |
-          set -o pipefail
           sudo env PATH="$GITHUB_WORKSPACE/tools/bin:$PATH" \
             ASAN_OPTIONS="detect_leaks=1" \
-            ./styxtest -test.v -test.timeout 30m -test.shuffle=on -test.count=2 \
-            2>&1 | tee "$RUNNER_TEMP/suite.log"
-      # The end-of-test checks log violations caused by known, unfixed bugs as
-      # warnings rather than failing (see tests/invariants_test.go); count them.
-      - name: Known-bug warnings
-        if: ${{ !cancelled() }}
-        run: |
-          grep -o '(known bug: [^)]*)' "$RUNNER_TEMP/suite.log" | sort | uniq -c |
-            while read -r n what; do
-              echo "::warning title=suite (${{ matrix.variant }})::$n warnings $what"
-            done
+            ./styxtest -test.v -test.timeout 30m -test.shuffle=on -test.count=2

@@ -37,11 +37,7 @@ func (tb *testBase) collect() {
 
 	var gc daemon.GcResp
 	if err := tb.tryCall(daemon.GcPath, daemon.GcReq{GcByState: gcUnmounted}, &gc); err != nil {
-		if strings.Contains(err.Error(), "manifest") && strings.Contains(err.Error(), "not found") {
-			t.Logf("collect warning: (known bug: %s) default gc failed: %v", bugFailedMount, err)
-		} else {
-			t.Errorf("collect: default gc failed: %v", err)
-		}
+		t.Errorf("collect: default gc failed: %v", err)
 		return
 	}
 	t.Logf("collect: gc: %+v", gc)

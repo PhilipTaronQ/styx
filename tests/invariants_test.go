@@ -40,22 +40,6 @@ const (
 	invMaxReports     = 40
 )
 
-// Checks that fail today because of known bugs are reported as warnings, each
-// tagged with one of these. Once a bug's fix has merged, delete its constant
-// and turn its known() calls into bad().
-const (
-	// TODO: promote to an error when gc prunes catalogf. gc.go builds the
-	// catalogf keys with ParseSph, which returns the hash where the code
-	// expects the name, so forward entries are never deleted.
-	bugCatalogfPrune = "gc never prunes catalogf"
-	// TODO: promote to an error when a batched present write can no longer
-	// land after gc deleted the chunk (gotNewChunk vs. gc, daemon/diff.go).
-	bugPresentReadd = "present marker re-added after gc"
-	// TODO: promote to an error when a failed mount records MountError and gc
-	// skips images with no manifest (tryMount returns before the imageTx).
-	bugFailedMount = "failed mount leaves an image with no manifest"
-)
-
 type invLoc struct {
 	slab uint16
 	addr uint32
@@ -109,8 +93,7 @@ func (tb *testBase) invSlabFile(files map[uint16]*os.File, id uint16) *os.File {
 }
 
 // checkInvariants opens styx.bolt read-only and checks that the buckets agree
-// with each other and with the slab files. Violations are test errors, except
-// those caused by a known bug, which are logged as warnings (see bugCatalogfPrune).
+// with each other and with the slab files. Violations are test errors.
 func (tb *testBase) checkInvariants() {
 	t := tb.t
 	dbPath := filepath.Join(tb.cachedir, "styx.bolt")
@@ -124,11 +107,8 @@ func (tb *testBase) checkInvariants() {
 	}
 	defer db.Close()
 
-	var errs, warns []string
+	var errs []string
 	bad := func(format string, a ...any) { errs = append(errs, fmt.Sprintf(format, a...)) }
-	known := func(bug, format string, a ...any) {
-		warns = append(warns, fmt.Sprintf("(known bug: %s) ", bug)+fmt.Sprintf(format, a...))
-	}
 
 	files := make(map[uint16]*os.File)
 	defer func() {
@@ -247,7 +227,7 @@ func (tb *testBase) checkInvariants() {
 				addr := binary.BigEndian.Uint32(k)
 				if addr&invPresentMask != 0 {
 					if !invHas(sb, invAddrKey(addr&^invPresentMask)) {
-						known(bugPresentReadd, "slab %d: present marker for addr %d, which holds no chunk", id, addr&^invPresentMask)
+						bad("slab %d: present marker for addr %d, which holds no chunk", id, addr&^invPresentMask)
 					}
 					continue
 				}
@@ -289,9 +269,13 @@ func (tb *testBase) checkInvariants() {
 			if mv == nil {
 				switch {
 				case !kept:
-				case img.MountState == pb.MountState_Requested || img.MountState == pb.MountState_MountError:
-					known(bugFailedMount, "image %s (%s, %s) has no manifest; gc keeps %s images and fails on them",
-						sphStr, img.StorePath, img.MountState, img.MountState)
+				case img.MountState == pb.MountState_MountError || img.MountState == pb.MountState_Unknown:
+					// a mount that failed before it had the manifest; gc keeps the record
+				case img.MountState == pb.MountState_Requested:
+					// the daemon has stopped, so no mount is in progress: a mount that
+					// fails records MountError
+					bad("image %s (%s) is still Requested with no manifest after the daemon stopped",
+						sphStr, img.StorePath)
 				default:
 					bad("image %s (%s, %s) has no manifest; gc keeps %s images and needs their manifests",
 						sphStr, img.StorePath, img.MountState, img.MountState)
@@ -386,7 +370,7 @@ func (tb *testBase) checkInvariants() {
 			switch {
 			case rv == nil && noImage:
 				// gc deleted the image and its catalogr entry but not this
-				known(bugCatalogfPrune, "catalogf %q -> %s outlived its image and catalogr entry", name, isph.String())
+				bad("catalogf %q -> %s outlived its image and catalogr entry", name, isph.String())
 			case !bytes.Equal(rv, name):
 				bad("catalogf %q: catalogr has %q", name, rv)
 			case noImage:
@@ -409,13 +393,6 @@ func (tb *testBase) checkInvariants() {
 		return nil
 	})
 
-	for i, w := range warns {
-		if i == invMaxReports {
-			t.Logf("invariant warning: ... %d more", len(warns)-i)
-			break
-		}
-		t.Log("invariant warning:", w)
-	}
 	for i, e := range errs {
 		if i == invMaxReports {
 			t.Errorf("invariant violated: ... %d more", len(errs)-i)
