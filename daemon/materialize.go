@@ -113,7 +113,8 @@ func (s *Server) handleMaterializeReq(ctx context.Context, r *MaterializeReq) (*
 		}
 	}
 
-	// copy to dest
+	// copy to dest. stop if the client gives up: it may fall back to writing
+	// the same destination itself.
 	err = s.materialize(ctx, r.DestPath, m)
 	if err != nil {
 		return nil, err
@@ -188,6 +189,9 @@ func (s *Server) materialize(ctx context.Context, dest string, m *pb.Manifest) e
 		}
 
 		eg.Go(func() error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			switch ent.Type {
 			case pb.EntryType_DIRECTORY:
 				return nil // done above
@@ -248,6 +252,11 @@ tryAgain:
 	cshift := ent.ChunkShiftDef()
 	roundedUp := false
 	for i, dig := range digs {
+		// check between chunks too, so a large file stops within one chunk
+		// (at most 1<<shift.MaxChunkShift bytes) of the client giving up.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		loc := locs[dig]
 		size := cshift.FileChunkSize(ent.Size, i == len(digs)-1)
 		// The chunk is recorded present, but its data can still be missing: lost in a crash,

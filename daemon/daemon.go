@@ -675,10 +675,14 @@ func (s *Server) handleMountReq(ctx context.Context, r *MountReq) (*Status, erro
 	}
 	defer done()
 
+	// the record can still say mounted after the mount went away without us
+	// (unmounted by someone else, or not restored yet). then mount it again.
+	kernelMounted, _ := isErofsMount(r.MountPoint)
+
 	var haveImageSize int64
 	var haveIsBare bool
 	err = s.imageTx(sphStr, func(img *pb.DbImage) error {
-		if img.MountState == pb.MountState_Mounted {
+		if img.MountState == pb.MountState_Mounted && (kernelMounted || img.MountPoint != r.MountPoint) {
 			if img.MountPoint == r.MountPoint {
 				// nix thinks it's not mounted but it is. return success so nix can enter in db.
 				return errAlreadyMounted
@@ -906,6 +910,21 @@ func (s *Server) restoreMounts() {
 		return nil
 	})
 	for _, img := range toRestore {
+		if _, err := os.Lstat(img.MountPoint); errors.Is(err, os.ErrNotExist) {
+			// nix deleted the store path (e.g. GC while it wasn't mounted),
+			// so don't bring it back.
+			log.Print("restoring: ", img.StorePath, " mount point ", img.MountPoint, " is gone, marking unmounted")
+			_, sphStr, _ := ParseSph(img.StorePath)
+			_ = s.imageTx(sphStr, func(cur *pb.DbImage) error {
+				if cur.MountState != pb.MountState_Mounted || cur.MountPoint != img.MountPoint {
+					return errors.New("rollback")
+				}
+				cur.MountState = pb.MountState_Unmounted
+				cur.MountPoint = ""
+				return nil
+			})
+			continue
+		}
 		if mounted, err := isErofsMount(img.MountPoint); err == nil && mounted {
 			// log.Print("restoring: ", img.StorePath, " already mounted on ", img.MountPoint)
 			continue
