@@ -16,9 +16,9 @@ import (
 	"github.com/dnr/styx/common/resolve"
 	"github.com/dnr/styx/manifester"
 	"github.com/dnr/styx/pb"
-	"github.com/nix-community/go-nix/pkg/hash"
 	"github.com/nix-community/go-nix/pkg/narinfo"
 	"github.com/nix-community/go-nix/pkg/nixbase32"
+	"github.com/nix-community/go-nix/pkg/nixhash"
 	"go.etcd.io/bbolt"
 	"google.golang.org/protobuf/proto"
 )
@@ -155,11 +155,11 @@ func (s *Server) handleTarballReq(ctx context.Context, r *TarballReq) (*TarballR
 		return nil, fmt.Errorf("entry missing inline manifest metadata")
 	}
 
-	fh, err := hash.ParseNixBase32(nipb.FileHash)
+	fh, err := nixhash.ParseAny(nipb.FileHash, nil)
 	if err != nil {
 		return nil, err
 	}
-	nh, err := hash.ParseNixBase32(nipb.NarHash)
+	nh, err := nixhash.ParseAny(nipb.NarHash, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -173,7 +173,7 @@ func (s *Server) handleTarballReq(ctx context.Context, r *TarballReq) (*TarballR
 		NarHash:     nh,
 		NarSize:     uint64(nipb.NarSize),
 		// needed to make nix treat it as CA so doesn't it require a signature
-		CA: "fixed:r:" + nh.NixString(),
+		CA: "fixed:r:" + nh.Format(nixhash.NixBase32, true),
 	}
 
 	sph := nipb.StorePath[11:43]
@@ -199,6 +199,6 @@ func (s *Server) handleTarballReq(ctx context.Context, r *TarballReq) (*TarballR
 		StorePathHash: sph,
 		StorePathName: nipb.StorePath[44:],
 		NarHash:       hex.EncodeToString(nh.Digest()),
-		NarHashAlgo:   nh.HashTypeString(),
+		NarHashAlgo:   nh.Algo().String(),
 	}, nil
 }
