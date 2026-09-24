@@ -4,7 +4,9 @@ package daemon
 // devnode is one end of a SOCK_SEQPACKET socketpair, so on-demand features look enabled.
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -20,6 +22,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"github.com/dnr/styx/common/cdig"
+	"github.com/dnr/styx/erofs"
 	"github.com/dnr/styx/pb"
 )
 
@@ -77,6 +80,58 @@ func gcTestDevnode(t *testing.T, s *Server) {
 	require.NoError(t, unix.SetNonblock(fds[0], true))
 	t.Cleanup(func() { unix.Close(fds[0]); unix.Close(fds[1]) })
 	s.devnode.Store(int32(fds[0]))
+}
+
+func gcTestDigest(b byte) cdig.CDig {
+	var d cdig.CDig
+	d[0], d[1] = b, 0xcd
+	return d
+}
+
+// Records an image in state st whose inline manifest has one file made of digs, and
+// allocates its chunks and catalog entries, as getManifestAndBuildImage does.
+func gcTestImage(t *testing.T, s *Server, c byte, name string, st pb.MountState, digs ...cdig.CDig) []erofs.SlabLoc {
+	t.Helper()
+	sp := gcTestStorePath(c, name)
+	sph, sphStr, spName, err := ParseSphAndName(sp)
+	require.NoError(t, err)
+	mdata, err := proto.Marshal(&pb.Manifest{Entries: []*pb.Entry{{
+		Path:    "/",
+		Type:    pb.EntryType_REGULAR,
+		Size:    int64(len(digs)) << 16,
+		Digests: cdig.ToSliceAlias(digs),
+	}}})
+	require.NoError(t, err)
+	env, err := proto.Marshal(&pb.SignedMessage{Msg: &pb.Entry{InlineData: mdata}})
+	require.NoError(t, err)
+	img, err := proto.Marshal(&pb.DbImage{StorePath: sp, MountState: st})
+	require.NoError(t, err)
+
+	blocks := make([]uint16, len(digs))
+	for i := range blocks {
+		blocks[i] = 16
+	}
+	locs, err := s.AllocateBatch(withAllocateCtx(context.Background(), sph, false), blocks, digs)
+	require.NoError(t, err)
+	require.NoError(t, s.db.Update(func(tx *bbolt.Tx) error {
+		return errors.Join(
+			tx.Bucket(manifestBucket).Put([]byte(sphStr), env),
+			tx.Bucket(imageBucket).Put([]byte(sphStr), img),
+			tx.Bucket(catalogFBucket).Put(bytes.Join([][]byte{[]byte(spName), {0}, sph[:]}, nil), []byte{}),
+			tx.Bucket(catalogRBucket).Put(sph[:], []byte(spName)),
+		)
+	}))
+	return locs
+}
+
+func gcTestHasChunk(t *testing.T, s *Server, d cdig.CDig) bool {
+	t.Helper()
+	var have bool
+	require.NoError(t, s.db.View(func(tx *bbolt.Tx) error {
+		have = tx.Bucket(chunkBucket).Get(d[:]) != nil
+		return nil
+	}))
+	return have
 }
 
 func gcTestGetImage(t *testing.T, s *Server, sphStr string) *pb.DbImage {
@@ -180,4 +235,57 @@ func TestRejectedConcurrentMountKeepsRecord(t *testing.T) {
 	require.NotNil(t, img)
 	require.Equal(t, mp1, img.MountPoint, "a rejected concurrent mount replaced the mount point of the one in progress")
 	require.Equal(t, pb.MountState_Requested, img.MountState)
+}
+
+// `styx gc --error_states` puts Requested in GcByState, and gc used to delete the record
+// of a mount that was still fetching its manifest.
+func TestGcErrorStatesKeepsMountInProgress(t *testing.T) {
+	url, entered, release := gcTestBlockingServer(t)
+	s := newGcTestServer(t)
+	initGcTestServer(t, s, url)
+	gcTestDevnode(t, s)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.handleMountReq(context.Background(), &MountReq{
+			Upstream:   url,
+			StorePath:  gcTestStorePath('2', "pkg-1.0"),
+			MountPoint: filepath.Join(t.TempDir(), "mp"),
+		})
+		done <- err
+	}()
+	gcTestWaitEntered(t, entered)
+
+	allStates := make(map[pb.MountState]bool)
+	for st := range pb.MountState_name {
+		allStates[pb.MountState(st)] = true
+	}
+	res, err := s.handleGcReq(context.Background(), &GcReq{GcByState: allStates})
+	require.NoError(t, err)
+	require.Zero(t, res.DeleteImages, "gc deleted the image of a mount in progress")
+	require.NotNil(t, gcTestGetImage(t, s, gcTestSph('2')))
+
+	release()
+	<-done
+}
+
+// materialize leaves an Unmounted or Materialized image in its state while it copies the
+// image's chunks, so gc must keep an image that is held.
+func TestGcKeepsHeldImage(t *testing.T) {
+	s := newGcTestServer(t)
+	initGcTestServer(t, s, "http://localhost:1")
+	d := gcTestDigest(3)
+	gcTestImage(t, s, '3', "pkg-1.0", pb.MountState_Unmounted, d)
+
+	release := s.holdForGc(gcTestSph('3'))
+	res, err := s.handleGcReq(context.Background(), &GcReq{GcByState: gcDefault})
+	require.NoError(t, err)
+	require.Zero(t, res.DeleteImages, "gc deleted a held image")
+	require.True(t, gcTestHasChunk(t, s, d), "gc deleted a chunk of a held image")
+
+	release()
+	res, err = s.handleGcReq(context.Background(), &GcReq{GcByState: gcDefault})
+	require.NoError(t, err)
+	require.Equal(t, 1, res.DeleteImages)
+	require.False(t, gcTestHasChunk(t, s, d))
 }

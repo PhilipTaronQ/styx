@@ -87,6 +87,9 @@ type (
 		// connect context for mount request to cachefiles request
 		mountCtxMap common.SimpleSyncMap[string, context.Context]
 
+		// what gc must leave alone for operations in progress
+		gcGuard gcGuard
+
 		// keeps track of pending diff/fetch state
 		// note: we open a read-only transaction inside of diffLock.
 		// therefore we must not try to lock diffLock while in a read or write tx.
@@ -633,14 +636,19 @@ func (s *Server) handleMountReq(ctx context.Context, r *MountReq) (*Status, erro
 	return nil, s.tryMount(ctx, r, haveImageSize, haveIsBare)
 }
 
-// startMount claims the in-progress mount of sphStr. The returned context carries the
-// mountContext that handleOpenImage reads; pass it to tryMount, and call done when finished.
+// startMount claims the in-progress mount of sphStr and keeps gc away from it. The returned
+// context carries the mountContext that handleOpenImage reads; pass it to tryMount, and call
+// done when finished.
 func (s *Server) startMount(ctx context.Context, sphStr string) (context.Context, func(), error) {
 	ctx = withMountContext(ctx, &mountContext{})
 	if _, ok := s.mountCtxMap.GetOrPut(sphStr, ctx); ok {
 		return nil, nil, errors.New("another mount is in progress for this store path")
 	}
-	return ctx, func() { s.mountCtxMap.Delete(sphStr) }, nil
+	release := s.holdForGc(sphStr)
+	return ctx, func() {
+		release()
+		s.mountCtxMap.Delete(sphStr)
+	}, nil
 }
 
 // tryMount mounts req's image and records the result. ctx must come from startMount.

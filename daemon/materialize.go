@@ -45,6 +45,11 @@ func (s *Server) handleMaterializeReq(ctx context.Context, r *MaterializeReq) (*
 		return nil, err
 	}
 
+	// An Unmounted or Materialized image stays in that state while we copy it, so without
+	// this gc could delete its chunks and punch them mid-copy, and we'd copy the holes as
+	// zeros.
+	defer s.holdForGc(sphStr)()
+
 	common.NormalizeUpstream(&r.Upstream)
 
 	shouldHaveManifest := false

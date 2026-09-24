@@ -7,9 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"math"
 	"net/http"
 	"slices"
+	"sync"
 
 	"github.com/dnr/styx/common"
 	"github.com/dnr/styx/common/cdig"
@@ -34,6 +36,15 @@ type (
 		keepImage map[string]struct{}    // sph string
 		keepSphps map[SphPrefix]struct{} // sph prefix
 		keepDig   map[cdig.CDig]struct{}
+
+		held      map[string]struct{}    // sph string with an operation in progress
+		heldSphps map[SphPrefix]struct{} // sph prefixes of those and their manifests
+	}
+
+	// gcGuard tracks what in-progress operations need gc to leave alone.
+	gcGuard struct {
+		mu    sync.Mutex
+		holds map[string]int // sph string -> number of operations using it
 	}
 
 	rewriteChunk struct {
@@ -73,6 +84,25 @@ func (s *Server) handleGcReq(ctx context.Context, r *GcReq) (*GcResp, error) {
 		keepImage: make(map[string]struct{}, 1000),
 		keepSphps: make(map[SphPrefix]struct{}, 1000),
 		keepDig:   make(map[cdig.CDig]struct{}, 100000),
+		held:      make(map[string]struct{}),
+		heldSphps: make(map[SphPrefix]struct{}),
+	}
+
+	// A mount, materialize or vaporize in progress keeps its image whatever the image's state,
+	// and any chunk allocated for it so far, even one no manifest refers to yet. Read the
+	// holds inside the write transaction: an operation that takes one later does its first
+	// update after we commit.
+	for _, sphStr := range s.gcHolds() {
+		sph, _, err := ParseSph(sphStr)
+		if err != nil {
+			continue
+		}
+		manifestSph := makeManifestSph(sph)
+		g.held[sphStr] = struct{}{}
+		for _, sphp := range []SphPrefix{SphPrefixFromBytes(sph[:]), SphPrefixFromBytes(manifestSph[:])} {
+			g.heldSphps[sphp] = struct{}{}
+			g.keepSphps[sphp] = struct{}{}
+		}
 	}
 
 	// use image bucket as roots
@@ -116,7 +146,8 @@ func (s *Server) handleGcReq(ctx context.Context, r *GcReq) (*GcResp, error) {
 	var delManifests [][]byte
 	mbcur := g.mb.Cursor()
 	for k, _ := mbcur.First(); k != nil; k, _ = mbcur.Next() {
-		if _, ok := g.keepImage[string(k)]; !ok {
+		_, keep := g.keepImage[string(k)]
+		if _, held := g.held[string(k)]; !keep && !held {
 			delManifests = append(delManifests, bytes.Clone(k))
 		}
 	}
@@ -128,13 +159,13 @@ func (s *Server) handleGcReq(ctx context.Context, r *GcReq) (*GcResp, error) {
 	cbcur := g.cb.Cursor()
 	for k, v := cbcur.First(); k != nil; k, v = cbcur.Next() {
 		d := cdig.FromBytes(k)
-		if _, ok := g.keepDig[d]; !ok {
+		sphps := sphpsFromLoc(v)
+		if _, ok := g.keepDig[d]; !ok && !g.anyHeld(sphps) {
 			delChunks = append(delChunks, d)
 			delLocs = append(delLocs, loadLoc(v))
 			continue
 		}
 		g.RemainHaveChunks++
-		sphps := sphpsFromLoc(v)
 		if g.keepAllSphps(sphps) {
 			continue
 		}
@@ -339,7 +370,7 @@ func (s *Server) gcTraceImage(g *gcCtx, sphStr string, img *pb.DbImage) error {
 	manifestSph := makeManifestSph(sph)
 	manifestSphPrefix := SphPrefixFromBytes(manifestSph[:])
 
-	if g.GcByState[img.MountState] {
+	if _, held := g.held[sphStr]; g.GcByState[img.MountState] && !held {
 		g.DeleteImagesByState[img.MountState]++
 		return nil
 	}
@@ -390,6 +421,42 @@ func gcNeedsManifest(st pb.MountState) bool {
 	default:
 		return false
 	}
+}
+
+// holdForGc makes gc keep sphStr's image, manifest and chunks until the returned function is
+// called. Take it before the operation's first db update.
+func (s *Server) holdForGc(sphStr string) func() {
+	g := &s.gcGuard
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.holds == nil {
+		g.holds = make(map[string]int)
+	}
+	g.holds[sphStr]++
+	return func() {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		g.holds[sphStr]--
+		if g.holds[sphStr] <= 0 {
+			delete(g.holds, sphStr)
+		}
+	}
+}
+
+func (s *Server) gcHolds() []string {
+	g := &s.gcGuard
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return slices.Collect(maps.Keys(g.holds))
+}
+
+func (g *gcCtx) anyHeld(sphps []SphPrefix) bool {
+	for _, sphp := range sphps {
+		if _, ok := g.heldSphps[sphp]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func (g *gcCtx) keepAllSphps(sphps []SphPrefix) bool {
