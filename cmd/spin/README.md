@@ -42,7 +42,7 @@ First, set up Styx and set `services.styx.includeSpin = true`.
 Then do stuff like this:
 
 ```sh
-spin add nixpkgs https://channels.nixos.org/nixos-25.11/nixexprs.tar.xz
+spin add nixpkgs https://channels.nixos.org/nixos-26.05/nixexprs.tar.xz
 spin add other https://github.com/owner/repo/archive/branch.tar.gz
 spin update nixpkgs
 spin update --all
