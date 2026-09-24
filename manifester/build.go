@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -41,6 +42,9 @@ const (
 	// Build modes
 	ModeNar            = "" // default
 	ModeGenericTarball = "generic-tarball"
+
+	// narinfo.Parse allows lines up to 1 MiB, and real narinfos are much smaller
+	maxNarinfoSize = 2 << 20
 )
 
 type (
@@ -198,12 +202,18 @@ func (b *ManifestBuilder) BuildFromNar(
 		return nil, fmt.Errorf("%w: upstream http for %s: %s", ErrReq, narinfoUrl, res.Status)
 	}
 
-	ni, err := narinfo.Parse(res.Body)
+	niBytes, err := io.ReadAll(io.LimitReader(res.Body, maxNarinfoSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("%w: upstream http for %s: %w", ErrReq, narinfoUrl, err)
+	} else if len(niBytes) > maxNarinfoSize {
+		return nil, fmt.Errorf("%w: narinfo for %s is larger than %d bytes", ErrReq, narinfoUrl, maxNarinfoSize)
+	}
+	ni, err := narinfo.Parse(bytes.NewReader(niBytes))
 	if err != nil {
 		return nil, fmt.Errorf("%w: narinfo parse for %s: %w", ErrReq, narinfoUrl, err)
 	}
 
-	// check the fields we use (Fingerprint dereferences NarHash)
+	// check the fields we use (the fingerprint needs NarHash)
 	if ni.NarHash == nil {
 		return nil, fmt.Errorf("%w: narinfo for %s has no NarHash", ErrReq, narinfoUrl)
 	} else if sp, err := storepath.FromAbsolutePath(ni.StorePath); err != nil {
@@ -217,7 +227,7 @@ func (b *ManifestBuilder) BuildFromNar(
 	// TODO: I think if ni.CA is present, then we can verify the CA field here instead of
 	// requiring a signature
 
-	if !signature.VerifyFirst(ni.Fingerprint(), ni.Signatures, b.pubKeys) {
+	if !signature.VerifyFirst(narinfoFingerprint(ni), ni.Signatures, b.pubKeys) {
 		return nil, fmt.Errorf("%w: signature validation failed for %s; narinfo %#v", ErrReq, narinfoUrl, ni)
 	}
 
@@ -431,6 +441,28 @@ func (b *ManifestBuilder) BuildFromNar(
 		Sph:      storePathHash,
 		Bytes:    cmpSb,
 	}, nil
+}
+
+// narinfoFingerprint is ni.Fingerprint(), which builds the reference list with repeated
+// string concatenation, in linear time. It runs before the signature is checked.
+func narinfoFingerprint(ni *narinfo.NarInfo) string {
+	var sb strings.Builder
+	sb.WriteString("1;")
+	sb.WriteString(ni.StorePath)
+	sb.WriteByte(';')
+	sb.WriteString(ni.NarHash.Format(nixhash.NixBase32, true))
+	sb.WriteByte(';')
+	sb.WriteString(strconv.FormatUint(ni.NarSize, 10))
+	sb.WriteByte(';')
+	for i, ref := range ni.References {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		sb.WriteString(storepath.StoreDir)
+		sb.WriteByte('/')
+		sb.WriteString(ref)
+	}
+	return sb.String()
 }
 
 func (b *ManifestBuilder) buildFromNar(ctx context.Context, args *BuildArgs, r io.Reader) (*pb.Manifest, error) {
