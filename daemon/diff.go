@@ -95,7 +95,6 @@ type (
 	// context for building set of diff ops
 	opSet struct {
 		s     *Server
-		tx    *bbolt.Tx
 		op    *diffOp // last op in ops
 		ops   []*diffOp
 		using map[cdig.CDig]struct{}
