@@ -498,9 +498,10 @@ func TestShardMarkersMustMatch(t *testing.T) {
 	styxSk, _, err := signature.GenerateKeypair("styx-test-1", rand.Reader)
 	require.NoError(t, err)
 	mb, err := NewManifestBuilder(ManifestBuilderConfig{
-		PublicKeys:  []signature.PublicKey{e.pk},
-		SigningKeys: []signature.SecretKey{styxSk},
-		ChunkSizer:  func(int64) shift.Shift { return 17 },
+		PublicKeys:       []signature.PublicKey{e.pk},
+		SigningKeys:      []signature.SecretKey{styxSk},
+		ChunkSizer:       func(int64) shift.Shift { return 17 },
+		AllowedUpstreams: []string{e.up.host()},
 	}, e.cs)
 	require.NoError(t, err)
 	other := e.server(mb)
