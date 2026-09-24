@@ -3,6 +3,7 @@ package tests
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"io/fs"
 	"math/rand/v2"
@@ -61,6 +62,40 @@ func TestGcAfterFailedMount(t *testing.T) {
 	// what `styx gc` sends with no flags
 	code, body = tb.lcCall(daemon.GcPath, daemon.GcReq{DryRunFast: true, GcByState: gcUnmounted})
 	require.Equal(t, http.StatusOK, code, "default gc failed after an unrelated failed mount: %s", body)
+}
+
+// A completed vaporize leaves nothing for gc. Mounting a vaporized store path replaces its
+// unsigned manifest with the manifester's signed one, which orphans the old manifest's
+// chunks, and only those.
+func TestGcAfterVaporize(t *testing.T) {
+	tb := newTestBase(t)
+	tb.startAll()
+
+	tmp := t.TempDir()
+	vaporize := func(name, filehash string) {
+		src := filepath.Join(tmp, name)
+		cmd := fmt.Sprintf("xz -cd %s/nar/%s.nar.xz | nix-store --restore %s", TestdataDir, filehash, src)
+		require.NoError(t, exec.Command("sh", "-c", cmd).Run())
+		tb.vaporize(src)
+	}
+	const opensslMan = "v35ysx9k1ln4c6r7lj74204ss4bw7l5l-openssl-3.0.12-man"
+	vaporize(lcOpusfile, "0h336qzb63kdqxwc5yjrxq61cjraz8jrav0m5rkrcvsb6w55rbll")
+	vaporize(opensslMan, "1mv76iwv027rxgdb0i04www6nkx8hy5bxh8v8vjihr9pl5a37hpy")
+
+	gc := tb.gc(daemon.GcReq{DryRunFast: true, GcByState: gcUnmounted})
+	t.Logf("gc after vaporize: %+v", gc)
+	require.Zero(t, gc.DeleteChunks, "vaporize left chunks no image refers to")
+
+	d := tb.debug(daemon.DebugReq{IncludeImages: []string{opensslMan[:32]}, IncludeManifests: true})
+	require.Contains(t, d.Images, opensslMan)
+	vaporizedManifestChunks := len(d.Images[opensslMan].ManifestChunks)
+
+	mp := tb.mount(opensslMan)
+	require.Equal(t, "0v60mg7qj7mfd27s1nnldb0041ln08xs1bw7zn1mmjiaq02myzlh", tb.nixHash(mp))
+	gc = tb.gc(daemon.GcReq{DryRunFast: true, GcByState: gcUnmounted})
+	t.Logf("gc after mounting a vaporized path: %+v", gc)
+	require.Equal(t, vaporizedManifestChunks, gc.DeleteChunks,
+		"mounting a vaporized path should orphan only the chunks of its vaporized manifest")
 }
 
 // gc deletes an unmounted image's record, chunks and slab data, and used to leave its
