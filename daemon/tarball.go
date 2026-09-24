@@ -116,13 +116,6 @@ func (s *Server) handleTarballReq(ctx context.Context, r *TarballReq) (*TarballR
 		log.Println("checking manifest cache for tarball", rr.Url, "etag", rr.Etag)
 		envelopeBytes, _ = s.p().mcread.Get(ctx, mReq.CacheKey(), nil)
 		mReq.ETag = ""
-		// entries cached with only a v1 signature don't authenticate the meta copy in a
-		// chunked manifest, so verification drops it. the manifester sends a fresh one.
-		if e, _, err := common.VerifyMessageAsEntry(s.p().keys, common.ManifestContext, envelopeBytes); err == nil &&
-			e.ManifestMeta == nil && len(e.InlineData) == 0 {
-			log.Println("cached tarball manifest has no signed metadata, asking manifester")
-			envelopeBytes = nil
-		}
 	}
 
 	// fall back to asking manifester

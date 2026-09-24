@@ -4,34 +4,23 @@ import (
 	"cmp"
 	"crypto/rand"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"os"
-	"path"
 	"slices"
-	"strconv"
 	"strings"
 
 	"github.com/nix-community/go-nix/pkg/narinfo/signature"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
 
-	"github.com/dnr/styx/common/cdig"
 	"github.com/dnr/styx/pb"
 )
 
-// Signed messages carry signatures over one or both of these fingerprints:
-//
-// v1 covers only the entry's path, size and inline data or digests. It's still produced so
-// that older daemons can verify new messages, and accepted so that messages already in
-// caches keep working, but a message that verifies only under v1 must have default values
-// in every field v1 doesn't cover (see checkV1Entry).
-//
-// v2 covers every field of the entry and the params (see entryFingerprintV2).
-const (
-	fingerprintV1 = "styx-signed-message-1"
-	fingerprintV2 = "styx-signed-message-2"
-)
+// fingerprintPrefix starts every signed-message fingerprint, so that a styx signature can't be
+// taken for a signature over anything else: a narinfo fingerprint, or the
+// "styx-signed-message-1" fingerprint that older styx versions signed, which covered only part
+// of the entry.
+const fingerprintPrefix = "styx-signed-message-2"
 
 func LoadPubKeys(keys []string) ([]signature.PublicKey, error) {
 	var out []signature.PublicKey
@@ -77,10 +66,9 @@ func VerifyInlineMessage(
 }
 
 // VerifyMessageAsEntry checks the signatures on a SignedMessage and returns its entry and
-// params. Everything returned is covered by a signature: if the message verifies only under
-// the v1 fingerprint, fields that v1 doesn't cover must have their default values, except
-// for the ManifestMeta copy that v1 signers put in chunked manifest entries, which is
-// removed from the returned entry.
+// params. The signatures cover every field of both (see messageFingerprint), so everything
+// returned is authenticated. A message with fields that this version of styx doesn't know
+// can't be verified.
 func VerifyMessageAsEntry(keys []signature.PublicKey, expectedContext string, b []byte) (*pb.Entry, *pb.GlobalParams, error) {
 	if len(keys) == 0 {
 		return nil, nil, fmt.Errorf("no public keys provided")
@@ -107,52 +95,14 @@ func VerifyMessageAsEntry(keys []signature.PublicKey, expectedContext string, b 
 		sigs[i].Data = sm.Signature[i]
 	}
 
-	if fp, err := entryFingerprintV2(sm.Msg, sm.Params); err == nil && verifyAny(fp, sigs, keys) {
-		return sm.Msg, sm.Params, nil
-	}
-	if !verifyAny(entryFingerprintV1(sm.Msg), sigs, keys) {
+	fingerprint, err := messageFingerprint(sm.Msg, sm.Params)
+	if err != nil {
+		return nil, nil, fmt.Errorf("SignedMessage can't be verified: %w", err)
+	} else if !signature.VerifyFirst(fingerprint, sigs, keys) {
 		return nil, nil, fmt.Errorf("signature verification failed")
 	}
-	if err := checkV1Entry(sm.Msg, sm.Params); err != nil {
-		return nil, nil, err
-	}
+
 	return sm.Msg, sm.Params, nil
-}
-
-// verifyAny returns true if any signature verifies against a key with the same name.
-func verifyAny(fingerprint string, sigs []signature.Signature, keys []signature.PublicKey) bool {
-	for _, k := range keys {
-		for _, sig := range sigs {
-			if k.Verify(fingerprint, sig) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// checkV1Entry rejects a v1-only message with a non-default value in any field that the v1
-// fingerprint doesn't cover: no v1 signer ever set them, so they must have been tampered
-// with. The exception is ManifestMeta, which v1 signers copied into chunked manifest entries.
-// It can't be authenticated, so it's dropped (after a consistency check).
-func checkV1Entry(e *pb.Entry, params *pb.GlobalParams) error {
-	if e.Type != pb.EntryType_REGULAR || e.Executable || e.DigestBytes != 0 || e.ChunkShift != 0 ||
-		e.StatsInlineData != 0 || e.StatsPresentChunks != 0 || e.StatsPresentBlocks != 0 ||
-		len(e.DebugDigests) > 0 || len(e.ProtoReflect().GetUnknown()) > 0 ||
-		// v1 covers digests only when there's no inline data
-		(len(e.InlineData) > 0 && len(e.Digests) > 0) {
-		return errors.New("SignedMessage has fields not covered by its signature")
-	}
-	if params != nil && (params.DigestAlgo != cdig.Algo || params.DigestBits != cdig.Bits) {
-		return errors.New("SignedMessage has params not covered by its signature")
-	}
-	if mm := e.ManifestMeta; mm != nil {
-		if len(e.InlineData) > 0 || path.Base(mm.GetNarinfo().GetStorePath()) != path.Base(e.Path) {
-			return errors.New("SignedMessage has inconsistent manifest meta")
-		}
-		e.ManifestMeta = nil
-	}
-	return nil
 }
 
 func SignInlineMessage(keys []signature.SecretKey, context string, msg proto.Message) ([]byte, error) {
@@ -168,10 +118,8 @@ func SignInlineMessage(keys []signature.SecretKey, context string, msg proto.Mes
 	})
 }
 
-// SignMessageAsEntry signs with both fingerprints. The v1 signatures come first, since older
-// daemons check only the first signature for each key.
 func SignMessageAsEntry(keys []signature.SecretKey, params *pb.GlobalParams, e *pb.Entry) ([]byte, error) {
-	fpV2, err := entryFingerprintV2(e, params)
+	fingerprint, err := messageFingerprint(e, params)
 	if err != nil {
 		return nil, err
 	}
@@ -179,51 +127,29 @@ func SignMessageAsEntry(keys []signature.SecretKey, params *pb.GlobalParams, e *
 	sm := &pb.SignedMessage{
 		Msg:       e,
 		Params:    params,
-		KeyId:     make([]string, 0, 2*len(keys)),
-		Signature: make([][]byte, 0, 2*len(keys)),
+		KeyId:     make([]string, len(keys)),
+		Signature: make([][]byte, len(keys)),
 	}
-	for _, fingerprint := range []string{entryFingerprintV1(e), fpV2} {
-		for _, k := range keys {
-			sig, err := k.Sign(rand.Reader, fingerprint)
-			if err != nil {
-				return nil, err
-			}
-			sm.KeyId = append(sm.KeyId, sig.Name)
-			sm.Signature = append(sm.Signature, sig.Data)
+	for i, k := range keys {
+		sig, err := k.Sign(rand.Reader, fingerprint)
+		if err != nil {
+			return nil, err
 		}
+		sm.KeyId[i] = sig.Name
+		sm.Signature[i] = sig.Data
 	}
 
 	return proto.Marshal(sm)
 }
 
-func entryFingerprintV1(e *pb.Entry) string {
-	var sb strings.Builder
-	sb.Grow(40 + len(e.Path) + len(e.InlineData) + len(e.Digests))
-	sb.WriteString(fingerprintV1)
-	sb.WriteByte(0)
-	if strings.IndexByte(e.Path, 0) != -1 {
-		panic("nil in entry path")
-	}
-	sb.WriteString(e.Path)
-	sb.WriteByte(0)
-	sb.WriteString(strconv.Itoa(int(e.Size)))
-	if len(e.InlineData) > 0 {
-		sb.WriteByte(1)
-		sb.Write(e.InlineData)
-	} else {
-		sb.WriteByte(2)
-		sb.Write(e.Digests)
-	}
-	return sb.String()
-}
-
-// entryFingerprintV2 covers every field of the entry (including nested messages) and the
-// params. It doesn't depend on the protobuf wire encoding, which isn't canonical: fields are
-// walked by reflection and encoded with appendCanonical. Unknown fields can't be covered, so
-// messages with unknown fields can't be signed or verified under v2.
-func entryFingerprintV2(e *pb.Entry, params *pb.GlobalParams) (string, error) {
+// messageFingerprint is what a SignedMessage's signatures sign: fingerprintPrefix, then every
+// field of the entry (including nested messages) and the params. It doesn't depend on the
+// protobuf wire encoding, which isn't canonical: fields are walked by reflection and encoded
+// by appendCanonical, so it also covers fields added to the schema later. Unknown fields
+// can't be covered, so messages with unknown fields can't be signed or verified.
+func messageFingerprint(e *pb.Entry, params *pb.GlobalParams) (string, error) {
 	b := make([]byte, 0, 64+len(e.Path)+len(e.InlineData)+len(e.Digests))
-	b = append(b, fingerprintV2...)
+	b = append(b, fingerprintPrefix...)
 	b = append(b, 0)
 	b, err := appendCanonical(b, e.ProtoReflect())
 	if err != nil {
