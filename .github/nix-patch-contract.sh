@@ -109,32 +109,56 @@ nixstore --store "$work/s2" "${styxopts[@]}" --option styx-ondemand 'nomatch' --
 # Fake styx daemon: /mount and /materialize answer Success, /umount answers
 # the way the real daemon does for a path it doesn't record as mounted.
 # /materialize copies the package into DestPath like the real one does
-# (mkdir -p, overwrite files, keep whatever else is there).
+# (mkdir -p, overwrite files, keep whatever else is there). If the file named
+# by `slow` exists, /materialize then waits until it is removed and writes
+# into DestPath again, like a daemon that keeps going after its client has
+# given up, and logs a "late-write" line.
 cat > "$work/fakedaemon.py" <<'EOF'
-import http.server, json, os, shutil, socketserver, sys
-sock, log, src, corrupt = sys.argv[1:5]
+import http.server, json, os, shutil, socketserver, sys, time
+sock, log, src, corrupt, slow = sys.argv[1:6]
+def record(line):
+    with open(log, "a") as f:
+        f.write(line + "\n")
 class H(http.server.BaseHTTPRequestHandler):
     def address_string(self):
         return "unix"
     def do_POST(self):
         body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
         req = json.loads(body)
-        with open(log, "a") as f:
-            f.write(self.path + " " + json.dumps(req, sort_keys=True) + "\n")
+        record(self.path + " " + json.dumps(req, sort_keys=True))
         code, res = 200, {"Success": True}
         if self.path == "/materialize":
-            shutil.copytree(src, req["DestPath"], symlinks=True, dirs_exist_ok=True)
+            dest = req["DestPath"]
+            shutil.copytree(src, dest, symlinks=True, dirs_exist_ok=True)
             if os.path.exists(corrupt):
-                with open(os.path.join(req["DestPath"], "data.txt"), "w") as f:
+                with open(os.path.join(dest, "data.txt"), "w") as f:
                     f.write("corrupted\n")
+            if os.path.exists(slow):
+                for _ in range(600):
+                    if not os.path.exists(slow):
+                        break
+                    time.sleep(0.1)
+                try:
+                    # the real daemon runs as root, so read-only modes don't stop it
+                    os.chmod(dest, 0o755)
+                    os.chmod(os.path.join(dest, "data.txt"), 0o644)
+                    with open(os.path.join(dest, "data.txt"), "w") as f:
+                        f.write("late\n")
+                    result = "wrote data.txt"
+                except OSError as e:
+                    result = e.strerror
+                record("late-write " + dest + ": " + result)
         elif self.path == "/umount":
             code, res = 404, {"Error": "not mounted"}
         out = json.dumps(res).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(out)))
-        self.end_headers()
-        self.wfile.write(out)
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+        except OSError:
+            pass  # the client gave up
 class S(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
     daemon_threads = True
 if os.path.exists(sock):
@@ -143,7 +167,7 @@ srv = S(sock, H)
 os.chmod(sock, 0o777)
 srv.serve_forever()
 EOF
-python3 "$work/fakedaemon.py" "$work/fake.sock" "$work/fake.log" "$work/src/pkg" "$work/fake-corrupt" &
+python3 "$work/fakedaemon.py" "$work/fake.sock" "$work/fake.log" "$work/src/pkg" "$work/fake-corrupt" "$work/fake-slow" &
 fakepid=$!
 trap 'kill $fakepid 2>/dev/null; sudo umount "$work/s5$P" 2>/dev/null; true' EXIT
 for _ in $(seq 50); do [ -S "$work/fake.sock" ] && break; sleep 0.1; done
@@ -206,6 +230,111 @@ elif ! grep -q "falling back to substitution" "$work/s4b.log"; then
 else
     pass "a corrupt materialize fell back to substitution"
 fi
+
+section "materialize that outlasts styx-timeout"
+# Expected: Nix gives up on a daemon that hasn't answered after styx-timeout
+# and falls back to a regular copy. The daemon may still be writing into the
+# destination it was given (it stops when it sees the disconnect, see
+# TestMaterializeStopsWhenCancelled), and that must not reach the registered
+# path. The fake daemon writes only once Nix has finished.
+touch "$work/fake-slow"
+nixstore --store "$work/s8" "${fakeopts[@]}" --option styx-timeout 1 --option styx-materialize '.*' --realise "$P" > "$work/s8.log" 2>&1
+s8rc=$?
+rm -f "$work/fake-slow"
+for _ in $(seq 100); do grep -q '^late-write ' "$work/fake.log" && break; sleep 0.1; done
+late=$(grep '^late-write ' "$work/fake.log")
+if [ "$s8rc" != 0 ]; then
+    nfail "realise after a materialize timeout failed: $(oneline "$work/s8.log")"
+elif ! grep -q "falling back to substitution:.*styx request '/materialize' failed: Timeout was reached" "$work/s8.log"; then
+    nfail "Nix did not give up on the daemon after styx-timeout: $(oneline "$work/s8.log")"
+elif [ -z "$late" ]; then
+    nfail "the fake daemon did not write after Nix gave up, so nothing was checked"
+elif ! nixstore --store "$work/s8" --verify-path "$P" || [ "$(cat "$work/s8$P/data.txt")" != hello ]; then
+    nfail "the daemon's write after the timeout reached the store path ($late): data.txt is $(cat "$work/s8$P/data.txt")"
+else
+    pass "Nix fell back after styx-timeout and the late write missed the store path ($late)"
+fi
+
+section "path registered by another process during a styx substitution"
+# A long-lived Nix process (nix-store --serve here, or a nix-daemon worker)
+# can hold a negative path info cache entry for a path it then substitutes.
+# If another process registers the path while this one waits for the path's
+# lock, mountStyx and materializeStyx find it valid and leave it alone.
+# Expected: they drop the negative entry, as addToStore does, so the process
+# sees the path as valid afterwards. The driver speaks the serve protocol:
+# QueryPathInfos (not valid yet), then QueryValidPaths with substitution,
+# holding the path's lock until nix-store waits on it and registering the
+# path meanwhile. It prints the paths nix-store reports as valid.
+cat > "$work/serverace.py" <<'EOF'
+import fcntl, os, re, struct, subprocess, sys, time
+nixstore, store, path, src, errlog = sys.argv[1:6]
+opts = sys.argv[6:]
+real = store + path
+base = [nixstore, "--option", "build-users-group", ""]
+def u64(n):
+    return struct.pack("<Q", n)
+def string(s):
+    b = s.encode()
+    return u64(len(b)) + b + b"\0" * (-len(b) % 8)
+def read_u64(f):
+    b = f.read(8)
+    if len(b) != 8:
+        sys.exit("nix-store --serve closed its output")
+    return struct.unpack("<Q", b)[0]
+def read_string(f):
+    n = read_u64(f)
+    return f.read(n + (-n % 8))[:n].decode()
+def send(p, data):
+    p.stdin.write(data)
+    p.stdin.flush()
+lock = open(real + ".lock", "w")
+fcntl.flock(lock, fcntl.LOCK_EX)
+waiter = re.compile(r"->\s+FLOCK\s.*:%d\s" % os.fstat(lock.fileno()).st_ino)
+serve = subprocess.Popen(base + ["--store", store] + opts + ["--serve", "--write"],
+                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=open(errlog, "w"))
+send(serve, u64(0x390c9deb) + u64(0x207))
+if read_u64(serve.stdout) != 0x5452eecb:
+    sys.exit("bad nix-store --serve magic")
+read_u64(serve.stdout)
+send(serve, u64(2) + u64(1) + string(path))  # QueryPathInfos
+if read_string(serve.stdout) != "":
+    sys.exit("nix-store --serve has path info for a path that isn't valid yet")
+send(serve, u64(1) + u64(0) + u64(1) + u64(1) + string(path))  # QueryValidPaths, substitute
+for _ in range(600):
+    with open("/proc/locks") as f:
+        if any(waiter.search(l) for l in f):
+            break
+    if serve.poll() is not None:
+        sys.exit("nix-store --serve exited")
+    time.sleep(0.1)
+else:
+    sys.exit("nix-store --serve never waited for the path's lock")
+subprocess.run(["cp", "-a", src, real], check=True)
+subprocess.run(base + ["--store", store, "--register-validity"], input=(path + "\n\n0\n").encode(), check=True)
+fcntl.flock(lock, fcntl.LOCK_UN)
+lock.close()
+valid = [read_string(serve.stdout) for _ in range(read_u64(serve.stdout))]
+serve.stdin.close()
+serve.wait()
+print(" ".join(valid) if valid else "none")
+EOF
+for mode in styx-ondemand styx-materialize; do
+    s7="$work/s7-$mode"
+    nixstore --store "$s7" --dump-db >/dev/null || setup_err "cannot create $s7"
+    nreq=$(wc -l < "$work/fake.log")
+    if ! valid=$(python3 "$work/serverace.py" "$NIXBIN/nix-store" "$s7" "$P" "$work/s1$P" "$s7.log" \
+            "${fakeopts[@]}" --option "$mode" '.*'); then
+        nfail "$mode: the serve protocol driver failed: $(oneline "$s7.log")"
+    elif ! grep -q "with styx" "$s7.log"; then
+        nfail "$mode: nix-store --serve did not substitute with styx: $(oneline "$s7.log")"
+    elif [ "$(wc -l < "$work/fake.log")" != "$nreq" ]; then
+        nfail "$mode: styx asked the daemon for a path that was already valid: $(tail -n 1 "$work/fake.log")"
+    elif [ "$valid" != "$P" ]; then
+        nfail "$mode: nix-store --serve kept a stale negative path info cache entry: valid paths after substituting $P: $valid"
+    else
+        pass "$mode: the substituting process sees the path registered by another as valid"
+    fi
+done
 
 # The rest needs root and a loop-mounted EROFS image over a valid path.
 sudo modprobe erofs || true

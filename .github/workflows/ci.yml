@@ -160,7 +160,7 @@ jobs:
       - name: styx settings are registered
         run: |
           ./patched-nix/bin/nix --version
-          for s in styx-substituters styx-min-size styx-ondemand styx-materialize styx-exclude styx-sock-path; do
+          for s in styx-substituters styx-min-size styx-ondemand styx-materialize styx-exclude styx-sock-path styx-timeout; do
             printf '%s = ' "$s"; ./patched-nix/bin/nix --extra-experimental-features nix-command config show "$s"
           done
       - name: styx patch behaviour

@@ -156,7 +156,7 @@ index 8e997c8..9cff3bb 100644
                      deleteFromStore(path.to_string(), true);
                      referrersCache.erase(path);
 diff --git a/src/libstore/include/nix/store/globals.hh b/src/libstore/include/nix/store/globals.hh
-index 34eab7f..09c53e2 100644
+index 34eab7f..bc42270 100644
 --- a/src/libstore/include/nix/store/globals.hh
 +++ b/src/libstore/include/nix/store/globals.hh
 @@ -9,6 +9,7 @@
@@ -167,7 +167,7 @@ index 34eab7f..09c53e2 100644
  #include "nix/store/worker-settings.hh"
  
  #include "nix/store/config.hh"
-@@ -421,6 +422,33 @@ public:
+@@ -421,6 +422,39 @@ public:
            Set it to 1 to warn on all paths.
          )"};
  
@@ -197,6 +197,12 @@ index 34eab7f..09c53e2 100644
 +
 +    Setting<std::string> styxSockPath{
 +        this, "/var/cache/styx/styx.sock", "styx-sock-path", "Path to Styx socket."};
++
++    Setting<unsigned int> styxTimeout{
++        this,
++        300,
++        "styx-timeout",
++        "Seconds to wait for the Styx daemon to answer a request before falling back to regular substitution (0 means no limit)."};
 +
      /**
       * Get the options needed for profile directory functions.
@@ -446,7 +452,7 @@ index fa19b08..8c32232 100644
          }
 diff --git a/src/libstore/styx.cc b/src/libstore/styx.cc
 new file mode 100644
-index 0000000..c432875
+index 0000000..71256ca
 --- /dev/null
 +++ b/src/libstore/styx.cc
 @@ -0,0 +1,239 @@
@@ -493,8 +499,8 @@ index 0000000..c432875
 +    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, postData.c_str());
 +    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, postData.size());
 +    // TODO: this doesn't seem to work for unix sockets?
-+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 1);
-+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 300);
++    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 1L);
++    curl_easy_setopt(curl, CURLOPT_TIMEOUT, (long) settings.styxTimeout.get());
 +
 +    std::string resData;
 +    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCallback);
@@ -503,7 +509,7 @@ index 0000000..c432875
 +    CURLcode curlRes = curl_easy_perform(curl);
 +    curl_easy_cleanup(curl);
 +    if (curlRes != CURLE_OK) {
-+        throw Error("styx error: curl: %d", curlRes);
++        throw Error("styx request '%s' failed: %s", path, curl_easy_strerror(curlRes));
 +    }
 +    nlohmann::json res = nlohmann::json::parse(resData);
 +    if (!res.value("Success", false)) {
