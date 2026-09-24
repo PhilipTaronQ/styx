@@ -203,6 +203,7 @@ func (s *server) handleChunkDiff(w http.ResponseWriter, req *http.Request) {
 
 	// wait for all
 	if err := expandGrp.Wait(); err != nil {
+		egCtx.Cancel(err) // stop fetches that are still running
 		log.Println("chunk read error:", err)
 		writeError(w, err)
 		return
@@ -276,9 +277,10 @@ func (s *server) expand(egCtx *errgroup.Group, digests []cdig.CDig, expand strin
 		go func() {
 			pw.CloseWithError(s.fetchChunkSeries(egCtx, digests, pw, &budget.fetch))
 		}()
+		// if we stop reading early, make writes to the write end fail
+		defer pr.CloseWithError(errExpandDone)
 		gzr, err := gzip.NewReader(pr)
 		if err != nil {
-			pr.CloseWithError(err) // cause writes to write end to fail
 			return nil, err
 		}
 		return io.ReadAll(budgetReader{gzr, &budget.expand})
@@ -352,7 +354,10 @@ const (
 	chunkDiffMaxExpandedBytes = 4 * ChunkDiffMaxBytes
 )
 
-var errChunkDiffTooBig = fmt.Errorf("%w: chunk diff data is too big", ErrReq)
+var (
+	errChunkDiffTooBig = fmt.Errorf("%w: chunk diff data is too big", ErrReq)
+	errExpandDone      = errors.New("expansion finished")
+)
 
 // checkChunkDiffReq enforces the documented limits on digests (and on the number of
 // requests, which is otherwise unbounded).

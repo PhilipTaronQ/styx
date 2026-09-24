@@ -129,6 +129,37 @@ func TestChunkDiffByteLimits(t *testing.T) {
 	assert.Equal(t, http.StatusExpectationFailed, rec.Code, "%d byte gzip expanded without limit", gz.Len())
 }
 
+// ExpandGz: if the gzip stream was corrupt after the header, io.ReadAll(gzr) returned but the
+// pipe reader was never closed. The chunk-series consumer stayed blocked in pw.Write forever
+// (no ctx case), and its producer/fetchers stayed blocked on channels, holding chunk buffers
+// and ChunkDiffParallel slots.
+func TestChunkDiffGzipErrorLeaksFetchGoroutines(t *testing.T) {
+	cs := &mockChunkStore{data: make(map[string][]byte)}
+	mb, err := NewManifestBuilder(ManifestBuilderConfig{}, cs)
+	require.NoError(t, err)
+	srv, err := NewManifestServer(Config{ChunkDiffParallel: 4, ChunkDiffZstdLevel: 3}, mb)
+	require.NoError(t, err)
+
+	// gzip header, then a deflate block with the reserved type 3: NewReader succeeds, Read fails
+	chunks := [][]byte{{0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xff, 0x07}}
+	for i := range 12 {
+		chunks = append(chunks, bytes.Repeat([]byte{byte('a' + i)}, 1024))
+	}
+	bases := putChunks(t, cs, chunks...)
+
+	const marker = "manifester.(*server).fetchChunkSeries"
+	before := countGoroutines(marker)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	rec := doChunkDiff(t, ctx, srv, &pb.ManifesterChunkDiffReq_Req{Bases: bases, ExpandBeforeDiff: ExpandGz})
+	require.GreaterOrEqual(t, rec.Code, 400)
+	cancel() // the request is over; net/http would cancel it here too
+
+	after := waitGoroutines(marker, before, 3*time.Second)
+	assert.LessOrEqual(t, after, before,
+		"%d chunk-series goroutines still blocked after the request finished and its context was cancelled", after-before)
+}
+
 // An unauthenticated caller can send only shard 0 of N. Shard 0 used to write the manifest to
 // the shared cache after uploading only its own 1/N of the chunks. Clients then got the
 // cached manifest and 404 on the rest (and remanifesting hit the same cache entry). The same
