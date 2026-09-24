@@ -219,7 +219,9 @@ func (s *Server) getNewManifest(ctx context.Context, req manifester.ManifestReq,
 			}
 			defer res.Body.Close()
 			if i == 0 {
-				if b, err := io.ReadAll(zstd.NewReader(res.Body)); err != nil {
+				zr := zstd.NewReader(res.Body)
+				defer zr.Close() // frees the C decompression stream
+				if b, err := io.ReadAll(zr); err != nil {
 					return err
 				} else {
 					shard0 = b
