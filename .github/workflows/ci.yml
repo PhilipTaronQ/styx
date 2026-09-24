@@ -64,6 +64,9 @@ jobs:
 
   # Unit tests under the race detector and sanitizers. -race, -asan and -msan
   # all imply -d=checkptr. The cgo code (vendored zstd) is instrumented too.
+  # This is every package but ./tests, which needs root: the daemon/ and ci/
+  # tests are root-free (fake devnode, fake S3) so the daemon's concurrency
+  # and cgo paths run here.
   sanitize:
     strategy:
       fail-fast: false
@@ -98,7 +101,36 @@ jobs:
           echo "CGO_ENABLED=1" >> "$GITHUB_ENV"
       - run: go vet $SANFLAGS ./...
       - name: go test ${{ matrix.mode }}
-        run: go test $SANFLAGS -shuffle=on -count=2 -timeout 20m $(go list ./... | grep -v '/tests$')
+        run: |
+          set -o pipefail
+          # -json so the next step can check what ran; print the plain log
+          # from it, one package at a time.
+          rc=0
+          go test $SANFLAGS -shuffle=on -count=2 -timeout 20m -json \
+            $(go list ./... | grep -v '/tests$') > "$RUNNER_TEMP/test.json" || rc=$?
+          jq -rjs 'group_by(.Package // .ImportPath)[][]
+            | select(.Action == "output" or .Action == "build-output") | .Output' "$RUNNER_TEMP/test.json"
+          exit $rc
+      # A test that skips itself (say, because it needs root) would silently
+      # drop its package out of this job. Fail if any package with tests ran
+      # none, and flag every skip.
+      - name: every package's tests ran under ${{ matrix.mode }}
+        if: ${{ !cancelled() }}
+        run: |
+          jq -r 'select(.Action == "skip" and .Test != null) | "\(.Package) \(.Test)"' "$RUNNER_TEMP/test.json" |
+            sort -u | while read -r pkg name; do
+              echo "::warning title=sanitize (${{ matrix.mode }})::$pkg: $name skipped"
+            done
+          bad=0
+          for pkg in $(go list -f '{{if or .TestGoFiles .XTestGoFiles}}{{.ImportPath}}{{end}}' ./... | grep -v '/tests$'); do
+            n=$(jq -r --arg p "$pkg" 'select(.Package == $p and .Test != null and (.Action == "pass" or .Action == "fail")) | .Test' "$RUNNER_TEMP/test.json" | wc -l)
+            echo "$pkg: $n test runs"
+            if [ "$n" -eq 0 ]; then
+              echo "::error title=sanitize (${{ matrix.mode }})::no tests in $pkg ran"
+              bad=1
+            fi
+          done
+          exit $bad
 
   generate:
     runs-on: ubuntu-24.04
