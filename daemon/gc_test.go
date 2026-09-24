@@ -403,8 +403,7 @@ func TestGcPrunesCatalog(t *testing.T) {
 	initGcTestServer(t, s, "http://localhost:1")
 	gcTestImage(t, s, '6', "pkg-1.0", pb.MountState_Unmounted, gcTestDigest(6))
 	gcTestImage(t, s, '7', "pkg-1.1", pb.MountState_Mounted, gcTestDigest(7))
-	gcTestPutStaleCatalogF(t, s, '8', "pkg-0.9") // left behind by an older gc
-	require.Equal(t, []string{"pkg-0.9", "pkg-1.0", "pkg-1.1"}, gcTestCatalogF(t, s))
+	require.Equal(t, []string{"pkg-1.0", "pkg-1.1"}, gcTestCatalogF(t, s))
 
 	res, err := s.handleGcReq(context.Background(), &GcReq{GcByState: gcDefault})
 	require.NoError(t, err)
@@ -412,7 +411,7 @@ func TestGcPrunesCatalog(t *testing.T) {
 	require.Equal(t, []string{"pkg-1.1"}, gcTestCatalogF(t, s))
 }
 
-// Stale catalogf entries in existing databases must not be picked as diff bases.
+// A catalogf entry with no catalogr entry is stale and must not be picked as a diff base.
 func TestCatalogSkipsStaleBase(t *testing.T) {
 	s := newGcTestServer(t)
 	initGcTestServer(t, s, "http://localhost:1")

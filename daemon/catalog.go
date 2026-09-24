@@ -145,7 +145,7 @@ func (s *Server) catalogFindBaseFromHashAndName(tx *bbolt.Tx, reqHash Sph, reqNa
 			continue // this is a bug
 		}
 		sph := SphFromBytes(hash)
-		// an entry with no reverse entry was left by an older gc; its manifest is gone
+		// an entry with no reverse entry is stale: its image and manifest are gone
 		if sph != reqHash && bytes.Count(name, []byte{'-'}) == numDashes && crb.Get(hash) != nil {
 			// take last best instead of first since it's probably more recent
 			if match := matchLen(reqName, name); match >= bestmatch {
