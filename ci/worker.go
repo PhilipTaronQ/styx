@@ -80,10 +80,14 @@ type (
 		ns         string
 		c          client.Client
 		notifyCh   chan struct{}
-		prev       int
-		asgcli     *autoscaling.Client
+		prev       int // last capacity set successfully, or -1
+		asgcli     asgClient
 		startTime  time.Time // non-zero when we scale up asg
 		failedTime time.Time // non-zero after a failure
+	}
+
+	asgClient interface {
+		SetDesiredCapacity(context.Context, *autoscaling.SetDesiredCapacityInput, ...func(*autoscaling.Options)) (*autoscaling.SetDesiredCapacityOutput, error)
 	}
 
 	scalerInfo struct {
@@ -421,7 +425,10 @@ func (s *scaler) iter() {
 		log.Println("scaler getPending error:", err)
 		return
 	}
+	s.update(info)
+}
 
+func (s *scaler) update(info scalerInfo) {
 	target := 0
 
 	if info.scheduled > 0 || info.started > 0 {
@@ -454,8 +461,8 @@ func (s *scaler) iter() {
 		}
 	}
 
-	if target != s.prev {
-		s.setSize(target)
+	// if setting fails, try again next time
+	if target != s.prev && s.setSize(target) == nil {
 		s.prev = target
 	}
 }
@@ -498,7 +505,7 @@ func (s *scaler) getInfo() (scalerInfo, error) {
 	return info, nil
 }
 
-func (s *scaler) setSize(size int) {
+func (s *scaler) setSize(size int) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -511,9 +518,16 @@ func (s *scaler) setSize(size int) {
 	} else {
 		log.Println("asg set capacity error:", err)
 	}
+	return err
 }
 
-func (s *scaler) poke() { s.notifyCh <- struct{}{} }
+// poke asks the scaler to run soon. It's called from workflow code, so it must not block.
+func (s *scaler) poke() {
+	select {
+	case s.notifyCh <- struct{}{}:
+	default: // already poked
+	}
+}
 
 // activities
 
