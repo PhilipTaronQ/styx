@@ -105,6 +105,23 @@ func TestNarinfoManyReferencesIsQuadratic(t *testing.T) {
 	assert.ErrorContains(t, err, "larger than")
 }
 
+// When a chunk upload failed mid-nar, buildFromNar returned without stopping go-nix's parser
+// goroutine, which stayed parked forever (Lambda reuses the process across invocations).
+func TestFailedNarBuildLeaksNarReaderGoroutine(t *testing.T) {
+	sk, pk := upstreamKeys(t)
+	up := newFakeUpstream(t)
+	sph := up.addPath(t, sk, "leak", []narFile{{"/big", 64 << 16}, {"/z", 1000}}, narinfoOpts{})
+	cs := failingStore{&mockChunkStore{data: make(map[string][]byte)}}
+	mb := newTestBuilder(t, cs, pk, 1)
+
+	const marker = "go-nix/pkg/nar.NewReader"
+	before := countGoroutines(marker)
+	_, err := mb.BuildFromNar(context.Background(), up.url(), sph, 0, 0, "", false)
+	require.Error(t, err)
+	after := waitGoroutines(marker, before, 3*time.Second)
+	assert.LessOrEqual(t, after, before, "nar reader goroutine leaked after a failed build")
+}
+
 func TestNarinfoFingerprint(t *testing.T) {
 	sk, _ := upstreamKeys(t)
 	narData := makeNar(t, "fp", []narFile{{"/f", 10}})

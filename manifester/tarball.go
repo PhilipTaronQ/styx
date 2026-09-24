@@ -134,6 +134,7 @@ func (b *ManifestBuilder) BuildFromTarball(
 		// construct nar from contents, write to hasher and builder
 		pr, pw := io.Pipe()
 		go b.writeNar(tarEnts, tmpData, tmpBuf, pw)
+		defer pr.CloseWithError(errBuildStopped) // unblock writeNar if we stop reading early
 		narOut = pr
 	}
 
