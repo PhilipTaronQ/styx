@@ -175,3 +175,47 @@ func TestImageDataNotRetainedAfterWrite(t *testing.T) {
 	require.Nil(t, st.imageData,
 		"mounted image object still holds %d bytes of image data that was already written", len(st.imageData))
 }
+
+type restoreFdStore struct {
+	fd      int
+	removed bool
+}
+
+func (*restoreFdStore) Ready() {}
+
+func (f *restoreFdStore) GetFd(string) (int, error) { return f.fd, nil }
+
+func (*restoreFdStore) SaveFd(string, int) {}
+
+func (f *restoreFdStore) RemoveFd(string) { f.removed = true }
+
+// If the saved devnode can't be restored, setupDevNode drops it and closes it, expecting
+// systemd to restart the daemon. Start must fail so that happens, instead of carrying on
+// without on-demand.
+func TestStartFailsWhenDevnodeRestoreFails(t *testing.T) {
+	var p [2]int
+	require.NoError(t, unix.Pipe2(p[:], unix.O_CLOEXEC))
+	t.Cleanup(func() { unix.Close(p[1]) })
+	fdStore := &restoreFdStore{fd: p[0]} // writing "restore" to a pipe's read end fails
+
+	s := NewServer(Config{
+		DevPath:         "/nonexistent",
+		CachePath:       t.TempDir(),
+		CacheTag:        testDomain,
+		CacheDomain:     testDomain,
+		ErofsBlockShift: 12,
+		Workers:         2,
+		IsTesting:       true,
+		FdStore:         fdStore,
+	})
+	err := s.Start()
+	t.Cleanup(func() {
+		if err == nil {
+			s.Stop(false)
+		} else if s.db != nil {
+			s.db.Close()
+		}
+	})
+	require.ErrorIs(t, err, errRestoreFailed)
+	require.True(t, fdStore.removed, "saved devnode was not removed")
+}

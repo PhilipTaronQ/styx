@@ -376,6 +376,8 @@ func (s *Server) openDevNode() (int, error) {
 	return fd, nil
 }
 
+var errRestoreFailed = errors.New("cachefiles 'restore' failed")
+
 func (s *Server) setupDevNode() error {
 	fd, err := s.cfg.FdStore.GetFd(savedFdName)
 	if err == nil {
@@ -384,7 +386,7 @@ func (s *Server) setupDevNode() error {
 			unix.Close(fd)
 			// instead of trying to recover, just let systemd restart the process
 			// and next time we won't have a saved fd.
-			return fmt.Errorf("cachefiles 'restore' failed: %w", err)
+			return fmt.Errorf("%w: %w", errRestoreFailed, err)
 		}
 		s.devnode.Store(int32(fd))
 		log.Println("restored cachefiles device")
@@ -836,7 +838,10 @@ func (s *Server) Start() error {
 	if err := s.setupManifestSlab(); err != nil {
 		return fmt.Errorf("error setting up manifest slab: %w", err)
 	}
-	if err := s.setupDevNode(); err != nil {
+	if err := s.setupDevNode(); errors.Is(err, errRestoreFailed) {
+		// exit so that systemd restarts us, without the saved devnode
+		return err
+	} else if err != nil {
 		log.Println("on-demand features disabled:", err)
 		// don't abort, support manifest only
 	}
