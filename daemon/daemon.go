@@ -625,7 +625,7 @@ func (s *Server) handleMountReq(ctx context.Context, r *MountReq) (*Status, erro
 	return nil, s.tryMount(ctx, r, haveImageSize, haveIsBare)
 }
 
-func (s *Server) tryMount(ctx context.Context, req *MountReq, haveImageSize int64, haveIsBare bool) error {
+func (s *Server) tryMount(ctx context.Context, req *MountReq, haveImageSize int64, haveIsBare bool) (retErr error) {
 	_, sphStr, _ := ParseSph(req.StorePath)
 
 	mountCtx := &mountContext{}
@@ -635,6 +635,27 @@ func (s *Server) tryMount(ctx context.Context, req *MountReq, haveImageSize int6
 		return errors.New("another mount is in progress for this store path")
 	}
 	defer s.mountCtxMap.Delete(sphStr)
+
+	// Record the result however we return. A failure before mount(2), like a manifest the
+	// manifester can't build, must not leave the image Requested: gc keeps Requested images
+	// by default, and nothing else moves them on.
+	defer func() {
+		_ = s.imageTx(sphStr, func(img *pb.DbImage) error {
+			if retErr == nil {
+				img.MountState = pb.MountState_Mounted
+				img.LastMountError = ""
+				// if the mount succeeded then we must have written the image.
+				// record size here so we skip it next time.
+				img.ImageSize = mountCtx.imageSize
+				img.IsBare = mountCtx.isBare
+			} else {
+				img.MountState = pb.MountState_MountError
+				img.LastMountError = retErr.Error()
+				img.ImageSize = 0 // force refetch/rebuild
+			}
+			return nil
+		})
+	}()
 
 	if haveImageSize > 0 {
 		// if we have an image we can proceed right to mounting
@@ -695,22 +716,6 @@ func (s *Server) tryMount(ctx context.Context, req *MountReq, haveImageSize int6
 			mountErr = unix.Mount("none", req.MountPoint, "erofs", 0, opts)
 		}
 	}
-
-	_ = s.imageTx(sphStr, func(img *pb.DbImage) error {
-		if mountErr == nil {
-			img.MountState = pb.MountState_Mounted
-			img.LastMountError = ""
-			// if the mount succeeded then we must have written the image.
-			// record size here so we skip it next time.
-			img.ImageSize = mountCtx.imageSize
-			img.IsBare = mountCtx.isBare
-		} else {
-			img.MountState = pb.MountState_MountError
-			img.LastMountError = mountErr.Error()
-			img.ImageSize = 0 // force refetch/rebuild
-		}
-		return nil
-	})
 
 	return mountErr
 }

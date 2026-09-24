@@ -351,7 +351,22 @@ func (s *Server) gcTraceImage(g *gcCtx, sphStr string, img *pb.DbImage) error {
 
 	m, mdigs, err := s.getManifestLocal(g.tx, sphStr)
 	if err != nil {
-		return err
+		if gcNeedsManifest(img.MountState) {
+			return err
+		}
+		// A mount or materialize that failed, or is still running, before it had the whole
+		// manifest. It has no image chunks yet, so there is nothing more to trace, but keep
+		// any manifest chunks it got so a retry can use them.
+		log.Printf("gc: keeping %s (%s) without its manifest: %v", sphStr, img.MountState, err)
+		if v := g.mb.Get([]byte(sphStr)); v != nil {
+			var sm pb.SignedMessage
+			if proto.Unmarshal(v, &sm) == nil {
+				for _, mdig := range cdig.FromSliceAlias(sm.Msg.GetDigests()) {
+					g.keepDig[mdig] = struct{}{}
+				}
+			}
+		}
+		return nil
 	}
 
 	for _, mdig := range mdigs {
@@ -364,6 +379,17 @@ func (s *Server) gcTraceImage(g *gcCtx, sphStr string, img *pb.DbImage) error {
 	}
 
 	return nil
+}
+
+// Images in these states were mounted or materialized, so they have chunks, and gc must read
+// their manifests to know which. An image in another state may have no manifest yet.
+func gcNeedsManifest(st pb.MountState) bool {
+	switch st {
+	case pb.MountState_Mounted, pb.MountState_UnmountRequested, pb.MountState_Unmounted, pb.MountState_Materialized:
+		return true
+	default:
+		return false
+	}
 }
 
 func (g *gcCtx) keepAllSphps(sphps []SphPrefix) bool {
