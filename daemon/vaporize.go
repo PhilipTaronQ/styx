@@ -384,7 +384,7 @@ func (s *Server) preallocateBatch(ctx context.Context, blocks []uint16, digests 
 				}
 				addr := common.TruncU32(seq)
 				seq += uint64(blocks[i])
-				out[i] = erofs.SlabLoc{slabId, addr}
+				out[i] = erofs.SlabLoc{SlabId: slabId, Addr: addr}
 			} else {
 				out[i] = loadLoc(loc)
 				wasAllocated[i] = true
