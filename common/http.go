@@ -47,9 +47,15 @@ var ErrTooLarge = errors.New("response too large")
 // responses for RetryBudget, or until ctx is done. Other non-200 responses are returned as
 // an HttpError. The caller must close the response body.
 func RetryHttpRequest(ctx context.Context, method, url, cType string, body []byte) (*http.Response, error) {
+	return RetryHttpRequestWithClient(ctx, http.DefaultClient, method, url, cType, body)
+}
+
+// RetryHttpRequestWithClient is RetryHttpRequest using client, with the same retries and
+// budget.
+func RetryHttpRequestWithClient(ctx context.Context, client *http.Client, method, url, cType string, body []byte) (*http.Response, error) {
 	return retry.DoWithData(
 		func() (*http.Response, error) {
-			return doHttpRequest(ctx, method, url, cType, body)
+			return doHttpRequest(ctx, client, method, url, cType, body)
 		},
 		retryOpts(ctx)...,
 	)
@@ -78,7 +84,7 @@ func RetryHttpRequestBody(
 			}
 			defer cancel()
 
-			res, err := doHttpRequest(attemptCtx, method, url, cType, body)
+			res, err := doHttpRequest(attemptCtx, http.DefaultClient, method, url, cType, body)
 			if err == nil {
 				defer res.Body.Close()
 				var b []byte
@@ -100,7 +106,7 @@ func RetryHttpRequestBody(
 	return res.body, res.header, err
 }
 
-func doHttpRequest(ctx context.Context, method, url, cType string, body []byte) (*http.Response, error) {
+func doHttpRequest(ctx context.Context, client *http.Client, method, url, cType string, body []byte) (*http.Response, error) {
 	var bReader io.Reader
 	if body != nil {
 		bReader = bytes.NewReader(body)
@@ -112,7 +118,7 @@ func doHttpRequest(ctx context.Context, method, url, cType string, body []byte) 
 	if cType != "" {
 		req.Header.Set("Content-Type", cType)
 	}
-	res, err := http.DefaultClient.Do(req)
+	res, err := client.Do(req)
 	if err == nil && res.StatusCode != http.StatusOK {
 		err = HttpErrorFromRes(res)
 		res.Body.Close()

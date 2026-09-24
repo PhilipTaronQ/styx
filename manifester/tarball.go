@@ -19,13 +19,21 @@ import (
 
 	"github.com/dnr/styx/common"
 	"github.com/dnr/styx/common/cdig"
+	"github.com/dnr/styx/common/nar"
 	"github.com/dnr/styx/common/resolve"
 	"github.com/dnr/styx/pb"
-	"github.com/nix-community/go-nix/pkg/nar"
 	"github.com/nix-community/go-nix/pkg/nixbase32"
 	"github.com/nix-community/go-nix/pkg/nixhash"
 	"github.com/nix-community/go-nix/pkg/storepath"
 	"google.golang.org/protobuf/proto"
+)
+
+const (
+	// Limits on tarball structure. Each entry adds its missing parents, and sorting compares
+	// paths component by component, so the cost grows with depth as well as entry count.
+	maxTarPathLen   = 4096 // PATH_MAX, also bounds the depth
+	maxTarEntries   = 1 << 20
+	maxTarPathBytes = 64 << 20 // total over all entries, including added parents
 )
 
 type tarEntry struct {
@@ -43,7 +51,7 @@ func (b *ManifestBuilder) BuildFromTarball(
 	log.Println("manifest tarball", upstream)
 
 	// resolve the url to a hopefully-immutable url and get an etag for constructing a cache key
-	rr, err := resolve.ResolveUrl(ctx, upstream)
+	rr, err := resolve.ResolveUrl(ctx, b.upstreamClient, upstream)
 	if err != nil {
 		return nil, err
 	}
@@ -71,7 +79,7 @@ func (b *ManifestBuilder) BuildFromTarball(
 		var tarOut io.Reader
 		var decompress *exec.Cmd
 
-		res, err := common.RetryHttpRequest(ctx, http.MethodGet, rr.Url, "", nil)
+		res, err := common.RetryHttpRequestWithClient(ctx, b.upstreamClient, http.MethodGet, rr.Url, "", nil)
 		if err != nil {
 			return nil, fmt.Errorf("%w: tar http error for %s: %w", ErrReq, upstream, err)
 		}
@@ -134,6 +142,7 @@ func (b *ManifestBuilder) BuildFromTarball(
 		// construct nar from contents, write to hasher and builder
 		pr, pw := io.Pipe()
 		go b.writeNar(tarEnts, tmpData, tmpBuf, pw)
+		defer pr.CloseWithError(errBuildStopped) // unblock writeNar if we stop reading early
 		narOut = pr
 	}
 
@@ -172,8 +181,17 @@ func (b *ManifestBuilder) BuildFromTarball(
 
 	b.stats.Shards.Add(1)
 
-	// if we're not shard 0, we're done
-	if shardIndex != 0 {
+	cacheKey := (&ManifestReq{
+		Upstream:      rr.Url,
+		StorePathHash: sph,
+		DigestAlgo:    cdig.Algo,
+		DigestBits:    int(cdig.Bits),
+	}).CacheKey()
+
+	// in a sharded build, only a shard that finds every shard done caches the manifest
+	if done, err := b.shardsDone(ctx, args, cacheKey, manifest); err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrInternal, err)
+	} else if !done {
 		return nil, nil
 	}
 
@@ -211,15 +229,7 @@ func (b *ManifestBuilder) BuildFromTarball(
 	}
 
 	// write to cache (it'd be nice to return and do this in the background, but that doesn't
-	// work on lambda)
-	// TODO: we shouldn't write to cache unless we know for sure that other shards are done.
-	// (or else change client to re-request manifest on missing)
-	cacheKey := (&ManifestReq{
-		Upstream:      rr.Url,
-		StorePathHash: sph,
-		DigestAlgo:    cdig.Algo,
-		DigestBits:    int(cdig.Bits),
-	}).CacheKey()
+	// work on lambda). shardsDone made sure every chunk is there.
 	cmpSb, err := b.cs.PutIfNotExists(ctx, ManifestCachePath, cacheKey, sb)
 	if err != nil {
 		return nil, fmt.Errorf("%w: manifest cache write error: %w", ErrInternal, err)
@@ -267,7 +277,7 @@ func (b *ManifestBuilder) BuildFromTarball(
 			broot.Manifest = append(broot.Manifest, etagCacheKey)
 		}
 		if brdata, err := proto.Marshal(broot); err == nil {
-			brkey := strings.Join([]string{"manifest", btime.Format(time.RFC3339), "m", "m"}, "@")
+			brkey := buildRootKey(btime, cacheKey)
 			if _, err = b.cs.PutIfNotExists(ctx, BuildRootPath, brkey, brdata); err != nil {
 				return nil, fmt.Errorf("%w: build root write error: %w", ErrInternal, err)
 			}
@@ -296,6 +306,7 @@ func (b *ManifestBuilder) extractTar(r io.Reader, tmpData *os.File, tmpBuf []byt
 		},
 	}}
 	seen := map[string]int{"/": 0} // path -> index in ents
+	pathBytes := 0
 
 	for {
 		ent, err := b.tarEntry(tr, tmpData, tmpBuf)
@@ -329,6 +340,14 @@ func (b *ManifestBuilder) extractTar(r io.Reader, tmpData *os.File, tmpBuf []byt
 		} else {
 			seen[ent.Path] = len(ents)
 			ents = append(ents, ent)
+		}
+
+		for _, p := range parents {
+			pathBytes += len(p)
+		}
+		pathBytes += len(ent.Path)
+		if len(ents) > maxTarEntries || pathBytes > maxTarPathBytes {
+			return nil, fmt.Errorf("tarball has more than %d entries or %d bytes of paths", maxTarEntries, maxTarPathBytes)
 		}
 	}
 
@@ -383,13 +402,23 @@ func (b *ManifestBuilder) tarEntry(tr *tar.Reader, tmpData *os.File, tmpBuf []by
 		return nil, err
 	} else if h.Typeflag == tar.TypeXGlobalHeader {
 		return nil, nil // skip PAX global headers
+	} else if len(h.Name) > maxTarPathLen || len(h.Linkname) > maxTarPathLen {
+		return nil, fmt.Errorf("tar entry name or link target longer than %d bytes", maxTarPathLen)
 	}
 
+	// like tar, refuse ".." components. path.Clean keeps a leading "..", and "/../x" would
+	// then sort next to "/x" and turn into a duplicate entry named "." in the nar.
+	if slices.Contains(strings.Split(h.Name, "/"), "..") {
+		return nil, fmt.Errorf("tar entry name %q contains \"..\"", h.Name)
+	}
 	name := path.Clean(h.Name)
 	if name == "." {
 		name = "/"
 	} else {
 		name = "/" + strings.Trim(name, "/")
+	}
+	if name == "/" && h.Typeflag != tar.TypeDir {
+		return nil, fmt.Errorf("tar entry %q for the root is not a directory", h.Name)
 	}
 
 	e := &tarEntry{

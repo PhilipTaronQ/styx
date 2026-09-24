@@ -17,6 +17,7 @@ import (
 	"os/exec"
 	"path"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/DataDog/zstd"
@@ -36,6 +37,8 @@ const (
 	// maxSmallFileCutoff = 480
 
 	SmallManifestCutoff = 32 * 1024
+
+	defaultChunkDiffParallel = 60
 
 	// max size of json-encoded stats. if we add more stats, may need to increase this
 	statsSpace = 256
@@ -59,6 +62,15 @@ type (
 )
 
 func NewManifestServer(cfg Config, mb *ManifestBuilder) (*server, error) {
+	if cfg.ChunkDiffParallel < 0 {
+		return nil, fmt.Errorf("ChunkDiffParallel must be positive, not %d", cfg.ChunkDiffParallel)
+	} else if cfg.ChunkDiffParallel == 0 {
+		// a limit of 0 would make every chunk fetch block forever
+		cfg.ChunkDiffParallel = defaultChunkDiffParallel
+	}
+	// the server takes requests from anyone, so its builds may follow upstream redirects only
+	// to allowed hosts
+	mb.upstreamClient = newUpstreamClient(cfg.AllowedUpstreams)
 	return &server{
 		cfg: &cfg,
 		mb:  mb,
@@ -72,6 +84,8 @@ func (s *server) validateManifestReq(r *ManifestReq, upstreamHost string) error 
 	} else if r.DigestBits != cdig.Bits {
 		return fmt.Errorf("mismatched digest bits (this server uses %d, not %d)",
 			cdig.Bits, r.DigestBits)
+	} else if !validShard(r.ShardTotal, r.ShardIndex) {
+		return fmt.Errorf("invalid shard %d of %d", r.ShardIndex, r.ShardTotal)
 	}
 
 	if !slices.Contains(s.cfg.AllowedUpstreams, upstreamHost) {
@@ -102,7 +116,8 @@ func (s *server) handleManifest(w http.ResponseWriter, req *http.Request) {
 
 	log.Println("req", r.StorePathHash, "from", r.Upstream)
 
-	mres, err := s.mb.Build(req.Context(), r.BuildMode, r.Upstream, r.StorePathHash, r.ShardTotal, r.ShardIndex, "", true)
+	ctx := req.Context()
+	mres, err := s.mb.Build(ctx, r.BuildMode, r.Upstream, r.StorePathHash, r.ShardTotal, r.ShardIndex, "", true)
 
 	if err != nil {
 		log.Println("build error:", err)
@@ -110,11 +125,13 @@ func (s *server) handleManifest(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	if r.ShardIndex != 0 {
+	if mres == nil {
+		// another shard caches and returns the manifest
 		w.Write([]byte(fmt.Sprintf("shard %d/%d ok", r.ShardIndex, r.ShardTotal)))
 		return
 	}
 
+	w.Header().Set(ManifestHeader, "1")
 	w.Header().Set("Content-Encoding", "zstd")
 	w.Write(mres.Bytes)
 }
@@ -158,7 +175,11 @@ func (s *server) handleChunkDiff(w http.ResponseWriter, req *http.Request) {
 	if r.Params.GetDigestAlgo() != cdig.Algo || r.Params.GetDigestBits() != cdig.Bits {
 		writeError(w, fmt.Errorf("%w: parameter mismatch", ErrReq))
 		return
+	} else if err := checkChunkDiffReq(&r); err != nil {
+		writeError(w, err)
+		return
 	}
+	baseBudget, reqBudget := newDiffBudget(), newDiffBudget()
 
 	// load requested chunks
 	start := time.Now()
@@ -185,17 +206,18 @@ func (s *server) handleChunkDiff(w http.ResponseWriter, req *http.Request) {
 		stats.ReqChunks += len(ri.Reqs) / cdig.Bytes
 
 		expandGrp.Go(func() (err error) {
-			baseDatas[i], err = s.expand(egCtx, cdig.FromSliceAlias(ri.Bases), ri.ExpandBeforeDiff)
+			baseDatas[i], err = s.expand(egCtx, cdig.FromSliceAlias(ri.Bases), ri.ExpandBeforeDiff, baseBudget)
 			return
 		})
 		expandGrp.Go(func() (err error) {
-			reqDatas[i], err = s.expand(egCtx, cdig.FromSliceAlias(ri.Reqs), ri.ExpandBeforeDiff)
+			reqDatas[i], err = s.expand(egCtx, cdig.FromSliceAlias(ri.Reqs), ri.ExpandBeforeDiff, reqBudget)
 			return
 		})
 	}
 
 	// wait for all
 	if err := expandGrp.Wait(); err != nil {
+		egCtx.Cancel(err) // stop fetches that are still running
 		log.Println("chunk read error:", err)
 		writeError(w, err)
 		return
@@ -258,7 +280,7 @@ func (s *server) handleChunkDiff(w http.ResponseWriter, req *http.Request) {
 	log.Printf("diff done %#v", stats)
 }
 
-func (s *server) expand(egCtx *errgroup.Group, digests []cdig.CDig, expand string) ([]byte, error) {
+func (s *server) expand(egCtx *errgroup.Group, digests []cdig.CDig, expand string, budget *diffBudget) ([]byte, error) {
 	if len(digests) == 0 {
 		return nil, nil
 	}
@@ -267,14 +289,15 @@ func (s *server) expand(egCtx *errgroup.Group, digests []cdig.CDig, expand strin
 	case ExpandGz:
 		pr, pw := io.Pipe()
 		go func() {
-			pw.CloseWithError(s.fetchChunkSeries(egCtx, digests, pw))
+			pw.CloseWithError(s.fetchChunkSeries(egCtx, digests, pw, &budget.fetch))
 		}()
+		// if we stop reading early, make writes to the write end fail
+		defer pr.CloseWithError(errExpandDone)
 		gzr, err := gzip.NewReader(pr)
 		if err != nil {
-			pr.CloseWithError(err) // cause writes to write end to fail
 			return nil, err
 		}
-		return io.ReadAll(gzr)
+		return io.ReadAll(budgetReader{gzr, &budget.expand})
 
 	case ExpandXz:
 		decompress := exec.CommandContext(egCtx, common.XzBin, "-d")
@@ -289,49 +312,132 @@ func (s *server) expand(egCtx *errgroup.Group, digests []cdig.CDig, expand strin
 		if err = decompress.Start(); err != nil {
 			return nil, err
 		}
+		fetchErr := make(chan error, 1)
 		go func() {
-			s.fetchChunkSeries(egCtx, digests, pw)
+			err := s.fetchChunkSeries(egCtx, digests, pw, &budget.fetch)
 			pw.Close()
+			fetchErr <- err
 		}()
-		out, readErr := io.ReadAll(pr)
-		return common.ValOrErr(out, cmp.Or(decompress.Wait(), readErr))
+		out, readErr := io.ReadAll(budgetReader{pr, &budget.expand})
+		if readErr != nil {
+			egCtx.Cancel(readErr) // kill xz, which may be blocked writing to us
+		}
+		waitErr := decompress.Wait() // also closes pw, so the fetch can't block writing to it
+		// a failed fetch truncates xz's input (or kills it), so its error is the real one
+		return common.ValOrErr(out, cmp.Or(<-fetchErr, readErr, waitErr))
 
 	default:
 		var out bytes.Buffer
 		out.Grow(len(digests) << shift.DefaultChunkShift)
-		err := s.fetchChunkSeries(egCtx, digests, &out)
+		err := s.fetchChunkSeries(egCtx, digests, &out, &budget.fetch)
 		return common.ValOrErr(out.Bytes(), err)
 	}
 }
 
-func (s *server) fetchChunkSeries(egCtx *errgroup.Group, digests []cdig.CDig, out io.Writer) error {
+func (s *server) fetchChunkSeries(egCtx *errgroup.Group, digests []cdig.CDig, out io.Writer, budget *atomic.Int64) error {
 	// TODO: ew, use separate setting?
 	cs := s.mb.cs
 
-	chs := make(chan chan []byte, egCtx.Limit())
+	// Each fetch sends its error along with its data: a failed fetch cancels egCtx only
+	// after its result is sent, so checking egCtx for errors could miss it, and the failed
+	// chunk would read as empty.
+	type result struct {
+		b   []byte
+		err error
+	}
+	chs := make(chan chan result, egCtx.Limit())
 	go func() {
 		for i := 0; i < len(digests) && egCtx.Err() == nil; i++ {
 			digest := digests[i]
 			digestStr := digest.String()
-			ch := make(chan []byte)
+			ch := make(chan result, 1)
 			chs <- ch
 			egCtx.Go(func() error {
 				b, err := cs.Get(egCtx, ChunkReadPath, digestStr, nil)
-				ch <- b
+				ch <- result{b, err}
 				return err
 			})
 		}
 		close(chs)
 	}()
 
+	// read every result, so that the producer isn't left blocked, but stop writing at the
+	// first error
+	var err error
 	for ch := range chs {
-		if b := <-ch; len(b) > 0 && egCtx.Err() == nil {
-			if _, err := out.Write(b); err != nil {
-				egCtx.Cancel(err)
-			}
+		r := <-ch
+		if err != nil {
+			continue
+		}
+		err = cmp.Or(r.err, context.Cause(egCtx))
+		if err == nil && budget.Add(-int64(len(r.b))) < 0 {
+			err = errChunkDiffTooBig
+		}
+		if err == nil {
+			_, err = out.Write(r.b)
+		}
+		if err != nil {
+			egCtx.Cancel(err)
 		}
 	}
-	return context.Cause(egCtx)
+	return cmp.Or(err, context.Cause(egCtx))
+}
+
+const (
+	// gz and xz expansion can produce much more than ChunkDiffMaxBytes
+	chunkDiffMaxExpandedBytes = 4 * ChunkDiffMaxBytes
+)
+
+var (
+	errChunkDiffTooBig = fmt.Errorf("%w: chunk diff data is too big", ErrReq)
+	errExpandDone      = errors.New("expansion finished")
+)
+
+// checkChunkDiffReq enforces the documented limits on digests (and on the number of
+// requests, which is otherwise unbounded).
+func checkChunkDiffReq(r *pb.ManifesterChunkDiffReq) error {
+	if len(r.Req) > ChunkDiffMaxDigests {
+		return fmt.Errorf("%w: too many requests (%d)", ErrReq, len(r.Req))
+	}
+	var bases, reqs int
+	for _, ri := range r.Req {
+		if len(ri.Bases)%cdig.Bytes != 0 || len(ri.Reqs)%cdig.Bytes != 0 {
+			return fmt.Errorf("%w: digest lists must be a multiple of %d bytes", ErrReq, cdig.Bytes)
+		}
+		bases += len(ri.Bases) / cdig.Bytes
+		reqs += len(ri.Reqs) / cdig.Bytes
+	}
+	if bases > ChunkDiffMaxDigests || reqs > ChunkDiffMaxDigests {
+		return fmt.Errorf("%w: too many digests (%d bases, %d reqs, max %d each)",
+			ErrReq, bases, reqs, ChunkDiffMaxDigests)
+	}
+	return nil
+}
+
+// diffBudget is the number of bytes left for one side (bases or reqs) of a chunk diff, as
+// fetched from the chunk store and after expansion.
+type diffBudget struct {
+	fetch, expand atomic.Int64
+}
+
+func newDiffBudget() *diffBudget {
+	b := &diffBudget{}
+	b.fetch.Store(ChunkDiffMaxBytes)
+	b.expand.Store(chunkDiffMaxExpandedBytes)
+	return b
+}
+
+type budgetReader struct {
+	r    io.Reader
+	left *atomic.Int64
+}
+
+func (br budgetReader) Read(p []byte) (int, error) {
+	n, err := br.r.Read(p)
+	if br.left.Add(-int64(n)) < 0 {
+		return n, errChunkDiffTooBig
+	}
+	return n, err
 }
 
 func (s *server) handleChunk(w http.ResponseWriter, r *http.Request) {

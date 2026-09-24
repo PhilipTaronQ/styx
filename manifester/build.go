@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"crypto/rand"
 	_ "crypto/sha1" // for narinfo NarHash
 	"crypto/sha256"
 	_ "crypto/sha512" // for narinfo NarHash
@@ -16,21 +17,24 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/DataDog/zstd"
-	"github.com/nix-community/go-nix/pkg/nar"
 	"github.com/nix-community/go-nix/pkg/narinfo"
 	"github.com/nix-community/go-nix/pkg/narinfo/signature"
+	"github.com/nix-community/go-nix/pkg/nixbase32"
 	"github.com/nix-community/go-nix/pkg/nixhash"
+	"github.com/nix-community/go-nix/pkg/storepath"
 	"golang.org/x/sync/semaphore"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/dnr/styx/common"
 	"github.com/dnr/styx/common/cdig"
 	"github.com/dnr/styx/common/errgroup"
+	"github.com/dnr/styx/common/nar"
 	"github.com/dnr/styx/common/shift"
 	"github.com/dnr/styx/pb"
 )
@@ -39,6 +43,9 @@ const (
 	// Build modes
 	ModeNar            = "" // default
 	ModeGenericTarball = "generic-tarball"
+
+	// narinfo.Parse allows lines up to 1 MiB, and real narinfos are much smaller
+	maxNarinfoSize = 2 << 20
 )
 
 type (
@@ -59,6 +66,9 @@ type (
 		pubKeys    []signature.PublicKey
 		signKeys   []signature.SecretKey
 		chunkSizer func(int64) shift.Shift
+		// for narinfo, nar and tarball fetches. a manifester server replaces it with one that
+		// follows redirects only to its allowed upstreams.
+		upstreamClient *http.Client
 
 		stats atomicStats
 	}
@@ -87,7 +97,8 @@ type (
 		ConcurrentChunkOps int
 		ChunkSizer         func(int64) shift.Shift
 
-		// Verify loaded narinfo against these keys. Nil means don't verify.
+		// Verify loaded narinfo against these keys. Required to build from nars (there's no
+		// way to turn verification off); tarball builds don't use them.
 		PublicKeys []signature.PublicKey
 		// Sign manifests with these keys.
 		SigningKeys []signature.SecretKey
@@ -119,10 +130,11 @@ func NewManifestBuilder(cfg ManifestBuilderConfig, cs ChunkStoreWrite) (*Manifes
 			DigestAlgo: cdig.Algo,
 			DigestBits: int32(cdig.Bits),
 		},
-		chunkPool:  common.NewChunkPool(),
-		pubKeys:    cfg.PublicKeys,
-		signKeys:   cfg.SigningKeys,
-		chunkSizer: chunkSizer,
+		chunkPool:      common.NewChunkPool(),
+		pubKeys:        cfg.PublicKeys,
+		signKeys:       cfg.SigningKeys,
+		chunkSizer:     chunkSizer,
+		upstreamClient: http.DefaultClient,
 	}, nil
 }
 
@@ -175,27 +187,48 @@ func (b *ManifestBuilder) BuildFromNar(
 ) (*ManifestBuildRes, error) {
 	// get narinfo
 
+	if len(b.pubKeys) == 0 {
+		return nil, fmt.Errorf("%w: no public keys configured to verify narinfo", ErrInternal)
+	} else if len(storePathHash) != nixbase32.EncodedLen(storepath.PathHashSize) || nixbase32.ValidateString(storePathHash) != nil {
+		return nil, fmt.Errorf("%w: invalid store path hash %q", ErrReq, storePathHash)
+	}
 	upstreamUrl, err := url.Parse(upstream)
 	if err != nil {
 		return nil, err
 	}
 	narinfoUrl := upstreamUrl.JoinPath(storePathHash + ".narinfo").String()
-	res, err := common.RetryHttpRequest(ctx, http.MethodGet, narinfoUrl, "", nil)
+	res, err := common.RetryHttpRequestWithClient(ctx, b.upstreamClient, http.MethodGet, narinfoUrl, "", nil)
 	if err != nil {
+		// RetryHttpRequest returns non-200 responses as errors
+		if common.IsNotFound(err) {
+			return nil, fmt.Errorf("%w: upstream http for %s: %w", ErrNotFound, narinfoUrl, err)
+		}
 		return nil, fmt.Errorf("%w: upstream http for %s: %w", ErrReq, narinfoUrl, err)
 	}
 	defer res.Body.Close()
 
 	if res.StatusCode != http.StatusOK {
-		if res.StatusCode == http.StatusNotFound {
-			return nil, fmt.Errorf("%w: upstream http for %s", ErrNotFound, narinfoUrl)
-		}
 		return nil, fmt.Errorf("%w: upstream http for %s: %s", ErrReq, narinfoUrl, res.Status)
 	}
 
-	ni, err := narinfo.Parse(res.Body)
+	niBytes, err := io.ReadAll(io.LimitReader(res.Body, maxNarinfoSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("%w: upstream http for %s: %w", ErrReq, narinfoUrl, err)
+	} else if len(niBytes) > maxNarinfoSize {
+		return nil, fmt.Errorf("%w: narinfo for %s is larger than %d bytes", ErrReq, narinfoUrl, maxNarinfoSize)
+	}
+	ni, err := narinfo.Parse(bytes.NewReader(niBytes))
 	if err != nil {
 		return nil, fmt.Errorf("%w: narinfo parse for %s: %w", ErrReq, narinfoUrl, err)
+	}
+
+	// check the fields we use (the fingerprint needs NarHash)
+	if ni.NarHash == nil {
+		return nil, fmt.Errorf("%w: narinfo for %s has no NarHash", ErrReq, narinfoUrl)
+	} else if sp, err := storepath.FromAbsolutePath(ni.StorePath); err != nil {
+		return nil, fmt.Errorf("%w: narinfo for %s: %w", ErrReq, narinfoUrl, err)
+	} else if nixbase32.EncodeToString(sp.Digest) != storePathHash {
+		return nil, fmt.Errorf("%w: narinfo for %s has store path %s", ErrReq, narinfoUrl, ni.StorePath)
 	}
 
 	// verify signature
@@ -203,7 +236,7 @@ func (b *ManifestBuilder) BuildFromNar(
 	// TODO: I think if ni.CA is present, then we can verify the CA field here instead of
 	// requiring a signature
 
-	if !signature.VerifyFirst(ni.Fingerprint(), ni.Signatures, b.pubKeys) {
+	if !signature.VerifyFirst(narinfoFingerprint(ni), ni.Signatures, b.pubKeys) {
 		return nil, fmt.Errorf("%w: signature validation failed for %s; narinfo %#v", ErrReq, narinfoUrl, ni)
 	}
 
@@ -229,7 +262,7 @@ func (b *ManifestBuilder) BuildFromNar(
 	} else {
 		// start := time.Now()
 		narUrl := upstreamUrl.JoinPath(ni.URL).String()
-		res, err = common.RetryHttpRequest(ctx, http.MethodGet, narUrl, "", nil)
+		res, err = common.RetryHttpRequestWithClient(ctx, b.upstreamClient, http.MethodGet, narUrl, "", nil)
 		if err != nil {
 			return nil, fmt.Errorf("%w: nar http error for %s: %w", ErrReq, narUrl, err)
 		}
@@ -319,8 +352,17 @@ func (b *ManifestBuilder) BuildFromNar(
 
 	b.stats.Shards.Add(1)
 
-	// if we're not shard 0, we're done
-	if shardIndex != 0 {
+	cacheKey := (&ManifestReq{
+		Upstream:      upstream,
+		StorePathHash: storePathHash,
+		DigestAlgo:    cdig.Algo,
+		DigestBits:    int(cdig.Bits),
+	}).CacheKey()
+
+	// in a sharded build, only a shard that finds every shard done caches the manifest
+	if done, err := b.shardsDone(ctx, args, cacheKey, manifest); err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrInternal, err)
+	} else if !done {
 		return nil, nil
 	}
 
@@ -330,7 +372,6 @@ func (b *ManifestBuilder) BuildFromNar(
 		StorePath:   ni.StorePath,
 		Url:         ni.URL,
 		Compression: ni.Compression,
-		FileHash:    ni.FileHash.Format(nixhash.NixBase32, true),
 		FileSize:    int64(ni.FileSize),
 		NarHash:     ni.NarHash.Format(nixhash.NixBase32, true),
 		NarSize:     int64(ni.NarSize),
@@ -339,6 +380,9 @@ func (b *ManifestBuilder) BuildFromNar(
 		System:      ni.System,
 		Signatures:  make([]string, len(ni.Signatures)),
 		Ca:          ni.CA,
+	}
+	if ni.FileHash != nil { // optional, and not covered by the signature
+		nipb.FileHash = ni.FileHash.Format(nixhash.NixBase32, true)
 	}
 	for i, sig := range ni.Signatures {
 		nipb.Signatures[i] = sig.String()
@@ -365,15 +409,7 @@ func (b *ManifestBuilder) BuildFromNar(
 	}
 
 	// write to cache (it'd be nice to return and do this in the background, but that doesn't
-	// work on lambda)
-	// TODO: we shouldn't write to cache unless we know for sure that other shards are done.
-	// (or else change client to re-request manifest on missing)
-	cacheKey := (&ManifestReq{
-		Upstream:      upstream,
-		StorePathHash: storePathHash,
-		DigestAlgo:    cdig.Algo,
-		DigestBits:    int(cdig.Bits),
-	}).CacheKey()
+	// work on lambda). shardsDone made sure every chunk is there.
 	cmpSb, err := b.cs.PutIfNotExists(ctx, ManifestCachePath, cacheKey, sb)
 	if err != nil {
 		return nil, fmt.Errorf("%w: manifest cache write error: %w", ErrInternal, err)
@@ -400,7 +436,7 @@ func (b *ManifestBuilder) BuildFromNar(
 			Manifest: []string{cacheKey},
 		}
 		if brdata, err := proto.Marshal(broot); err == nil {
-			brkey := strings.Join([]string{"manifest", btime.Format(time.RFC3339), "m", "m"}, "@")
+			brkey := buildRootKey(btime, cacheKey)
 			if _, err = b.cs.PutIfNotExists(ctx, BuildRootPath, brkey, brdata); err != nil {
 				return nil, fmt.Errorf("%w: build root write error: %w", ErrInternal, err)
 			}
@@ -417,6 +453,35 @@ func (b *ManifestBuilder) BuildFromNar(
 	}, nil
 }
 
+// buildRootKey returns a new key for the build root of an on-demand manifest. ci/gc.go reads
+// the build time from the second field. The cache key and a random suffix keep manifests
+// built in the same second from sharing a key (only the first would get a root).
+func buildRootKey(btime time.Time, cacheKey string) string {
+	return strings.Join([]string{"manifest", btime.Format(time.RFC3339), cacheKey, rand.Text()}, "@")
+}
+
+// narinfoFingerprint is ni.Fingerprint(), which builds the reference list with repeated
+// string concatenation, in linear time. It runs before the signature is checked.
+func narinfoFingerprint(ni *narinfo.NarInfo) string {
+	var sb strings.Builder
+	sb.WriteString("1;")
+	sb.WriteString(ni.StorePath)
+	sb.WriteByte(';')
+	sb.WriteString(ni.NarHash.Format(nixhash.NixBase32, true))
+	sb.WriteByte(';')
+	sb.WriteString(strconv.FormatUint(ni.NarSize, 10))
+	sb.WriteByte(';')
+	for i, ref := range ni.References {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		sb.WriteString(storepath.StoreDir)
+		sb.WriteByte('/')
+		sb.WriteString(ref)
+	}
+	return sb.String()
+}
+
 func (b *ManifestBuilder) buildFromNar(ctx context.Context, args *BuildArgs, r io.Reader) (*pb.Manifest, error) {
 	m := &pb.Manifest{
 		Params:          b.params,
@@ -427,6 +492,8 @@ func (b *ManifestBuilder) buildFromNar(ctx context.Context, args *BuildArgs, r i
 	if err != nil {
 		return nil, err
 	}
+	// stops the parser goroutine if we stop early
+	defer nr.Close()
 
 	egCtx := errgroup.WithContext(ctx)
 	for err == nil && egCtx.Err() == nil {
@@ -436,8 +503,12 @@ func (b *ManifestBuilder) buildFromNar(ctx context.Context, args *BuildArgs, r i
 		err = nil
 	}
 
-	return common.ValOrErr(m, cmp.Or(err, egCtx.Wait()))
+	// a failed chunk upload cancels egCtx, so the loop may have stopped with a context
+	// error: report the upload's error instead
+	return common.ValOrErr(m, cmp.Or(egCtx.Wait(), err))
 }
+
+var errBuildStopped = errors.New("manifest build stopped")
 
 func (b *ManifestBuilder) ManifestAsEntry(ctx context.Context, args *BuildArgs, path string, manifest *pb.Manifest) (*pb.Entry, error) {
 	mb, err := proto.Marshal(manifest)
@@ -465,7 +536,7 @@ func (b *ManifestBuilder) ManifestAsEntry(ctx context.Context, args *BuildArgs, 
 	egCtx := errgroup.WithContext(ctx)
 	entry.Digests, err = b.chunkData(egCtx, args, int64(len(mb)), shift.ManifestChunkShift, bytes.NewReader(mb))
 
-	return common.ValOrErr(entry, cmp.Or(err, egCtx.Wait()))
+	return common.ValOrErr(entry, cmp.Or(egCtx.Wait(), err))
 }
 
 func (b *ManifestBuilder) entry(egCtx *errgroup.Group, args *BuildArgs, m *pb.Manifest, nr *nar.Reader) error {

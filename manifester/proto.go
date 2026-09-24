@@ -27,6 +27,10 @@ var (
 
 	// header value is base64(proto-encoded pb.Lengths)
 	LengthsHeader = "x-styx-lengths"
+
+	// Set (to "1") on a manifest response whose body is the manifest. In a sharded request,
+	// only a shard that finds every shard done sends the manifest (see shard.go).
+	ManifestHeader = "x-styx-manifest"
 )
 
 type (
@@ -44,11 +48,12 @@ type (
 		// used for tarball cache lookups only
 		ETag string
 
-		// sharded manifesting (not in cache key, only shard 0 writes to cache)
+		// sharded manifesting (not in cache key). Send every shard: the one that finishes
+		// last writes the manifest to the cache and returns it (see shard.go).
 		ShardTotal int `json:",omitempty"`
 		ShardIndex int `json:",omitempty"`
 	}
-	// response is SignedManifest
+	// response is the zstd-compressed SignedMessage, if the ManifestHeader is set
 
 	// deprecated: use pb.ManifesterChunkDiffReq
 	DeprecatedChunkDiffReq struct {

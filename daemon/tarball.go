@@ -151,7 +151,7 @@ func (s *Server) handleTarballReq(ctx context.Context, r *TarballReq) (*TarballR
 
 	// we only have a url at this point, not a sph. resolve the url to a hopefully-immutable
 	// url with etag for cache lookup if possible.
-	rr, err := resolve.ResolveUrl(ctx, r.UpstreamUrl)
+	rr, err := resolve.ResolveUrl(ctx, http.DefaultClient, r.UpstreamUrl)
 	if err != nil {
 		return nil, err
 	}

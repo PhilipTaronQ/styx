@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"path"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/DataDog/zstd"
@@ -255,7 +256,10 @@ func (s *Server) getNewManifest(ctx context.Context, req manifester.ManifestReq,
 	log.Print(msg)
 	egCtx := errgroup.WithContext(ctx)
 
-	var shard0 []byte
+	// every shard has to succeed, and the one that finishes last caches the manifest and
+	// returns it (two may, if they finish together)
+	var manifestMu sync.Mutex
+	var manifest []byte
 	for i := range shards {
 		egCtx.Go(func() error {
 			thisReq := req
@@ -267,22 +271,30 @@ func (s *Server) getNewManifest(ctx context.Context, req manifester.ManifestReq,
 			}
 			// no attempt timeout: building a manifest can take a while
 			maxBody := int64(zstd.CompressBound(manifester.MaxEnvelopeBytes))
-			b, _, err := common.RetryHttpRequestBody(egCtx, http.MethodPost, url, common.CTJson, reqBytes, maxBody, 0)
+			b, hdr, err := common.RetryHttpRequestBody(egCtx, http.MethodPost, url, common.CTJson, reqBytes, maxBody, 0)
 			if err != nil {
 				return fmt.Errorf("manifester http error: %w", err)
 			}
-			if i == 0 {
-				if shard0, err = common.DecompressLimit(b, manifester.MaxEnvelopeBytes); err != nil {
-					return fmt.Errorf("manifester response: %w", err)
-				}
+			if hdr.Get(manifester.ManifestHeader) == "" {
+				return nil // another shard caches and returns the manifest
+			}
+			b, err = common.DecompressLimit(b, manifester.MaxEnvelopeBytes)
+			if err != nil {
+				return fmt.Errorf("manifester response: %w", err)
+			}
+			manifestMu.Lock()
+			defer manifestMu.Unlock()
+			if manifest == nil {
+				manifest = b
 			}
 			return nil
 		})
 	}
 
-	err := egCtx.Wait()
-	if err != nil {
+	if err := egCtx.Wait(); err != nil {
 		return nil, err
+	} else if manifest == nil {
+		return nil, fmt.Errorf("manifester returned no manifest for %d shards", shards)
 	}
 	elapsed := time.Since(start)
 	msg = "got manifest for " + req.StorePathHash
@@ -294,7 +306,7 @@ func (s *Server) getNewManifest(ctx context.Context, req manifester.ManifestReq,
 		msg += fmt.Sprintf(" (%d shards)", shards)
 	}
 	log.Print(msg)
-	return shard0, nil
+	return manifest, nil
 }
 
 func (s *Server) calcShards(narSize int64) int {

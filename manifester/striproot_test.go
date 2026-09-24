@@ -3,8 +3,9 @@ package manifester
 import (
 	"testing"
 
-	"github.com/nix-community/go-nix/pkg/nar"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/dnr/styx/common/nar"
 )
 
 func TestStripRoot(t *testing.T) {

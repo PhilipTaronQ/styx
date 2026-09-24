@@ -4,7 +4,6 @@
   "manifestCacheUrl": "https://styx-1.s3.amazonaws.com/",
   "chunkReadUrl":     "https://styx-1.s3.amazonaws.com/",
   "params": {
-    "chunkShift": 16,
     "digestAlgo": "sha256",
     "digestBits": 192
   }

@@ -225,6 +225,7 @@ func (e *fetchEnv) handleManifester(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Encoding", "zstd")
+	w.Header().Set(manifester.ManifestHeader, "1") // one shard: it caches and returns the manifest
 	w.Write(comp)
 }
 

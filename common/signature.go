@@ -1,17 +1,26 @@
 package common
 
 import (
+	"cmp"
 	"crypto/rand"
+	"encoding/binary"
 	"fmt"
 	"os"
-	"strconv"
+	"slices"
 	"strings"
 
 	"github.com/nix-community/go-nix/pkg/narinfo/signature"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
 
 	"github.com/dnr/styx/pb"
 )
+
+// fingerprintPrefix starts every signed-message fingerprint, so that a styx signature can't be
+// taken for a signature over anything else: a narinfo fingerprint, or the
+// "styx-signed-message-1" fingerprint that older styx versions signed, which covered only part
+// of the entry.
+const fingerprintPrefix = "styx-signed-message-2"
 
 func LoadPubKeys(keys []string) ([]signature.PublicKey, error) {
 	var out []signature.PublicKey
@@ -56,6 +65,10 @@ func VerifyInlineMessage(
 	return proto.Unmarshal(entry.InlineData, msg)
 }
 
+// VerifyMessageAsEntry checks the signatures on a SignedMessage and returns its entry and
+// params. The signatures cover every field of both (see messageFingerprint), so everything
+// returned is authenticated. A message with fields that this version of styx doesn't know
+// can't be verified.
 func VerifyMessageAsEntry(keys []signature.PublicKey, expectedContext string, b []byte) (*pb.Entry, *pb.GlobalParams, error) {
 	if len(keys) == 0 {
 		return nil, nil, fmt.Errorf("no public keys provided")
@@ -82,8 +95,10 @@ func VerifyMessageAsEntry(keys []signature.PublicKey, expectedContext string, b 
 		sigs[i].Data = sm.Signature[i]
 	}
 
-	fingerprint := entryFingerprint(sm.Msg)
-	if !signature.VerifyFirst(fingerprint, sigs, keys) {
+	fingerprint, err := messageFingerprint(sm.Msg, sm.Params)
+	if err != nil {
+		return nil, nil, fmt.Errorf("SignedMessage can't be verified: %w", err)
+	} else if !signature.VerifyFirst(fingerprint, sigs, keys) {
 		return nil, nil, fmt.Errorf("signature verification failed")
 	}
 
@@ -104,14 +119,17 @@ func SignInlineMessage(keys []signature.SecretKey, context string, msg proto.Mes
 }
 
 func SignMessageAsEntry(keys []signature.SecretKey, params *pb.GlobalParams, e *pb.Entry) ([]byte, error) {
+	fingerprint, err := messageFingerprint(e, params)
+	if err != nil {
+		return nil, err
+	}
+
 	sm := &pb.SignedMessage{
 		Msg:       e,
 		Params:    params,
 		KeyId:     make([]string, len(keys)),
 		Signature: make([][]byte, len(keys)),
 	}
-
-	fingerprint := entryFingerprint(sm.Msg)
 	for i, k := range keys {
 		sig, err := k.Sign(rand.Reader, fingerprint)
 		if err != nil {
@@ -124,24 +142,94 @@ func SignMessageAsEntry(keys []signature.SecretKey, params *pb.GlobalParams, e *
 	return proto.Marshal(sm)
 }
 
-func entryFingerprint(e *pb.Entry) string {
-	// TODO: do we need to include params here?
-	var sb strings.Builder
-	sb.Grow(40 + len(e.Path) + len(e.InlineData) + len(e.Digests))
-	sb.WriteString("styx-signed-message-1")
-	sb.WriteByte(0)
-	if strings.IndexByte(e.Path, 0) != -1 {
-		panic("nil in entry path")
+// messageFingerprint is what a SignedMessage's signatures sign: fingerprintPrefix, then every
+// field of the entry (including nested messages) and the params. It doesn't depend on the
+// protobuf wire encoding, which isn't canonical: fields are walked by reflection and encoded
+// by appendCanonical, so it also covers fields added to the schema later. Unknown fields
+// can't be covered, so messages with unknown fields can't be signed or verified.
+func messageFingerprint(e *pb.Entry, params *pb.GlobalParams) (string, error) {
+	b := make([]byte, 0, 64+len(e.Path)+len(e.InlineData)+len(e.Digests))
+	b = append(b, fingerprintPrefix...)
+	b = append(b, 0)
+	b, err := appendCanonical(b, e.ProtoReflect())
+	if err != nil {
+		return "", err
 	}
-	sb.WriteString(e.Path)
-	sb.WriteByte(0)
-	sb.WriteString(strconv.Itoa(int(e.Size)))
-	if len(e.InlineData) > 0 {
-		sb.WriteByte(1)
-		sb.Write(e.InlineData)
+	if params == nil {
+		b = append(b, 0)
 	} else {
-		sb.WriteByte(2)
-		sb.Write(e.Digests)
+		b = append(b, 1)
+		if b, err = appendCanonical(b, params.ProtoReflect()); err != nil {
+			return "", err
+		}
 	}
-	return sb.String()
+	return string(b), nil
+}
+
+// appendCanonical appends an unambiguous encoding of m: the number of populated fields, then
+// each populated field's number and value, in field number order.
+func appendCanonical(b []byte, m protoreflect.Message) ([]byte, error) {
+	if len(m.GetUnknown()) > 0 {
+		return nil, fmt.Errorf("can't sign %s with unknown fields", m.Descriptor().FullName())
+	}
+	var fds []protoreflect.FieldDescriptor
+	m.Range(func(fd protoreflect.FieldDescriptor, _ protoreflect.Value) bool {
+		fds = append(fds, fd)
+		return true
+	})
+	slices.SortFunc(fds, func(x, y protoreflect.FieldDescriptor) int {
+		return cmp.Compare(x.Number(), y.Number())
+	})
+
+	b = binary.AppendUvarint(b, uint64(len(fds)))
+	var err error
+	for _, fd := range fds {
+		b = binary.AppendUvarint(b, uint64(fd.Number()))
+		v := m.Get(fd)
+		switch {
+		case fd.IsMap():
+			return nil, fmt.Errorf("can't sign map field %s", fd.FullName())
+		case fd.IsList():
+			l := v.List()
+			b = binary.AppendUvarint(b, uint64(l.Len()))
+			for i := range l.Len() {
+				if b, err = appendCanonicalValue(b, fd, l.Get(i)); err != nil {
+					return nil, err
+				}
+			}
+		default:
+			if b, err = appendCanonicalValue(b, fd, v); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return b, nil
+}
+
+func appendCanonicalValue(b []byte, fd protoreflect.FieldDescriptor, v protoreflect.Value) ([]byte, error) {
+	switch fd.Kind() {
+	case protoreflect.BoolKind:
+		if v.Bool() {
+			return append(b, 1), nil
+		}
+		return append(b, 0), nil
+	case protoreflect.EnumKind:
+		return binary.AppendVarint(b, int64(v.Enum())), nil
+	case protoreflect.Int32Kind, protoreflect.Sint32Kind, protoreflect.Sfixed32Kind,
+		protoreflect.Int64Kind, protoreflect.Sint64Kind, protoreflect.Sfixed64Kind:
+		return binary.AppendVarint(b, v.Int()), nil
+	case protoreflect.Uint32Kind, protoreflect.Fixed32Kind,
+		protoreflect.Uint64Kind, protoreflect.Fixed64Kind:
+		return binary.AppendUvarint(b, v.Uint()), nil
+	case protoreflect.StringKind:
+		b = binary.AppendUvarint(b, uint64(len(v.String())))
+		return append(b, v.String()...), nil
+	case protoreflect.BytesKind:
+		b = binary.AppendUvarint(b, uint64(len(v.Bytes())))
+		return append(b, v.Bytes()...), nil
+	case protoreflect.MessageKind, protoreflect.GroupKind:
+		return appendCanonical(b, v.Message())
+	default:
+		return nil, fmt.Errorf("can't sign %s field %s", fd.Kind(), fd.FullName())
+	}
 }
