@@ -1086,7 +1086,10 @@ func (s *Server) runRemanifest(ctx context.Context, req MountReq, rr *remanifest
 	defer rr.cancel()
 
 	// skip the manifest cache: the cached manifest is what refers to the missing chunks
-	_, err := s.requestNewManifest(ctx, newManifestReq(req.Upstream, req.StorePath), req.NarSize)
+	_, buildReq, err := s.manifestReqs(req.Upstream, req.StorePath)
+	if err == nil {
+		_, err = s.requestNewManifest(ctx, buildReq, req.NarSize)
+	}
 
 	if err != nil && ctx.Err() != nil {
 		// cancelled or timed out: don't cache that

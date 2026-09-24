@@ -13,6 +13,7 @@ import (
 
 	"github.com/dnr/styx/common"
 	"github.com/dnr/styx/common/cdig"
+	"github.com/dnr/styx/manifester"
 	"github.com/dnr/styx/pb"
 )
 
@@ -161,4 +162,65 @@ func TestRemanifestSurvivesFirstCallerLeaving(t *testing.T) {
 	close(e.manifesterGate)
 	require.NoError(t, <-errc2, "the first caller leaving cancelled the second caller's remanifest")
 	require.EqualValues(t, 1, e.manifestPosts.Load(), "the second caller should have shared the first request")
+}
+
+const testTarballUrl = "https://tarballs.example.org/opusfile-0.12.tar.gz"
+
+// putFakeCacheData records sphStr as built from testTarballUrl, like handleTarballReq does.
+func (e *fetchEnv) putFakeCacheData(sphStr string) {
+	b, err := proto.Marshal(&pb.FakeCacheData{Narinfo: []byte("narinfo"), Upstream: testTarballUrl})
+	require.NoError(e.t, err)
+	require.NoError(e.t, e.s.db.Update(func(tx *bbolt.Tx) error {
+		return tx.Bucket(fakeCacheBucket).Put([]byte(sphStr), b)
+	}))
+}
+
+func (e *fetchEnv) requireTarballReqs() {
+	e.t.Helper()
+	e.mu.Lock()
+	reqs := e.manifestReqs
+	e.mu.Unlock()
+	require.NotEmpty(e.t, reqs, "the manifester was never asked")
+	for _, r := range reqs {
+		require.Equal(e.t, manifester.ModeGenericTarball, r.BuildMode, "asked for a nar manifest from %s", r.Upstream)
+		require.Equal(e.t, testTarballUrl, r.Upstream)
+		require.Empty(e.t, r.StorePathHash)
+	}
+}
+
+// Tarball images are substituted from our fake binary cache, so the image records its
+// upstream as http://localhost:7444, which only this machine can read. Remanifesting sent
+// that to the manifester as a binary cache, so missing chunks of a tarball image could never
+// be recovered. It should build the tarball again instead.
+func TestRemanifestTarballImageRebuildsTarball(t *testing.T) {
+	e := newFetchEnv(t)
+	sphStr := testSpX[:32]
+	e.putFakeCacheData(sphStr)
+	req := MountReq{StorePath: sphStr, Upstream: "http://" + fakeCacheBind + "/", NarSize: 1000}
+
+	require.NoError(t, e.s.doRemanifestReqs(context.Background(), []MountReq{req}))
+	e.requireTarballReqs()
+}
+
+// Without the tarball url there's nothing to rebuild, so don't ask the manifester at all.
+func TestRemanifestTarballImageWithoutFakeCacheData(t *testing.T) {
+	e := newFetchEnv(t)
+	req := MountReq{StorePath: testSpX[:32], Upstream: "http://" + fakeCacheBind + "/", NarSize: 1000}
+
+	require.Error(t, e.s.doRemanifestReqs(context.Background(), []MountReq{req}))
+	require.Zero(t, e.manifestPosts.Load(), "sent a request the manifester can't do anything with")
+}
+
+// Mounting a tarball image looks for its manifest in the manifest cache under the tarball
+// url. On a miss it asked the manifester for a nar manifest from that url, which isn't a
+// binary cache. It should build the tarball.
+func TestTarballImageManifestCacheMissRebuildsTarball(t *testing.T) {
+	e := newFetchEnv(t)
+	e.putFakeCacheData(testSpX[:32])
+	req := MountReq{StorePath: testSpX, Upstream: "http://" + fakeCacheBind + "/", NarSize: 1000}
+
+	// the test manifester's response isn't a real envelope, so this fails after the request
+	_, _, err := e.s.getManifestAndBuildImage(context.Background(), &req)
+	require.Error(t, err)
+	e.requireTarballReqs()
 }
