@@ -775,7 +775,7 @@ func (s *Server) restoreMounts() {
 			// 	continue
 			// }
 			if img.MountState == pb.MountState_Mounted {
-				if img.ImageSize == 0 {
+				if img.ImageSize == 0 && img.Upstream == "" {
 					log.Print("found mounted image without size", img.StorePath)
 					continue
 				}
@@ -789,11 +789,19 @@ func (s *Server) restoreMounts() {
 			// log.Print("restoring: ", img.StorePath, " already mounted on ", img.MountPoint)
 			continue
 		}
-		err := s.tryMount(context.Background(), &MountReq{
+		req := &MountReq{
 			StorePath:  img.StorePath,
 			MountPoint: img.MountPoint,
 			// the image has been written so we don't need upstream/narsize
-		}, img.ImageSize, img.IsBare)
+		}
+		if img.ImageSize == 0 {
+			// the image has to be rebuilt (see repairSlabOverlaps). drop the old one so
+			// cachefiles doesn't keep it.
+			_, sphStr, _ := ParseSph(img.StorePath)
+			s.removeImageCacheFile(sphStr)
+			req.Upstream, req.NarSize = img.Upstream, img.NarSize
+		}
+		err := s.tryMount(context.Background(), req, img.ImageSize, img.IsBare)
 		if err == nil {
 			log.Print("restoring: ", img.StorePath, " restored to ", img.MountPoint)
 		} else {
@@ -813,6 +821,10 @@ func (s *Server) Start() error {
 	}
 	if err := s.setupManifestSlab(); err != nil {
 		return fmt.Errorf("error setting up manifest slab: %w", err)
+	}
+	if err := s.repairSlabOverlaps(); err != nil {
+		// nothing was changed, try again next time
+		log.Print(err)
 	}
 	if err := s.setupDevNode(); err != nil {
 		log.Println("on-demand features disabled:", err)
@@ -1428,6 +1440,62 @@ func (s *Server) VerifyParams(blockShift shift.Shift) error {
 	return nil
 }
 
+// slabAllocator hands out slab space inside a write transaction. It moves on to the next slab
+// when a chunk doesn't fit in the current one, and saves each slab's sequence as it leaves it,
+// so a batch that crosses a slab boundary doesn't leave the old slab's sequence behind.
+type slabAllocator struct {
+	slabroot *bbolt.Bucket
+	sb       *bbolt.Bucket
+	slabId   uint16
+	seq      uint64
+	limit    uint64
+}
+
+func (s *Server) newSlabAllocator(slabroot *bbolt.Bucket, slabId uint16) (*slabAllocator, error) {
+	a := &slabAllocator{slabroot: slabroot, slabId: slabId, limit: slabBytes >> s.blockShift}
+	return a, a.open()
+}
+
+func firstSlab(forManifest bool) uint16 {
+	if forManifest {
+		return manifestSlabOffset
+	}
+	return 0
+}
+
+func (a *slabAllocator) open() (err error) {
+	if a.sb, err = a.slabroot.CreateBucketIfNotExists(slabKey(a.slabId)); err != nil {
+		return err
+	}
+	// reserve some blocks for future purposes
+	a.seq = max(a.sb.Sequence(), reservedBlocks)
+	return nil
+}
+
+// alloc reserves blocks and returns their location and the bucket of the slab they're in.
+func (a *slabAllocator) alloc(blocks uint16) (erofs.SlabLoc, *bbolt.Bucket, error) {
+	if blocks == 0 {
+		return erofs.SlabLoc{}, nil, errors.New("zero-block slab allocation")
+	}
+	for a.seq+uint64(blocks) > a.limit {
+		if err := a.sb.SetSequence(a.seq); err != nil {
+			return erofs.SlabLoc{}, nil, err
+		}
+		a.slabId++
+		if err := a.open(); err != nil {
+			return erofs.SlabLoc{}, nil, err
+		}
+	}
+	loc := erofs.SlabLoc{SlabId: a.slabId, Addr: common.TruncU32(a.seq)}
+	a.seq += uint64(blocks)
+	return loc, a.sb, nil
+}
+
+// finish saves the sequence of the slab the allocator is in.
+func (a *slabAllocator) finish() error {
+	return a.sb.SetSequence(a.seq)
+}
+
 func (s *Server) AllocateBatch(ctx context.Context, blocks []uint16, digests []cdig.CDig) ([]erofs.SlabLoc, error) {
 	sph, forManifest, ok := fromAllocateCtx(ctx)
 	if !ok {
@@ -1440,37 +1508,26 @@ func (s *Server) AllocateBatch(ctx context.Context, blocks []uint16, digests []c
 	}
 	out := make([]erofs.SlabLoc, n)
 	err := s.db.Update(func(tx *bbolt.Tx) error {
-		cb, slabroot := tx.Bucket(chunkBucket), tx.Bucket(slabBucket)
-		var slabId uint16 = 0
-		if forManifest {
-			slabId = manifestSlabOffset
-		}
-		sb, err := slabroot.CreateBucketIfNotExists(slabKey(slabId))
+		cb := tx.Bucket(chunkBucket)
+		a, err := s.newSlabAllocator(tx.Bucket(slabBucket), firstSlab(forManifest))
 		if err != nil {
 			return err
 		}
-		// reserve some blocks for future purposes
-		seq := max(sb.Sequence(), reservedBlocks)
 
 		for i := range out {
 			digest := digests[i][:]
 			if loc := cb.Get(digest); loc == nil {
 				// allocate
-				if seq >= slabBytes>>s.blockShift {
-					slabId++
-					if sb, err = slabroot.CreateBucketIfNotExists(slabKey(slabId)); err != nil {
-						return err
-					}
-					seq = max(sb.Sequence(), reservedBlocks)
+				aloc, sb, err := a.alloc(blocks[i])
+				if err != nil {
+					return fmt.Errorf("chunk %s: %w", digests[i], err)
 				}
-				addr := common.TruncU32(seq)
-				seq += uint64(blocks[i])
-				if err := cb.Put(digest, locValue(slabId, addr, sph)); err != nil {
+				if err := cb.Put(digest, locValue(aloc.SlabId, aloc.Addr, sph)); err != nil {
 					return err
-				} else if err = sb.Put(addrKey(addr), digest); err != nil {
+				} else if err = sb.Put(addrKey(aloc.Addr), digest); err != nil {
 					return err
 				}
-				out[i] = erofs.SlabLoc{SlabId: slabId, Addr: addr}
+				out[i] = aloc
 			} else {
 				if newLoc := appendSph(loc, sph); newLoc != nil {
 					if err := cb.Put(digest, newLoc); err != nil {
@@ -1481,7 +1538,7 @@ func (s *Server) AllocateBatch(ctx context.Context, blocks []uint16, digests []c
 			}
 		}
 
-		return sb.SetSequence(seq)
+		return a.finish()
 	})
 	return common.ValOrErr(out, err)
 }

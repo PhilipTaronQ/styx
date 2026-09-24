@@ -19,6 +19,7 @@ import (
 	"github.com/dnr/styx/common"
 	"github.com/dnr/styx/common/cdig"
 	"github.com/dnr/styx/common/errgroup"
+	"github.com/dnr/styx/common/shift"
 	"github.com/dnr/styx/manifester"
 	"github.com/dnr/styx/pb"
 )
@@ -102,6 +103,9 @@ func (s *Server) getManifestAndBuildImage(ctx context.Context, req *MountReq) (*
 		digests := cdig.FromSliceAlias(entry.Digests)
 		blocks := make([]uint16, 0, len(digests))
 		cshift := entry.ChunkShiftDef()
+		if cshift < s.blockShift || cshift > shift.MaxChunkShift {
+			return nil, nil, fmt.Errorf("chunked manifest has bad chunk shift %d", cshift)
+		}
 		blocks = common.AppendBlocksList(blocks, entry.Size, s.blockShift, cshift)
 
 		ctxForManifestChunks := withAllocateCtx(ctx, manifestSph, true)

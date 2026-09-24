@@ -363,39 +363,26 @@ func (s *Server) preallocateBatch(ctx context.Context, blocks []uint16, digests 
 	out := make([]erofs.SlabLoc, n)
 	wasAllocated := make([]bool, n)
 	err := s.db.Update(func(tx *bbolt.Tx) error {
-		cb, slabroot := tx.Bucket(chunkBucket), tx.Bucket(slabBucket)
-		var slabId uint16 = 0
-		if forManifest {
-			slabId = manifestSlabOffset
-		}
-		sb, err := slabroot.CreateBucketIfNotExists(slabKey(slabId))
+		cb := tx.Bucket(chunkBucket)
+		a, err := s.newSlabAllocator(tx.Bucket(slabBucket), firstSlab(forManifest))
 		if err != nil {
 			return err
 		}
-		// reserve some blocks for future purposes
-		seq := max(sb.Sequence(), reservedBlocks)
 
 		for i := range out {
 			digest := digests[i][:]
 			if loc := cb.Get(digest); loc == nil {
 				// allocate
-				if seq >= slabBytes>>s.blockShift {
-					slabId++
-					if sb, err = slabroot.CreateBucketIfNotExists(slabKey(slabId)); err != nil {
-						return err
-					}
-					seq = max(sb.Sequence(), reservedBlocks)
+				if out[i], _, err = a.alloc(blocks[i]); err != nil {
+					return fmt.Errorf("chunk %s: %w", digests[i], err)
 				}
-				addr := common.TruncU32(seq)
-				seq += uint64(blocks[i])
-				out[i] = erofs.SlabLoc{SlabId: slabId, Addr: addr}
 			} else {
 				out[i] = loadLoc(loc)
 				wasAllocated[i] = true
 			}
 		}
 
-		return sb.SetSequence(seq)
+		return a.finish()
 	})
 	if err != nil {
 		return nil, nil, err
@@ -405,7 +392,7 @@ func (s *Server) preallocateBatch(ctx context.Context, blocks []uint16, digests 
 
 // next (after caller has written/cloned), associate with chunks
 func (s *Server) commitPreallocated(ctx context.Context, blocks []uint16, digests []cdig.CDig, locs []erofs.SlabLoc, wasAllocated []bool) error {
-	sph, forManifest, ok := fromAllocateCtx(ctx)
+	sph, _, ok := fromAllocateCtx(ctx)
 	if !ok {
 		return errors.New("missing allocate context")
 	}
@@ -415,14 +402,6 @@ func (s *Server) commitPreallocated(ctx context.Context, blocks []uint16, digest
 	}
 	return s.db.Update(func(tx *bbolt.Tx) error {
 		cb, slabroot := tx.Bucket(chunkBucket), tx.Bucket(slabBucket)
-		var slabId uint16 = 0
-		if forManifest {
-			slabId = manifestSlabOffset
-		}
-		sb, err := slabroot.CreateBucketIfNotExists(slabKey(slabId))
-		if err != nil {
-			return err
-		}
 
 		for i, loc := range locs {
 			digest := digests[i][:]
@@ -435,7 +414,11 @@ func (s *Server) commitPreallocated(ctx context.Context, blocks []uint16, digest
 				// clone or write into the space.
 				if !isAlloc {
 					// there's still no link from the digest to this space. create it, and mark
-					// it present also.
+					// it present also. the space may be in any slab preallocateBatch moved to.
+					sb := slabroot.Bucket(slabKey(loc.SlabId))
+					if sb == nil {
+						return fmt.Errorf("missing slab bucket %d", loc.SlabId)
+					}
 					if err := cb.Put(digest, locValue(loc.SlabId, loc.Addr, sph)); err != nil {
 						return err
 					} else if err = sb.Put(addrKey(loc.Addr), digest); err != nil {

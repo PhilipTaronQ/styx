@@ -28,6 +28,10 @@ import (
 
 const (
 	BarePath = "/___bare___"
+
+	// longest symlink target the kernel can read back (PATH_MAX without the NUL), which is
+	// also the longest a nar can hold
+	maxSymlinkLen = 4095
 )
 
 // larger block sizes don't seem to work with erofs yet
@@ -199,6 +203,12 @@ func (b *Builder) BuildFromManifestWithSlab(
 
 	for _, e := range m.Entries {
 		// every entry gets an inode and all but the root get a dirent
+		if !path.IsAbs(e.Path) || path.Clean(e.Path) != e.Path {
+			return fmt.Errorf("bad entry path %q", e.Path)
+		} else if e.Path == "/" && (e.Type != pb.EntryType_DIRECTORY || root != nil) {
+			return errors.New("root must be one directory")
+		}
+
 		var fstype uint16
 		i := &inodebuilder{
 			i: erofs_inode_compact{
@@ -250,6 +260,9 @@ func (b *Builder) BuildFromManifestWithSlab(
 				i.i.ISize = common.TruncU32(e.Size)
 				i.i.IFormat = formatChunked
 				cshift := e.ChunkShiftDef()
+				if cshift < b.blk || cshift > shift.MaxChunkShift {
+					return fmt.Errorf("%q: bad chunk shift %d", e.Path, cshift)
+				}
 				chunkedIU, err := inodeChunkInfo(b.blk, cshift)
 				if err != nil {
 					return err
@@ -277,8 +290,15 @@ func (b *Builder) BuildFromManifestWithSlab(
 		case pb.EntryType_SYMLINK:
 			fstype = EROFS_FT_SYMLINK
 			i.i.IMode = unix.S_IFLNK | 0777
-			i.i.ISize = common.TruncU32(len(e.InlineData))
-			i.taildata = e.InlineData
+			if n := int64(len(e.InlineData)); n > maxSymlinkLen {
+				return fmt.Errorf("%q: symlink target too long", e.Path)
+			} else if n == 0 || allowedTail(n) {
+				i.i.ISize = common.TruncU32(n)
+				i.taildata = e.InlineData
+			} else {
+				// too long to share a block with the inode, give it its own block
+				setDataOnInode(i, e.InlineData)
+			}
 
 		default:
 			return errors.New("unknown type")
@@ -293,6 +313,9 @@ func (b *Builder) BuildFromManifestWithSlab(
 				return errors.New("file name too long")
 			}
 			db := dirsmap[path.Clean(dir)]
+			if db == nil {
+				return fmt.Errorf("found %q before its parent dir", e.Path)
+			}
 			db.ents = append(db.ents, dbent{
 				name: file,
 				i:    i,
@@ -302,6 +325,8 @@ func (b *Builder) BuildFromManifestWithSlab(
 	}
 	if err := flushBlocks(); err != nil {
 		return err
+	} else if root == nil {
+		return errors.New("missing root directory")
 	}
 
 	// pass 2: pack inodes and tails
