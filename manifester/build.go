@@ -191,14 +191,15 @@ func (b *ManifestBuilder) BuildFromNar(
 	narinfoUrl := upstreamUrl.JoinPath(storePathHash + ".narinfo").String()
 	res, err := common.RetryHttpRequest(ctx, http.MethodGet, narinfoUrl, "", nil)
 	if err != nil {
+		// RetryHttpRequest returns non-200 responses as errors
+		if common.IsNotFound(err) {
+			return nil, fmt.Errorf("%w: upstream http for %s: %w", ErrNotFound, narinfoUrl, err)
+		}
 		return nil, fmt.Errorf("%w: upstream http for %s: %w", ErrReq, narinfoUrl, err)
 	}
 	defer res.Body.Close()
 
 	if res.StatusCode != http.StatusOK {
-		if res.StatusCode == http.StatusNotFound {
-			return nil, fmt.Errorf("%w: upstream http for %s", ErrNotFound, narinfoUrl)
-		}
 		return nil, fmt.Errorf("%w: upstream http for %s: %s", ErrReq, narinfoUrl, res.Status)
 	}
 
