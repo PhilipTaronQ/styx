@@ -947,7 +947,8 @@ func (s *Server) doRemanifestReqs(ctx context.Context, reqs []MountReq) error {
 				return nil
 			}
 
-			_, err := s.getManifestFromManifester(ctx, req.Upstream, req.StorePath, req.NarSize)
+			// skip the manifest cache: the cached manifest is what refers to the missing chunks
+			_, err := s.requestNewManifest(ctx, newManifestReq(req.Upstream, req.StorePath), req.NarSize)
 
 			rr.err = err
 			close(rr.done)

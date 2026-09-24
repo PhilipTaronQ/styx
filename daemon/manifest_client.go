@@ -156,14 +156,18 @@ func (s *Server) getManifestAndBuildImage(ctx context.Context, req *MountReq) (*
 	return &m, image.Bytes(), nil
 }
 
-func (s *Server) getManifestFromManifester(ctx context.Context, upstream, sph string, narSize int64) ([]byte, error) {
-	mReq := manifester.ManifestReq{
+func newManifestReq(upstream, sph string) manifester.ManifestReq {
+	return manifester.ManifestReq{
 		Upstream:      upstream,
 		StorePathHash: sph,
 		DigestAlgo:    cdig.Algo,
 		DigestBits:    int(cdig.Bits),
 		// SmallFileCutoff: s.cfg.SmallFileCutoff,
 	}
+}
+
+func (s *Server) getManifestFromManifester(ctx context.Context, upstream, sph string, narSize int64) ([]byte, error) {
+	mReq := newManifestReq(upstream, sph)
 
 	// check cache
 	s.stats.manifestCacheReqs.Add(1)
@@ -176,6 +180,13 @@ func (s *Server) getManifestFromManifester(ctx context.Context, upstream, sph st
 	}
 
 	// not found cached, request it
+	return s.requestNewManifest(ctx, mReq, narSize)
+}
+
+// requestNewManifest asks the manifester to build a manifest, without looking in the manifest
+// cache. The manifester uploads any chunks the chunk store is missing, so this is also how we
+// recover from missing chunks.
+func (s *Server) requestNewManifest(ctx context.Context, mReq manifester.ManifestReq, narSize int64) ([]byte, error) {
 	s.stats.manifestReqs.Add(1)
 	shards := s.calcShards(narSize)
 	b, err := s.getNewManifest(ctx, mReq, shards)
