@@ -140,7 +140,8 @@ type (
 )
 
 func (s *Server) requestChunk(ctx context.Context, loc erofs.SlabLoc, digest cdig.CDig, sphps []SphPrefix) error {
-	if s.readKnownMap.Has(loc) {
+	known := s.readKnownMap.Has(loc)
+	if known {
 		// We think we have this chunk and are trying to use it as a base, but we got asked for
 		// it again. This shouldn't happen, but at least try to recover by doing a single read
 		// instead of diffing more.
@@ -152,7 +153,14 @@ func (s *Server) requestChunk(ctx context.Context, loc erofs.SlabLoc, digest cdi
 		s.diffLock.Lock()
 		defer s.diffLock.Unlock()
 
-		if op = s.diffMap[loc]; op != nil {
+		op = s.diffMap[loc]
+		if _, single := op.(*singleOp); known && op != nil && !single {
+			// Don't wait on a diff op: it may be waiting for a slot held by whoever is reading
+			// this chunk as a base, which is waiting on us. A single op doesn't read bases.
+			op = nil
+		}
+
+		if op != nil {
 			// being request already, wait on this one
 		} else if len(sphps) == 0 {
 			// force single op
@@ -1589,10 +1597,13 @@ func (set *opSet) buildRecompress(
 	set.op.addRecompress(sphs, sop)
 
 	// For recompress diff we need to ask for the whole file so we may include chunks we
-	// already have, or are already being diffed (though that's very unlikely). In that case
-	// just leave the existing entry.
+	// already have, or are already being diffed (though that's very unlikely). Only register
+	// the missing ones that nobody is fetching yet. In particular, don't register present
+	// chunks: a kernel read for one means its data isn't really there, and it may be a base
+	// that another op is reading while holding a baseSem slot. That read would wait on this
+	// op, which may need a baseSem slot too.
 	for _, i := range sop.reqInfo {
-		if set.s.diffMap[i.loc] == nil {
+		if set.s.diffMap[i.loc] == nil && !set.s.locPresent(tx, i.loc) {
 			set.s.diffMap[i.loc] = set.op
 		}
 	}

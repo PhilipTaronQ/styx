@@ -209,3 +209,60 @@ func TestChunkDiffDecompressionIsBounded(t *testing.T) {
 	require.ErrorIs(t, ops[0].err, common.ErrTooLarge)
 	require.Zero(t, e.diffMapLen())
 }
+
+// A recompress diff asks for the whole file, and buildRecompress registered every chunk of it
+// in diffMap, present ones too. If a present chunk's data wasn't really in the cache and
+// another op read it as a base (holding a baseSem slot), the kernel's READ for it found the
+// recompress op in diffMap and waited on it. That op needed a baseSem slot too, and with
+// every slot held that way, the daemon deadlocked.
+func TestRecompressDoesNotRegisterPresentChunks(t *testing.T) {
+	e := newFetchEnv(t)
+	const path = "/share/man/man1/opusfile.1.gz"
+	baseChunks := testChunks(4, 31)
+	_, baseLocs := e.addImageFile(testSpB, path, baseChunks)
+	for _, loc := range baseLocs {
+		e.s.presentMap.Put(loc, struct{}{})
+	}
+	digests, locs := e.addImageFile(testSpX, path, testChunks(4, 32))
+	e.s.presentMap.Put(locs[2], struct{}{})
+
+	ops := e.buildOps(digests[0])
+	require.Len(t, ops, 1)
+	require.Len(t, ops[0].sops, 2)
+	require.NotEmpty(t, ops[0].sops[1].recompress, "precondition: expected a recompress diff against %s", testSpB)
+	require.Len(t, ops[0].sops[1].reqInfo, 4, "recompress asks for the whole file")
+
+	e.s.diffLock.Lock()
+	defer e.s.diffLock.Unlock()
+	defer e.s.unregisterDiffOp(ops[0])
+	for i, loc := range locs {
+		if i == 2 {
+			require.Nil(t, e.s.diffMap[loc], "present chunk %d registered for the recompress op", i)
+		} else {
+			require.Equal(t, reqOp(ops[0]), e.s.diffMap[loc], "missing chunk %d not registered", i)
+		}
+	}
+}
+
+// A kernel read for a chunk that we're reading as a known chunk (a base) means its data
+// isn't there. Waiting on a diff op that has it registered can deadlock, since that op may be
+// waiting for a slot held by the base reader, so do a single read instead.
+func TestRequestForKnownChunkDoesNotWaitOnDiffOp(t *testing.T) {
+	e := newFetchEnv(t)
+	chunks := testChunks(1, 33)
+	e.serveChunks(chunks)
+	digests, locs := e.addImage(testSpX, chunks)
+
+	stuck := &diffOp{done: make(chan struct{})} // never finishes
+	e.s.diffLock.Lock()
+	e.s.diffMap[locs[0]] = stuck
+	e.s.diffLock.Unlock()
+	e.s.readKnownMap.Put(locs[0], 1)
+	defer e.s.readKnownMap.Delete(locs[0])
+
+	requestChunkWithin(t, e.s, locs[0], digests[0], e.sphps(digests[0]), 10*time.Second)
+	require.NoError(t, e.s.db.View(func(tx *bbolt.Tx) error {
+		require.True(t, e.s.locPresent(tx, locs[0]))
+		return nil
+	}))
+}

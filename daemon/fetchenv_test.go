@@ -252,6 +252,11 @@ func (e *fetchEnv) serveChunks(chunks [][]byte) {
 // regular file made of the given chunks: inline manifest envelope, catalog entries, and
 // chunk/slab allocations.
 func (e *fetchEnv) addImage(storePath string, chunks [][]byte) ([]cdig.CDig, []erofs.SlabLoc) {
+	return e.addImageFile(storePath, "/file", chunks)
+}
+
+// addImageFile is addImage with the file at path.
+func (e *fetchEnv) addImageFile(storePath, path string, chunks [][]byte) ([]cdig.CDig, []erofs.SlabLoc) {
 	t, s := e.t, e.s
 	sph, sphStr, spName, err := ParseSphAndName(storePath)
 	require.NoError(t, err)
@@ -266,7 +271,7 @@ func (e *fetchEnv) addImage(storePath string, chunks [][]byte) ([]cdig.CDig, []e
 	}
 	m := &pb.Manifest{Entries: []*pb.Entry{
 		{Path: "/", Type: pb.EntryType_DIRECTORY},
-		{Path: "/file", Type: pb.EntryType_REGULAR, Size: size, Digests: cdig.ToSliceAlias(digests)},
+		{Path: path, Type: pb.EntryType_REGULAR, Size: size, Digests: cdig.ToSliceAlias(digests)},
 	}}
 	mb, err := proto.Marshal(m)
 	require.NoError(t, err)
