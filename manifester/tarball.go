@@ -387,11 +387,19 @@ func (b *ManifestBuilder) tarEntry(tr *tar.Reader, tmpData *os.File, tmpBuf []by
 		return nil, nil // skip PAX global headers
 	}
 
+	// like tar, refuse ".." components. path.Clean keeps a leading "..", and "/../x" would
+	// then sort next to "/x" and turn into a duplicate entry named "." in the nar.
+	if slices.Contains(strings.Split(h.Name, "/"), "..") {
+		return nil, fmt.Errorf("tar entry name %q contains \"..\"", h.Name)
+	}
 	name := path.Clean(h.Name)
 	if name == "." {
 		name = "/"
 	} else {
 		name = "/" + strings.Trim(name, "/")
+	}
+	if name == "/" && h.Typeflag != tar.TypeDir {
+		return nil, fmt.Errorf("tar entry %q for the root is not a directory", h.Name)
 	}
 
 	e := &tarEntry{
