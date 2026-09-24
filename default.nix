@@ -100,13 +100,9 @@ rec {
   styx-test-race = mkStyxTest "styxtest-race" "-race";
   styx-test-asan = mkStyxTest "styxtest-asan" "-asan";
 
-  # TODO: switch to nixVersions.stable
-  patchedNix = pkgs.nixVersions.nix_2_28.overrideAttrs (prev: {
-    patches = prev.patches ++ [ ./patches/nix_2_28.patch ];
-    # "doCheck = false" doesn't work since it needs checkInputs to build
-    checkPhase = "true"; # broke nix-functional-tests:ca / build, ignore for now
-    doInstallCheck = false; # broke tests/ca, ignore for now
-  });
+  # nixVersions.latest; bump together with patches/nix_*.patch
+  patchedNix =
+    (pkgs.nixVersions.nixComponents_2_35.appendPatches [ ./patches/nix_2_35.patch ]).nix-everything;
 
   testdata =
     let
