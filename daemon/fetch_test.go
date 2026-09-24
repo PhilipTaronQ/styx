@@ -137,6 +137,62 @@ func TestPrefetchFallsBackWhenDiffFails(t *testing.T) {
 	}))
 }
 
+// Diff ops used to read their bases while holding a diffSem slot. Base reads go through the
+// kernel, and a base that isn't really in the cache makes the kernel send a READ, which
+// needs a slot for the single op that fetches it. With every slot held by an op waiting on
+// such a read, the daemon deadlocked. The slab here is a plain file, so the test can't make
+// a base read wait on the kernel; instead it checks that an op gets as far as reading its
+// bases (which fail, because the slab has no read fd) while every diffSem slot is taken.
+func TestDiffOpReadsBasesWithoutDiffSemSlot(t *testing.T) {
+	e := newFetchEnv(t)
+	baseChunks := testChunks(4, 7)
+	e.serveChunks(baseChunks)
+	_, baseLocs := e.addImage(testSpB, baseChunks)
+	for _, loc := range baseLocs {
+		e.s.presentMap.Put(loc, struct{}{})
+	}
+	chunks := testChunks(4, 8)
+	e.serveChunks(chunks)
+	digests, _ := e.addImage(testSpX, chunks)
+
+	ops := e.buildOps(digests[0])
+	require.Len(t, ops, 1)
+	require.True(t, ops[0].anyHasBase(), "precondition: expected a diff against %s", testSpB)
+
+	e.s.stateLock.Lock()
+	fds := e.s.readfdBySlab[0]
+	delete(e.s.readfdBySlab, 0)
+	e.s.stateLock.Unlock()
+	defer func() {
+		e.s.stateLock.Lock()
+		e.s.readfdBySlab[0] = fds
+		e.s.stateLock.Unlock()
+	}()
+
+	workers := int64(e.s.cfg.Workers)
+	require.NoError(t, e.s.diffSem.Acquire(context.Background(), workers))
+	released := false
+	release := func() {
+		if !released {
+			released = true
+			e.s.diffSem.Release(workers)
+		}
+	}
+	defer release()
+
+	go e.s.startDiffOp(context.Background(), ops[0])
+	select {
+	case <-ops[0].done:
+	case <-time.After(10 * time.Second):
+		release()
+		<-ops[0].done
+		t.Fatal("diff op waited for a diffSem slot before reading its bases")
+	}
+	release()
+	require.ErrorContains(t, ops[0].err, "getKnownChunk")
+	require.Zero(t, e.diffMapLen())
+}
+
 // Chunk diffs are checked against their digests only after decompressing, so a small zstd
 // bomb from the chunk differ (or anything between it and us) used to make the daemon
 // allocate whatever the bomb expanded to.

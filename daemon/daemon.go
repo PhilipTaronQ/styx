@@ -94,6 +94,7 @@ type (
 		diffMap     map[erofs.SlabLoc]reqOp
 		recentReads map[string]*recentRead
 		diffSem     *semaphore.Weighted
+		baseSem     *semaphore.Weighted // for diff ops reading bases, see startDiffOp
 
 		remanifestCache common.SimpleSyncMap[string, *remanifestCacheEntry]
 
@@ -163,6 +164,7 @@ func NewServer(cfg Config) *Server {
 		diffMap:         make(map[erofs.SlabLoc]reqOp),
 		recentReads:     make(map[string]*recentRead),
 		diffSem:         semaphore.NewWeighted(int64(cfg.Workers)),
+		baseSem:         semaphore.NewWeighted(int64(cfg.Workers)),
 		remanifestCache: *common.NewSimpleSyncMap[string, *remanifestCacheEntry](),
 		shutdownChan:    make(chan struct{}),
 	}

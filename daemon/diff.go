@@ -496,10 +496,29 @@ func (s *Server) startDiffOp(ctx context.Context, op *diffOp) {
 	} else {
 		s.stats.diffReqs.Add(1)
 	}
-	if op.err = s.diffSem.Acquire(ctx, 1); op.err == nil {
-		defer s.diffSem.Release(1)
-		op.err = s.doDiffOp(ctx, op)
+
+	// Read bases before taking a diffSem slot. Base reads go through the kernel, and if a base
+	// isn't actually in the cache, the kernel asks us for it, and fetching that takes a
+	// diffSem slot. With every slot held by an op waiting on such a read, nothing could make
+	// progress. baseSem limits how many ops hold base data while waiting for a slot.
+	var bases [][]byte
+	if op.anyHasBase() {
+		if op.err = s.baseSem.Acquire(ctx, 1); op.err != nil {
+			return
+		}
+		bases, op.err = s.readDiffBases(op)
+		if op.err == nil {
+			op.err = s.diffSem.Acquire(ctx, 1)
+		}
+		s.baseSem.Release(1)
+	} else {
+		op.err = s.diffSem.Acquire(ctx, 1)
 	}
+	if op.err != nil {
+		return
+	}
+	defer s.diffSem.Release(1)
+	op.err = s.doDiffOp(ctx, op, bases)
 }
 
 // unregisterDiffOp removes op's entries from diffMap. call with diffLock held
@@ -513,7 +532,28 @@ func (s *Server) unregisterDiffOp(op *diffOp) {
 	}
 }
 
-func (s *Server) doDiffOp(ctx context.Context, op *diffOp) error {
+// readDiffBases reads the base data for each sub-op of op (nil for those without a base).
+func (s *Server) readDiffBases(op *diffOp) ([][]byte, error) {
+	bases := make([][]byte, len(op.sops))
+	for idx, sop := range op.sops {
+		if !sop.hasBase() {
+			continue
+		}
+		data := make([]byte, sop.baseSize)
+		p := data
+		for _, i := range sop.baseInfo {
+			var part []byte
+			part, p = takePart(p, i.size)
+			if err := s.getKnownChunk(i.loc, part); err != nil {
+				return nil, fmt.Errorf("getKnownChunk error: %w", err)
+			}
+		}
+		bases[idx] = data
+	}
+	return bases, nil
+}
+
+func (s *Server) doDiffOp(ctx context.Context, op *diffOp, bases [][]byte) error {
 	diff, lens, err := s.getChunkDiff(ctx, op.sops)
 	if err != nil {
 		return fmt.Errorf("getChunkDiff: %w", err)
@@ -522,23 +562,13 @@ func (s *Server) doDiffOp(ctx context.Context, op *diffOp) error {
 
 	baseDatas := make([][]byte, 0, len(op.sops))
 
-	for _, sop := range op.sops {
+	for idx, sop := range op.sops {
 		if !sop.hasBase() {
 			continue
 		}
 
-		data := make([]byte, sop.baseSize)
-		p := data
-		for _, i := range sop.baseInfo {
-			var part []byte
-			part, p = takePart(p, i.size)
-			if err := s.getKnownChunk(i.loc, part); err != nil {
-				return fmt.Errorf("getKnownChunk error: %w", err)
-			}
-		}
-
 		// decompress if needed
-		data, err = doDiffDecompress(ctx, data, sop.recompress)
+		data, err := doDiffDecompress(ctx, bases[idx], sop.recompress)
 		if err != nil {
 			return fmt.Errorf("decompress error: %w", err)
 		}
