@@ -1,6 +1,9 @@
 package daemon
 
-import "context"
+import (
+	"context"
+	"sync"
+)
 
 type (
 	allocateContext struct {
@@ -9,6 +12,10 @@ type (
 	}
 
 	mountContext struct {
+		// Written by tryMount and read by handleOpenImage on the cachefiles
+		// goroutine. The kernel orders those (the open only arrives after
+		// mount(2)), but that's invisible to the Go memory model, so lock.
+		lock      sync.Mutex
 		imageSize int64
 		isBare    bool
 		imageData []byte
