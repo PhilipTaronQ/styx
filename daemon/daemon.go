@@ -903,6 +903,9 @@ func (s *Server) closeAllFds() {
 			fds = s.readfdBySlab[state.slabId]
 		}
 		s.closeState(state, fds)
+		if state.tp == typeSlab {
+			s.unmountSlabImage(state.slabId)
+		}
 	}
 }
 
@@ -1205,12 +1208,13 @@ func (s *Server) handleClose(msgId, objectId uint32) error {
 		log.Println("missing state for close")
 		return nil
 	}
-	if state.tp == typeSlab {
-		delete(s.stateBySlab, state.slabId)
-	}
+	// If the kernel has already opened this slab again (as it does when mountSlabImage
+	// remounts), this CLOSE is for the old object, and the new object's state and the
+	// slab image fds must stay.
+	current := state.tp == typeSlab && s.stateBySlab[state.slabId] == state
 	var fds slabFds
-	switch state.tp {
-	case typeSlab, typeManifestSlab:
+	if current {
+		delete(s.stateBySlab, state.slabId)
 		fds = s.readfdBySlab[state.slabId]
 		delete(s.readfdBySlab, state.slabId)
 	}
@@ -1219,6 +1223,9 @@ func (s *Server) handleClose(msgId, objectId uint32) error {
 
 	// do rest of cleanup outside lock
 	s.closeState(state, fds)
+	if current {
+		s.unmountSlabImage(state.slabId)
+	}
 	return nil
 }
 
@@ -1232,10 +1239,11 @@ func (s *Server) closeState(state *openFileState, slabFds slabFds) {
 	for _, fd := range fds {
 		_ = unix.Close(fd)
 	}
-	if state.tp == typeSlab {
-		mp := filepath.Join(s.cfg.CachePath, slabImagePrefix+strconv.Itoa(int(state.slabId)))
-		_ = unix.Unmount(mp, 0)
-	}
+}
+
+func (s *Server) unmountSlabImage(slabId uint16) {
+	mp := filepath.Join(s.cfg.CachePath, slabImagePrefix+strconv.Itoa(int(slabId)))
+	_ = unix.Unmount(mp, 0)
 }
 
 func (s *Server) handleRead(msgId, objectId uint32, ln, off uint64) (retErr error) {

@@ -102,3 +102,35 @@ func TestStalledReadDoesNotBlockOpen(t *testing.T) {
 	require.Equal(t, "copen 3,4096", readDevnodeReply(t, devB, 5*time.Second),
 		"OPEN for an unrelated object was not answered while one slab READ waited on the network")
 }
+
+// The late CLOSE for a slab object that the kernel has already replaced (as happens when
+// mountSlabImage remounts) must not drop the new object's state or close the slab image
+// fds.
+func TestCloseOfOldSlabObjectKeepsNewState(t *testing.T) {
+	s := newTestServer(t, 2, true)
+
+	oldFd, newFd := testTempFd(t), testTempFd(t)
+	_, err := s.handleOpenSlab(1, 100, uint32(oldFd), 0, 0)
+	require.NoError(t, err)
+	_, err = s.handleOpenSlab(2, 101, uint32(newFd), 0, 0) // replacement object for slab 0
+	require.NoError(t, err)
+
+	readFd, cacheFd := testTempFd(t), testTempFd(t)
+	s.stateLock.Lock()
+	s.readfdBySlab[0] = slabFds{readFd, cacheFd} // as set by mountSlabImage
+	s.stateLock.Unlock()
+
+	require.NoError(t, s.handleClose(3, 100)) // late CLOSE for the old object
+
+	s.stateLock.Lock()
+	st := s.stateBySlab[0]
+	fds := s.readfdBySlab[0]
+	s.stateLock.Unlock()
+	_, fcntlErr := unix.FcntlInt(uintptr(readFd), unix.F_GETFD, 0)
+	t.Logf("after CLOSE(old): stateBySlab[0]=%v readfdBySlab[0]=%v; readFd fcntl err=%v", st, fds, fcntlErr)
+
+	require.NotNil(t, st, "CLOSE of the old slab object dropped the new object's state")
+	require.Equal(t, uint32(newFd), st.writeFd)
+	require.Equal(t, slabFds{readFd, cacheFd}, fds)
+	require.NoError(t, fcntlErr, "CLOSE of the old slab object closed the current slab image read fd")
+}
