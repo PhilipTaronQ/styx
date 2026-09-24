@@ -222,31 +222,40 @@ func (gc *gc) run(ctx context.Context) error {
 	return nil
 }
 
+// Remove deletes in phases, referrers before what they refer to, so that a delete that fails
+// or is cut short never leaves a surviving referrer without its referents.
+const (
+	phaseRoots  = iota // build roots
+	phaseRefs          // manifests and narinfos
+	phaseLeaves        // chunks, nars and anything unexpected
+	numPhases
+)
+
 // cutoff is the latest modification time of an object that GC may delete.
 func (gc *gc) cutoff() time.Time { return gc.now.Add(-gc.grace) }
 
-// classify reports whether the traced roots reach key, and whether key is a kind of object
-// that GC knows about.
-func (gc *gc) classify(key string) (live, known bool) {
+// classify reports key's remove phase, whether the traced roots reach it, and whether it's a
+// kind of object that GC knows about.
+func (gc *gc) classify(key string) (phase int, live, known bool) {
 	has := func(m *sync.Map, k any) bool { _, ok := m.Load(k); return ok }
 	if strings.HasPrefix(key, manifester.BuildRootPath[1:]) {
-		return has(&gc.tracedRoots, path.Base(key)), true
+		return phaseRoots, has(&gc.tracedRoots, path.Base(key)), true
 	} else if strings.HasPrefix(key, manifester.ManifestCachePath[1:]) {
-		return has(&gc.goodManifest, path.Base(key)), true
+		return phaseRefs, has(&gc.goodManifest, path.Base(key)), true
 	} else if key == "nixcache/nix-cache-info" {
-		return true, true
+		return phaseLeaves, true, true
 	} else if rest, ok := strings.CutPrefix(key, "nixcache/nar/"); ok {
-		return has(&gc.goodNar, rest), true
+		return phaseLeaves, has(&gc.goodNar, rest), true
 	} else if rest, ok := strings.CutSuffix(key, ".narinfo"); ok && strings.HasPrefix(rest, "nixcache/") {
-		return has(&gc.goodNi, strings.TrimPrefix(rest, "nixcache/")), true
+		return phaseRefs, has(&gc.goodNi, strings.TrimPrefix(rest, "nixcache/")), true
 	} else if rest, ok := strings.CutPrefix(key, manifester.ChunkReadPath[1:]); ok {
 		b, err := base64.RawURLEncoding.DecodeString(rest)
 		if err != nil || len(b) != cdig.Bytes {
-			return false, false
+			return phaseLeaves, false, false
 		}
-		return has(&gc.goodChunk, cdig.FromBytes(b)), true
+		return phaseLeaves, has(&gc.goodChunk, cdig.FromBytes(b)), true
 	}
-	return false, false
+	return phaseLeaves, false, false
 }
 
 // consider condemns o if nothing reaches it and it's older than the grace window.
@@ -254,7 +263,7 @@ func (gc *gc) consider(o s3types.Object) {
 	key, size := aws.ToString(o.Key), aws.ToInt64(o.Size)
 	gc.totalCount.Add(1)
 	gc.totalSize.Add(size)
-	live, known := gc.classify(key)
+	_, live, known := gc.classify(key)
 	if !known {
 		gc.logln("unexpected file", key)
 	}
@@ -450,17 +459,57 @@ func (gc *gc) remove(ctx context.Context) error {
 	gc.logf("keep  : %9d objects, %14d bytes", gc.totalCount.Load()-gc.delCount.Load(), gc.totalSize.Load()-gc.delSize.Load())
 	gc.logf("recent: %9d unreachable objects modified within %s", gc.recent.Load(), gc.grace)
 
-	var keys []string
+	var phases [numPhases][]string
 	gc.toDelete.Range(func(k, _ any) bool {
-		if live, _ := gc.classify(k.(string)); live {
-			gc.rescued.Add(1)
-		} else {
-			keys = append(keys, k.(string))
-		}
+		phase, _, _ := gc.classify(k.(string))
+		phases[phase] = append(phases[phase], k.(string))
 		return true
 	})
-	slices.Sort(keys)
+	err := gc.removePhases(ctx, phases)
+	if n := gc.rescued.Load(); n > 0 {
+		gc.logf("kept %d objects reached by roots written during gc", n)
+	}
+	if n := gc.refreshed.Load(); n > 0 {
+		gc.logf("kept %d objects deleted or modified during gc", n)
+	}
+	if n := gc.delErrors.Load(); n > 0 {
+		gc.logf("delete errors: %d", n)
+	}
+	return err
+}
 
+func (gc *gc) removePhases(ctx context.Context, phases [numPhases][]string) error {
+	for phase, keys := range phases {
+		// Check reachability again here: roots written during GC, or referrers whose
+		// deletes failed, may reach these.
+		keys = slices.DeleteFunc(keys, func(key string) bool {
+			_, live, _ := gc.classify(key)
+			if live {
+				gc.rescued.Add(1)
+			}
+			return live
+		})
+		slices.Sort(keys)
+		failed, err := gc.deleteKeys(ctx, keys)
+		if err != nil {
+			// Some of this phase's deletes may or may not have happened, so don't touch
+			// what they refer to.
+			return err
+		}
+		if phase == phaseRefs && len(failed) > 0 {
+			gc.logf("tracing %d manifests and narinfos that failed to delete", len(failed))
+			if err := gc.keepReferents(ctx, failed); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// deleteKeys deletes keys and returns those that S3 reported per-key errors for.
+func (gc *gc) deleteKeys(ctx context.Context, keys []string) ([]string, error) {
+	var mu sync.Mutex
+	var failed []string
 	eg := errgroup.WithContext(ctx)
 	eg.SetLimit(cmp.Or(gc.lim.del, 20))
 	for batch := range slices.Chunk(keys, cmp.Or(gc.lim.batch, 100)) {
@@ -473,23 +522,36 @@ func (gc *gc) remove(ctx context.Context) error {
 				Bucket: &gc.bucket,
 				Delete: makeBatchDelete(batch),
 			})
-			if res != nil {
-				gc.delErrors.Add(int64(len(res.Errors)))
+			if err != nil {
+				return err
 			}
-			return err
+			gc.delErrors.Add(int64(len(res.Errors)))
+			mu.Lock()
+			defer mu.Unlock()
+			for _, e := range res.Errors {
+				failed = append(failed, aws.ToString(e.Key))
+			}
+			return nil
 		})
 	}
 	err := eg.Wait()
-	if n := gc.rescued.Load(); n > 0 {
-		gc.logf("kept %d objects reached by roots written during gc", n)
+	return failed, err
+}
+
+// keepReferents traces manifests and narinfos that failed to delete, so that the next phase
+// keeps the chunks and nars they refer to.
+func (gc *gc) keepReferents(ctx context.Context, keys []string) error {
+	eg := errgroup.WithContext(ctx)
+	eg.SetLimit(cmp.Or(gc.lim.trace, 50))
+	for _, key := range keys {
+		if mc, ok := strings.CutPrefix(key, manifester.ManifestCachePath[1:]); ok {
+			eg.Go(func() error { return gc.traceManifest(eg, mc) })
+		} else if rest, ok := strings.CutSuffix(key, ".narinfo"); ok && strings.HasPrefix(rest, "nixcache/") {
+			sph := strings.TrimPrefix(rest, "nixcache/")
+			eg.Go(func() error { return gc.traceSph(eg, sph) })
+		}
 	}
-	if n := gc.refreshed.Load(); n > 0 {
-		gc.logf("kept %d objects deleted or modified during gc", n)
-	}
-	if n := gc.delErrors.Load(); n > 0 {
-		gc.logf("delete errors: %d", n)
-	}
-	return err
+	return eg.Wait()
 }
 
 // recheck returns the keys that still exist and are older than the grace window. The chunk

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -47,6 +48,9 @@ type fakeS3 struct {
 	// failDelete, if set, reports whether a DeleteObjects entry should fail with a per-key
 	// error (and the object be kept). Called with the lock held.
 	failDelete func(key string) bool
+	// loseDeleteResponse, if set, reports whether a DeleteObjects request should do its
+	// deletes and then fail with a 500 as if the response were lost. Called with the lock held.
+	loseDeleteResponse func(keys []string) bool
 }
 
 func newFakeS3() *fakeS3 {
@@ -200,8 +204,10 @@ func (f *fakeS3) serveDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var res fakeDeleteResult
+	var keys []string
 	f.mu.Lock()
 	for _, o := range req.Objects {
+		keys = append(keys, o.Key)
 		if f.failDelete != nil && f.failDelete(o.Key) {
 			res.Error = append(res.Error, fakeDeleteError{Key: o.Key, Code: "InternalError", Message: "injected"})
 			continue
@@ -211,7 +217,12 @@ func (f *fakeS3) serveDelete(w http.ResponseWriter, r *http.Request) {
 			res.Deleted = append(res.Deleted, fakeDeleted{Key: o.Key})
 		}
 	}
+	lose := f.loseDeleteResponse != nil && f.loseDeleteResponse(keys)
 	f.mu.Unlock()
+	if lose {
+		writeXML(w, http.StatusInternalServerError, fakeS3Error{Code: "InternalError", Message: "injected"})
+		return
+	}
 	writeXML(w, http.StatusOK, res)
 }
 
@@ -461,6 +472,59 @@ func TestGCKeepsObjectsRefreshedDuringGC(t *testing.T) {
 	require.Equal(t, int32(2), rootLists.Load())
 	require.True(t, f.has(chunk), "chunk refreshed during GC was deleted")
 	require.False(t, f.has(gone))
+}
+
+// GC deletes manifests before chunks. If the manifest's delete fails but its chunks'
+// deletes succeed, the manifest stays in the cache without its chunks, and the daemon's
+// remanifest recovery gets the same cached manifest back and can't recover.
+func TestGCPartialDeleteKeepsManifestChunks(t *testing.T) {
+	f := newFakeS3()
+	g, sb := newTestGC(t, f)
+
+	var digs []cdig.CDig
+	for i := range 5 {
+		d := testDigest(10 + i)
+		digs = append(digs, d)
+		f.putOld(testChunkKey(d), []byte("chunk"))
+	}
+	man := testManifestKey("v1-stale")
+	f.putOld(man, testManifestObj(t, digs...))
+	staleRoot := testRootKey("build", g.now.Add(-gcMaxAge-24*time.Hour))
+	f.putOld(staleRoot, testRootObj(t, "v1-stale"))
+	other := testChunkKey(testDigest(99))
+	f.putOld(other, []byte("chunk"))
+
+	f.failDelete = func(key string) bool { return key == man }
+
+	require.NoError(t, g.run(context.Background()))
+	t.Log(sb.String())
+
+	require.False(t, f.has(staleRoot))
+	require.False(t, f.has(other))
+	// invariant: a manifest left in the cache still has all of its chunks
+	require.True(t, f.has(man), "test setup: manifest delete should have failed")
+	for _, d := range digs {
+		require.True(t, f.has(testChunkKey(d)), "manifest %s survived GC but its chunk %s was deleted", man, d)
+	}
+}
+
+// If a DeleteObjects for manifests fails outright (here it deletes and then loses its
+// response), GC doesn't know which manifests are left, so it stops before deleting chunks.
+func TestGCLostDeleteResponseKeepsChunks(t *testing.T) {
+	f := newFakeS3()
+	g, sb := newTestGC(t, f)
+
+	dig := testDigest(1)
+	chunk := testChunkKey(dig)
+	f.putOld(chunk, []byte("chunk"))
+	man := testManifestKey("v1-stale")
+	f.putOld(man, testManifestObj(t, dig))
+	f.loseDeleteResponse = func(keys []string) bool { return slices.Contains(keys, man) }
+
+	require.Error(t, g.run(context.Background()))
+	t.Log(sb.String())
+	require.False(t, f.has(man))
+	require.True(t, f.has(chunk), "GC deleted chunks after a failed manifest delete")
 }
 
 // remove() runs DeleteObjects batches concurrently and counts the per-key errors of each.
