@@ -3,6 +3,7 @@ package tests
 import (
 	"archive/tar"
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"maps"
 	"net"
@@ -14,8 +15,10 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"go.etcd.io/bbolt"
 	"golang.org/x/sys/unix"
 
+	"github.com/dnr/styx/common/cdig"
 	"github.com/dnr/styx/common/client"
 	"github.com/dnr/styx/daemon"
 )
@@ -128,4 +131,61 @@ func TestExactChunkMultipleVaporize(t *testing.T) {
 	dst := tb.materialize(name)
 	requireFileBytes(t, filepath.Join(dst, "a"), a)
 	requireFileBytes(t, filepath.Join(dst, "b"), b)
+}
+
+// A database written with the old allocation, where two chunks of an image share an address,
+// is repaired when the daemon starts, and the image is rebuilt when it's restored after a
+// reboot.
+func TestRepairSlabOverlapOnReboot(t *testing.T) {
+	tb := newTestBase(t)
+	a := bytes.Repeat([]byte{'a'}, 64<<10)
+	b := bytes.Repeat([]byte{'b'}, 64<<10)
+	url := tb.serveExtraTarball("overlap.tar", map[string][]byte{"a": a, "b": b}, nil)
+	tb.startAll()
+
+	_, mp := tb.mountExtraTarball(url)
+	requireFileBytes(t, filepath.Join(mp, "a"), a)
+	requireFileBytes(t, filepath.Join(mp, "b"), b)
+
+	// reboot
+	tb.daemon.Stop(true)
+	tb.daemon = nil
+	require.NoError(t, unix.Unmount(mp, 0))
+	tb.dropCaches()
+
+	// make the database look like the old allocation did it: b's chunk was allocated at a's
+	// address and took over its address key. the image still has b's chunk at its own
+	// address, so if it isn't rebuilt, a and b can't both read back right.
+	da, db := cdig.Sum(a), cdig.Sum(b)
+	var addrA, addrB uint32
+	bdb, err := bbolt.Open(filepath.Join(tb.cachedir, "styx.bolt"), 0o644, nil)
+	require.NoError(t, err)
+	require.NoError(t, bdb.Update(func(tx *bbolt.Tx) error {
+		cb := tx.Bucket([]byte("chunk"))
+		sb := tx.Bucket([]byte("slab")).Bucket([]byte{0, 0})
+		va, vb := bytes.Clone(cb.Get(da[:])), bytes.Clone(cb.Get(db[:]))
+		require.NotNil(t, va)
+		require.NotNil(t, vb)
+		addrA, addrB = binary.LittleEndian.Uint32(va[2:]), binary.LittleEndian.Uint32(vb[2:])
+		require.NotEqual(t, addrA, addrB)
+		key := func(addr uint32) []byte { return binary.BigEndian.AppendUint32(nil, addr) }
+		require.NoError(t, sb.Delete(key(addrB)))
+		require.NoError(t, sb.Delete(key(addrB|1<<31)))
+		require.NoError(t, sb.Put(key(addrA), db[:]))
+		binary.LittleEndian.PutUint32(vb[2:], addrA)
+		require.NoError(t, cb.Put(db[:], vb))
+		// written before the repair existed
+		return tx.Bucket([]byte("meta")).Delete([]byte("slab-overlap-repaired"))
+	}))
+	require.NoError(t, bdb.Close())
+	t.Logf("a's chunk at %d, b's chunk moved from %d to %d", addrA, addrB, addrA)
+
+	tb.startDaemon()
+
+	requireFileBytes(t, filepath.Join(mp, "a"), a)
+	requireFileBytes(t, filepath.Join(mp, "b"), b)
+
+	chunks := tb.debug(daemon.DebugReq{IncludeChunks: []string{da.String(), db.String()}}).Chunks
+	t.Logf("after repair: a's chunk at %d, b's at %d", chunks[da.String()].Addr, chunks[db.String()].Addr)
+	require.NotEqual(t, chunks[da.String()].Addr, chunks[db.String()].Addr)
 }
