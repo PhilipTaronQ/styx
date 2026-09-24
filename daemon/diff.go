@@ -289,13 +289,17 @@ func (s *Server) buildAndStartPrefetch(ctx context.Context, reqs []cdig.CDig) ([
 
 // currently this is only used to read manifest chunks
 // all chunks must be the same size
+//
+// Each chunk is checked against its digest. One whose data doesn't match (data lost in a crash
+// can read back as zeros) is missing: its present record is dropped, and it's fetched again if
+// allowMissing, or else it's an errMissingChunk.
 func (s *Server) readChunks(
 	ctx context.Context, // can be nil if allowMissing is false
 	useTx *bbolt.Tx, // optional
 	totalSize int64,
 	chunkShift shift.Shift,
 	locs []erofs.SlabLoc,
-	digests []cdig.CDig, // used if allowMissing is true
+	digests []cdig.CDig,
 	sphps []SphPrefix, // used if allowMissing is true
 	allowMissing bool,
 ) ([]byte, error) {
@@ -311,40 +315,84 @@ func (s *Server) readChunks(
 		return nil
 	}
 
-	for {
-		if useTx != nil {
-			findMissing(useTx)
-		} else {
-			s.db.View(findMissing)
-		}
-		if firstMissing == -1 {
-			break // we have them all
-		}
-		if !allowMissing {
-			// if this happens we probably have a race between fetching and using manifests
-			loc := locs[firstMissing]
-			return nil, fmt.Errorf("missing chunk %d:%d", loc.SlabId, loc.Addr)
-		}
-
-		// request first missing one. the differ will do some readahead.
-		err := s.requestChunk(ctx, locs[firstMissing], digests[firstMissing], sphps)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	// read all from slabs. all but last chunk must be full.
 	out := make([]byte, totalSize)
-	rest := out
-	for _, loc := range locs {
-		toRead := min(int(chunkShift.Size()), len(rest))
-		err := s.getKnownChunk(loc, rest[:toRead])
-		if err != nil {
+	refetched := make(map[int]bool)
+	for {
+		for {
+			if useTx != nil {
+				findMissing(useTx)
+			} else {
+				s.db.View(findMissing)
+			}
+			if firstMissing == -1 {
+				break // we have them all
+			}
+			if !allowMissing {
+				// if this happens we probably have a race between fetching and using manifests
+				loc := locs[firstMissing]
+				return nil, fmt.Errorf("%w %d:%d", errMissingChunk, loc.SlabId, loc.Addr)
+			}
+
+			// request first missing one. the differ will do some readahead.
+			err := s.requestChunk(ctx, locs[firstMissing], digests[firstMissing], sphps)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		// read all from slabs. all but last chunk must be full.
+		bad, badSize := -1, 0
+		rest := out
+		for i, loc := range locs {
+			toRead := min(int(chunkShift.Size()), len(rest))
+			if err := s.getKnownChunk(loc, rest[:toRead]); err != nil {
+				return nil, err
+			} else if digests[i].Check(rest[:toRead]) != nil {
+				bad, badSize = i, toRead
+				break
+			}
+			rest = rest[toRead:]
+		}
+		if bad < 0 {
+			return out, nil
+		}
+
+		loc := locs[bad]
+		err := fmt.Errorf("%w %d:%d: data doesn't match digest %s", errMissingChunk, loc.SlabId, loc.Addr, digests[bad])
+		log.Print(err)
+		s.dropBadPresent(useTx, loc, digests[bad], badSize)
+		if !allowMissing || refetched[bad] {
 			return nil, err
 		}
-		rest = rest[toRead:]
+		refetched[bad] = true
 	}
-	return out, nil
+}
+
+// dropBadPresent forgets that loc is present, since its data doesn't match digest. A
+// read-only transaction can't write, so then it's done in the background, if the data is still
+// bad by then.
+func (s *Server) dropBadPresent(tx *bbolt.Tx, loc erofs.SlabLoc, digest cdig.CDig, size int) {
+	if tx != nil && tx.Writable() {
+		_ = s.dropPresent(tx, loc)
+		return
+	}
+	drop := func() {
+		err := s.db.Update(func(tx *bbolt.Tx) error {
+			buf := make([]byte, size)
+			if s.getKnownChunk(loc, buf) == nil && digest.Check(buf) == nil {
+				return nil // fetched again since
+			}
+			return s.dropPresent(tx, loc)
+		})
+		if err != nil {
+			log.Printf("dropping present record of %d:%d: %v", loc.SlabId, loc.Addr, err)
+		}
+	}
+	if tx != nil {
+		go drop()
+	} else {
+		drop()
+	}
 }
 
 func (s *Server) readSingle(ctx context.Context, loc erofs.SlabLoc, digest cdig.CDig) error {
@@ -748,7 +796,7 @@ func (s *Server) getDigestsFromImage(tx *bbolt.Tx, sph Sph, isManifest bool) ([]
 			return nil, err
 		}
 		cshift := entry.ChunkShiftDef()
-		data, err = s.readChunks(context.TODO(), tx, entry.Size, cshift, locs, nil, nil, false)
+		data, err = s.readChunks(context.TODO(), tx, entry.Size, cshift, locs, cdig.FromSliceAlias(entry.Digests), nil, false)
 		if err != nil {
 			return nil, err
 		}
@@ -762,18 +810,12 @@ func (s *Server) getDigestsFromImage(tx *bbolt.Tx, sph Sph, isManifest bool) ([]
 
 // simplified form of getDigestsFromImage (TODO: consolidate)
 func (s *Server) getManifestLocal(tx *bbolt.Tx, sphStr string) (*pb.Manifest, []cdig.CDig, error) {
-	v := tx.Bucket(manifestBucket).Get([]byte(sphStr))
-	if v == nil {
-		return nil, nil, fmt.Errorf("manifest %q not found", sphStr)
-	}
-	var sm pb.SignedMessage
-	err := proto.Unmarshal(v, &sm)
+	entry, err := getManifestEntry(tx, sphStr)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	// read chunks if needed
-	entry := sm.Msg
 	data := entry.InlineData
 	mdigs := cdig.FromSliceAlias(entry.Digests)
 	if len(data) == 0 {
@@ -782,13 +824,62 @@ func (s *Server) getManifestLocal(tx *bbolt.Tx, sphStr string) (*pb.Manifest, []
 			return nil, nil, err
 		}
 		cshift := entry.ChunkShiftDef()
-		data, err = s.readChunks(context.TODO(), tx, entry.Size, cshift, locs, nil, nil, false)
+		data, err = s.readChunks(context.TODO(), tx, entry.Size, cshift, locs, mdigs, nil, false)
 		if err != nil {
 			return nil, nil, err
 		}
 	}
+	return unmarshalManifest(data, mdigs)
+}
 
-	// unmarshal
+// loadManifest is getManifestLocal outside a transaction, so it can fetch manifest chunks that
+// are missing or damaged.
+func (s *Server) loadManifest(ctx context.Context, sphStr string) (*pb.Manifest, []cdig.CDig, error) {
+	sph, _, err := ParseSph(sphStr)
+	if err != nil {
+		return nil, nil, err
+	}
+	var entry *pb.Entry
+	var locs []erofs.SlabLoc
+	err = s.db.View(func(tx *bbolt.Tx) error {
+		var err error
+		if entry, err = getManifestEntry(tx, sphStr); err != nil || len(entry.InlineData) > 0 {
+			return err
+		}
+		locs, err = s.lookupLocs(tx, cdig.FromSliceAlias(entry.Digests))
+		return err
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	data := entry.InlineData
+	mdigs := cdig.FromSliceAlias(entry.Digests)
+	if len(data) == 0 {
+		manifestSph := makeManifestSph(sph)
+		sphps := []SphPrefix{SphPrefixFromBytes(manifestSph[:])}
+		data, err = s.readChunks(ctx, nil, entry.Size, entry.ChunkShiftDef(), locs, mdigs, sphps, true)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	return unmarshalManifest(data, mdigs)
+}
+
+// getManifestEntry returns the entry in sphStr's signed manifest message.
+func getManifestEntry(tx *bbolt.Tx, sphStr string) (*pb.Entry, error) {
+	v := tx.Bucket(manifestBucket).Get([]byte(sphStr))
+	if v == nil {
+		return nil, fmt.Errorf("manifest %q not found", sphStr)
+	}
+	var sm pb.SignedMessage
+	if err := proto.Unmarshal(v, &sm); err != nil {
+		return nil, err
+	}
+	return sm.Msg, nil
+}
+
+func unmarshalManifest(data []byte, mdigs []cdig.CDig) (*pb.Manifest, []cdig.CDig, error) {
 	var m pb.Manifest
 	if err := proto.Unmarshal(data, &m); err != nil {
 		return nil, nil, err

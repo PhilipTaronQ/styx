@@ -40,8 +40,12 @@ type (
 		keepSphps map[SphPrefix]struct{} // sph prefix
 		keepDig   map[cdig.CDig]struct{}
 
-		held      map[string]struct{}    // sph string with an operation in progress
-		heldSphps map[SphPrefix]struct{} // sph prefixes of those and their manifests
+		held map[string]struct{} // sph string with an operation in progress
+		// sph prefixes whose chunks we keep whether a manifest refers to them or not: held
+		// images and their manifests, and images whose manifests we couldn't read
+		tagSphps map[SphPrefix]struct{}
+		// images whose manifest chunks are missing or damaged, to fetch again after committing
+		repairManifests []string
 	}
 
 	// gcGuard tracks what in-progress operations need gc to leave alone.
@@ -95,7 +99,7 @@ func (s *Server) handleGcReq(ctx context.Context, r *GcReq) (*GcResp, error) {
 		keepSphps: make(map[SphPrefix]struct{}, 1000),
 		keepDig:   make(map[cdig.CDig]struct{}, 100000),
 		held:      make(map[string]struct{}),
-		heldSphps: make(map[SphPrefix]struct{}),
+		tagSphps:  make(map[SphPrefix]struct{}),
 	}
 
 	// A mount, materialize or vaporize in progress keeps its image whatever the image's state,
@@ -110,7 +114,7 @@ func (s *Server) handleGcReq(ctx context.Context, r *GcReq) (*GcResp, error) {
 		manifestSph := makeManifestSph(sph)
 		g.held[sphStr] = struct{}{}
 		for _, sphp := range []SphPrefix{SphPrefixFromBytes(sph[:]), SphPrefixFromBytes(manifestSph[:])} {
-			g.heldSphps[sphp] = struct{}{}
+			g.tagSphps[sphp] = struct{}{}
 			g.keepSphps[sphp] = struct{}{}
 		}
 	}
@@ -191,7 +195,7 @@ func (s *Server) handleGcReq(ctx context.Context, r *GcReq) (*GcResp, error) {
 	for k, v := cbcur.First(); k != nil; k, v = cbcur.Next() {
 		d := cdig.FromBytes(k)
 		sphps := sphpsFromLoc(v)
-		if _, ok := g.keepDig[d]; !ok && !g.anyHeld(sphps) {
+		if _, ok := g.keepDig[d]; !ok && !g.anyTagged(sphps) {
 			delChunks = append(delChunks, d)
 			delLocs = append(delLocs, loadLoc(v))
 			continue
@@ -412,6 +416,12 @@ func (s *Server) handleGcReq(ctx context.Context, r *GcReq) (*GcResp, error) {
 		})
 	}
 
+	for _, sphStr := range g.repairManifests {
+		if _, _, err := s.loadManifest(ctx, sphStr); err != nil {
+			log.Printf("gc: fetching manifest chunks of %s again: %v", sphStr, err)
+		}
+	}
+
 	return resp, nil
 }
 
@@ -430,7 +440,17 @@ func (s *Server) gcTraceImage(g *gcCtx, sphStr string, img *pb.DbImage) error {
 	g.RemainImagesByState[img.MountState]++
 
 	m, mdigs, err := s.getManifestLocal(g.tx, sphStr)
-	if err != nil {
+	if errors.Is(err, errMissingChunk) && gcNeedsManifest(img.MountState) {
+		// A chunk of the manifest is missing, or its data is damaged (readChunks dropped its
+		// present record). We fetch it again after committing. Until then we can't tell which
+		// chunks the image uses, but they're all tagged with it, so keep those.
+		log.Printf("gc: keeping all chunks of %s (%s) until its manifest is fetched again: %v", sphStr, img.MountState, err)
+		g.tagSphps[sphPrefix] = struct{}{}
+		g.tagSphps[manifestSphPrefix] = struct{}{}
+		g.keepManifestChunks(sphStr)
+		g.repairManifests = append(g.repairManifests, sphStr)
+		return nil
+	} else if err != nil {
 		if gcNeedsManifest(img.MountState) {
 			return err
 		}
@@ -438,14 +458,7 @@ func (s *Server) gcTraceImage(g *gcCtx, sphStr string, img *pb.DbImage) error {
 		// manifest. It has no image chunks yet, so there is nothing more to trace, but keep
 		// any manifest chunks it got so a retry can use them.
 		log.Printf("gc: keeping %s (%s) without its manifest: %v", sphStr, img.MountState, err)
-		if v := g.mb.Get([]byte(sphStr)); v != nil {
-			var sm pb.SignedMessage
-			if proto.Unmarshal(v, &sm) == nil {
-				for _, mdig := range cdig.FromSliceAlias(sm.Msg.GetDigests()) {
-					g.keepDig[mdig] = struct{}{}
-				}
-			}
-		}
+		g.keepManifestChunks(sphStr)
 		return nil
 	}
 
@@ -459,6 +472,18 @@ func (s *Server) gcTraceImage(g *gcCtx, sphStr string, img *pb.DbImage) error {
 	}
 
 	return nil
+}
+
+// keepManifestChunks keeps the chunks of sphStr's manifest.
+func (g *gcCtx) keepManifestChunks(sphStr string) {
+	if v := g.mb.Get([]byte(sphStr)); v != nil {
+		var sm pb.SignedMessage
+		if proto.Unmarshal(v, &sm) == nil {
+			for _, mdig := range cdig.FromSliceAlias(sm.Msg.GetDigests()) {
+				g.keepDig[mdig] = struct{}{}
+			}
+		}
+	}
 }
 
 // Images in these states were mounted or materialized, so they have chunks, and gc must read
@@ -617,9 +642,9 @@ func clampToReserved(reserved []slabRange, l erofs.SlabLoc, end uint32) uint32 {
 	return end
 }
 
-func (g *gcCtx) anyHeld(sphps []SphPrefix) bool {
+func (g *gcCtx) anyTagged(sphps []SphPrefix) bool {
 	for _, sphp := range sphps {
-		if _, ok := g.heldSphps[sphp]; ok {
+		if _, ok := g.tagSphps[sphp]; ok {
 			return true
 		}
 	}

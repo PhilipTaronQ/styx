@@ -22,7 +22,9 @@ import (
 	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/dnr/styx/common"
 	"github.com/dnr/styx/common/cdig"
+	"github.com/dnr/styx/common/shift"
 	"github.com/dnr/styx/erofs"
 	"github.com/dnr/styx/manifester"
 	"github.com/dnr/styx/pb"
@@ -606,4 +608,70 @@ func TestMaterializeChunkMissingAtCopy(t *testing.T) {
 			require.Contains(t, served(), digs[1], "the missing chunk wasn't fetched again")
 		})
 	}
+}
+
+// A manifest chunk whose data was lost while its present record survived (after a power cut
+// it reads back as zeros) made getManifestLocal fail for good: nothing fetched the chunk
+// again, and gc, which has to read the manifest of every mounted image, failed every time.
+func TestGcRecoversDamagedManifestChunk(t *testing.T) {
+	dataDigs := []cdig.CDig{gcTestDigest(20), gcTestDigest(21)}
+	mdata, err := proto.Marshal(&pb.Manifest{Entries: []*pb.Entry{{
+		Path:    "/",
+		Type:    pb.EntryType_REGULAR,
+		Size:    int64(len(dataDigs)) << 16,
+		Digests: cdig.ToSliceAlias(dataDigs),
+	}}})
+	require.NoError(t, err)
+	mdig := cdig.Sum(mdata)
+	url, served := gcTestChunkServer(t, map[cdig.CDig][]byte{mdig: mdata})
+
+	s := newGcTestServer(t)
+	initGcTestServer(t, s, url)
+	require.NoError(t, s.setupManifestSlab())
+	mfd := s.readfdBySlab[manifestSlabOffset].readFd
+	t.Cleanup(func() { unix.Close(mfd) })
+
+	// a mounted image with a chunked manifest, as getManifestAndBuildImage records it
+	sp := gcTestStorePath('r', "pkg-1.0")
+	sph, sphStr, _, err := ParseSphAndName(sp)
+	require.NoError(t, err)
+	_, err = s.AllocateBatch(withAllocateCtx(context.Background(), sph, false), []uint16{16, 16}, dataDigs)
+	require.NoError(t, err)
+	mblocks := common.AppendBlocksList(nil, int64(len(mdata)), s.blockShift, shift.DefaultChunkShift)
+	mlocs, err := s.AllocateBatch(withAllocateCtx(context.Background(), makeManifestSph(sph), true), mblocks, []cdig.CDig{mdig})
+	require.NoError(t, err)
+	env, err := proto.Marshal(&pb.SignedMessage{Msg: &pb.Entry{
+		Size:    int64(len(mdata)),
+		Digests: cdig.ToSliceAlias([]cdig.CDig{mdig}),
+	}})
+	require.NoError(t, err)
+	img, err := proto.Marshal(&pb.DbImage{StorePath: sp, MountState: pb.MountState_Mounted})
+	require.NoError(t, err)
+	require.NoError(t, s.db.Update(func(tx *bbolt.Tx) error {
+		return errors.Join(
+			tx.Bucket(manifestBucket).Put([]byte(sphStr), env),
+			tx.Bucket(imageBucket).Put([]byte(sphStr), img),
+		)
+	}))
+	gcTestWriteChunk(t, s, mlocs[0], mdata)
+
+	// lose the data, keep the present record
+	_, err = unix.Pwrite(mfd, make([]byte, s.blockShift.Roundup(int64(len(mdata)))), int64(mlocs[0].Addr)<<s.blockShift)
+	require.NoError(t, err)
+
+	res, err := s.handleGcReq(context.Background(), &GcReq{GcByState: gcDefault})
+	require.NoError(t, err, "gc failed on an image with a damaged manifest chunk")
+	require.Zero(t, res.DeleteImages)
+	for _, d := range dataDigs {
+		require.True(t, gcTestHasChunk(t, s, d), "gc deleted a chunk of an image whose manifest it couldn't read")
+	}
+
+	// the chunk was fetched again, so the manifest reads back
+	require.Contains(t, served(), mdig, "the damaged manifest chunk wasn't fetched again")
+	var m *pb.Manifest
+	require.NoError(t, s.db.View(func(tx *bbolt.Tx) error {
+		m, _, err = s.getManifestLocal(tx, sphStr)
+		return err
+	}))
+	require.Equal(t, dataDigs, cdig.FromSliceAlias(m.Entries[0].Digests))
 }

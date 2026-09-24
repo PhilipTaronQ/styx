@@ -79,11 +79,7 @@ func (s *Server) handleMaterializeReq(ctx context.Context, r *MaterializeReq) (*
 	var m *pb.Manifest
 	if shouldHaveManifest {
 		// read locally
-		err = s.db.View(func(tx *bbolt.Tx) error {
-			m, _, err = s.getManifestLocal(tx, sphStr)
-			return err
-		})
-		if err != nil {
+		if m, _, err = s.loadManifest(ctx, sphStr); err != nil {
 			// fall back to remote manifest
 			log.Print("error getting manifest locally, trying remote")
 			shouldHaveManifest = false
