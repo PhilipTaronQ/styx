@@ -290,6 +290,23 @@ func TestGcKeepsHeldImage(t *testing.T) {
 	require.False(t, gcTestHasChunk(t, s, d))
 }
 
+func TestSyncSlab(t *testing.T) {
+	s := newGcTestServer(t)
+	fd, err := unix.Open(filepath.Join(t.TempDir(), "slab"), unix.O_RDWR|unix.O_CREAT, 0o600)
+	require.NoError(t, err)
+	t.Cleanup(func() { unix.Close(fd) })
+	s.readfdBySlab[0] = slabFds{fd, fd}
+
+	errs := make(chan error, 8)
+	for range cap(errs) {
+		go func() { errs <- s.syncSlab(0) }()
+	}
+	for range cap(errs) {
+		require.NoError(t, <-errs)
+	}
+	require.Error(t, s.syncSlab(1), "slab 1 has no fd")
+}
+
 func gcTestCatalogF(t *testing.T, s *Server) []string {
 	t.Helper()
 	var names []string

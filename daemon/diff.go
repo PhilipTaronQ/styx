@@ -630,6 +630,10 @@ func (s *Server) gotNewChunk(loc erofs.SlabLoc, digest cdig.CDig, b []byte) erro
 }
 
 func (s *Server) cleanPresentMap(loc erofs.SlabLoc) {
+	if err := s.syncSlab(loc.SlabId); err != nil {
+		log.Println("present map sync error:", err)
+		return
+	}
 	err := s.db.Batch(func(tx *bbolt.Tx) error {
 		sb := tx.Bucket(slabBucket).Bucket(slabKey(loc.SlabId))
 		if sb == nil {

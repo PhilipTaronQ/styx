@@ -434,6 +434,16 @@ func (s *Server) commitPreallocated(ctx context.Context, blocks []uint16, digest
 	if len(blocks) != len(digests) || len(blocks) != len(locs) || len(blocks) != len(wasAllocated) {
 		return errors.New("mismatched lengths")
 	}
+	// the data we copied in must be durable before we mark it present
+	synced := make(map[uint16]bool)
+	for i, loc := range locs {
+		if !wasAllocated[i] && !synced[loc.SlabId] {
+			if err := s.syncSlab(loc.SlabId); err != nil {
+				return err
+			}
+			synced[loc.SlabId] = true
+		}
+	}
 	return s.db.Update(func(tx *bbolt.Tx) error {
 		cb, slabroot := tx.Bucket(chunkBucket), tx.Bucket(slabBucket)
 		var slabId uint16 = 0

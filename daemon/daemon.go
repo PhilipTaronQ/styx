@@ -81,6 +81,10 @@ type (
 		// keeps track of locs that we know are present before we persist them
 		presentMap common.SimpleSyncMap[erofs.SlabLoc, struct{}]
 
+		// syncs slab data before we persist presence
+		slabSyncLock sync.Mutex
+		slabSyncers  map[uint16]*slabSyncer
+
 		// tracks reads for chunks that we should have, to detect bugs
 		readKnownMap common.SimpleSyncMap[erofs.SlabLoc, int]
 
