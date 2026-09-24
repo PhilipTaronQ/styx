@@ -56,17 +56,24 @@ func TestUpstreamClientChecksEveryRedirect(t *testing.T) {
 	assert.Equal(t, maxRedirects, a.requestCount()-before, "retried or followed too many redirects")
 }
 
-// The redirect check lives in its own client: http.DefaultClient, which the daemon and
-// everything else use, is left alone.
+// The redirect check lives in the builder's own client, made from its config: making a
+// server doesn't change the builder, and http.DefaultClient, which the daemon and everything
+// else use, is left alone.
 func TestUpstreamClientLeavesDefaultClientAlone(t *testing.T) {
 	up := newFakeUpstream(t)
 	cs := &mockChunkStore{data: make(map[string][]byte)}
 	_, pk := upstreamKeys(t)
-	mb := newTestBuilder(t, cs, pk, 0)
-	_, err := NewManifestServer(Config{AllowedUpstreams: []string{up.host()}}, mb)
-	require.NoError(t, err)
 
-	assert.Nil(t, http.DefaultClient.CheckRedirect)
+	mb := newTestBuilder(t, cs, pk, 0, up.host())
 	assert.NotSame(t, http.DefaultClient, mb.upstreamClient)
 	assert.NotNil(t, mb.upstreamClient.CheckRedirect)
+	client := mb.upstreamClient
+	_, err := NewManifestServer(Config{}, mb)
+	require.NoError(t, err)
+	assert.Same(t, client, mb.upstreamClient, "NewManifestServer changed the builder's client")
+	assert.Nil(t, http.DefaultClient.CheckRedirect)
+
+	// a builder that doesn't serve requests follows redirects as usual
+	plain := newTestBuilder(t, cs, pk, 0)
+	assert.Same(t, http.DefaultClient, plain.upstreamClient)
 }

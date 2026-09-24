@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -66,8 +67,9 @@ type (
 		pubKeys    []signature.PublicKey
 		signKeys   []signature.SecretKey
 		chunkSizer func(int64) shift.Shift
-		// for narinfo, nar and tarball fetches. a manifester server replaces it with one that
-		// follows redirects only to its allowed upstreams.
+		// hosts that upstream fetches may start at or be redirected to, or nil for any
+		allowedUpstreams []string
+		// for narinfo, nar and tarball fetches: follows redirects only to allowedUpstreams
 		upstreamClient *http.Client
 
 		stats atomicStats
@@ -102,6 +104,12 @@ type (
 		PublicKeys []signature.PublicKey
 		// Sign manifests with these keys.
 		SigningKeys []signature.SecretKey
+
+		// Hosts that narinfo, nar and tarball fetches may be redirected to. A builder that
+		// takes requests from the network (a manifester server) must set this; the server
+		// also accepts only requests for these upstreams. nil follows any redirect, for
+		// builders that only build what they're told (CI, vaporize).
+		AllowedUpstreams []string
 	}
 
 	ManifestBuildRes struct {
@@ -123,6 +131,10 @@ func NewManifestBuilder(cfg ManifestBuilderConfig, cs ChunkStoreWrite) (*Manifes
 	if chunkSizer == nil {
 		chunkSizer = common.DefaultChunkShift
 	}
+	upstreamClient := http.DefaultClient
+	if cfg.AllowedUpstreams != nil {
+		upstreamClient = newUpstreamClient(cfg.AllowedUpstreams)
+	}
 	return &ManifestBuilder{
 		cs:       cs,
 		chunksem: semaphore.NewWeighted(int64(cmp.Or(cfg.ConcurrentChunkOps, 200))),
@@ -130,11 +142,12 @@ func NewManifestBuilder(cfg ManifestBuilderConfig, cs ChunkStoreWrite) (*Manifes
 			DigestAlgo: cdig.Algo,
 			DigestBits: int32(cdig.Bits),
 		},
-		chunkPool:      common.NewChunkPool(),
-		pubKeys:        cfg.PublicKeys,
-		signKeys:       cfg.SigningKeys,
-		chunkSizer:     chunkSizer,
-		upstreamClient: http.DefaultClient,
+		chunkPool:        common.NewChunkPool(),
+		pubKeys:          cfg.PublicKeys,
+		signKeys:         cfg.SigningKeys,
+		chunkSizer:       chunkSizer,
+		allowedUpstreams: slices.Clone(cfg.AllowedUpstreams),
+		upstreamClient:   upstreamClient,
 	}, nil
 }
 

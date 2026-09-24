@@ -176,7 +176,8 @@ func upstreamKeys(t *testing.T) (signature.SecretKey, signature.PublicKey) {
 	return sk, pk
 }
 
-func newTestBuilder(t *testing.T, cs ChunkStoreWrite, pk signature.PublicKey, concurrent int) *ManifestBuilder {
+// newTestBuilder returns a builder that accepts pk's narinfos, from allowed upstreams.
+func newTestBuilder(t *testing.T, cs ChunkStoreWrite, pk signature.PublicKey, concurrent int, allowed ...string) *ManifestBuilder {
 	t.Helper()
 	styxSk, _, err := signature.GenerateKeypair("styx-test-1", rand.Reader)
 	require.NoError(t, err)
@@ -184,6 +185,7 @@ func newTestBuilder(t *testing.T, cs ChunkStoreWrite, pk signature.PublicKey, co
 		ConcurrentChunkOps: concurrent,
 		PublicKeys:         []signature.PublicKey{pk},
 		SigningKeys:        []signature.SecretKey{styxSk},
+		AllowedUpstreams:   allowed,
 	}, cs)
 	require.NoError(t, err)
 	return mb

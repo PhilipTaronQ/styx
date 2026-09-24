@@ -53,8 +53,7 @@ type (
 	}
 
 	Config struct {
-		Bind             string
-		AllowedUpstreams []string
+		Bind string
 
 		ChunkDiffZstdLevel int
 		ChunkDiffParallel  int
@@ -68,9 +67,6 @@ func NewManifestServer(cfg Config, mb *ManifestBuilder) (*server, error) {
 		// a limit of 0 would make every chunk fetch block forever
 		cfg.ChunkDiffParallel = defaultChunkDiffParallel
 	}
-	// the server takes requests from anyone, so its builds may follow upstream redirects only
-	// to allowed hosts
-	mb.upstreamClient = newUpstreamClient(cfg.AllowedUpstreams)
 	return &server{
 		cfg: &cfg,
 		mb:  mb,
@@ -88,7 +84,8 @@ func (s *server) validateManifestReq(r *ManifestReq, upstreamHost string) error 
 		return fmt.Errorf("invalid shard %d of %d", r.ShardIndex, r.ShardTotal)
 	}
 
-	if !slices.Contains(s.cfg.AllowedUpstreams, upstreamHost) {
+	// the builder's allow-list, which its upstream client also applies to every redirect
+	if !slices.Contains(s.mb.allowedUpstreams, upstreamHost) {
 		return fmt.Errorf("invalid upstream %q", upstreamHost)
 	}
 

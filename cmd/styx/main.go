@@ -44,6 +44,21 @@ func withManifestBuilder(c *cobra.Command) cobrautil.RunE {
 	pubkeys := c.Flags().StringArray("nix_pubkey",
 		[]string{"cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="},
 		"verify narinfo with this public key")
+	c.Flags().StringArrayVar(&mbcfg.AllowedUpstreams, "allowed_upstream",
+		[]string{
+			"cache.nixos.org",
+			"releases.nixos.org",
+			"channels.nixos.org",
+			"github.com",
+			// redirects are checked too: github archives and release downloads go here
+			"codeload.github.com",
+			"objects.githubusercontent.com",
+			"release-assets.githubusercontent.com",
+			"gitlab.com",
+			"bitbucket.org",
+			"codeberg.org",
+			"git.sr.ht",
+		}, "allowed upstream binary caches or tarball sources, and hosts they may redirect to")
 
 	return cobrautil.Chain(
 		withChunkStoreWrite(c),
@@ -109,21 +124,6 @@ func withManifesterConfig(c *cobra.Command) *manifester.Config {
 	var cfg manifester.Config
 
 	c.Flags().StringVar(&cfg.Bind, "bind", ":7420", "address to listen on")
-	c.Flags().StringArrayVar(&cfg.AllowedUpstreams, "allowed_upstream",
-		[]string{
-			"cache.nixos.org",
-			"releases.nixos.org",
-			"channels.nixos.org",
-			"github.com",
-			// redirects are checked too: github archives and release downloads go here
-			"codeload.github.com",
-			"objects.githubusercontent.com",
-			"release-assets.githubusercontent.com",
-			"gitlab.com",
-			"bitbucket.org",
-			"codeberg.org",
-			"git.sr.ht",
-		}, "allowed upstream binary caches or tarball sources")
 	c.Flags().IntVar(&cfg.ChunkDiffZstdLevel, "chunk_diff_zstd_level", 3, "encoder level for chunk diffs")
 	c.Flags().IntVar(&cfg.ChunkDiffParallel, "chunk_diff_parallel", 60, "parallelism for loading chunks for diff")
 

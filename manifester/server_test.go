@@ -36,8 +36,8 @@ func TestNarinfo404IsReportedAs417(t *testing.T) {
 	_, pk := upstreamKeys(t)
 	up := newFakeUpstream(t)
 	cs := &mockChunkStore{data: make(map[string][]byte)}
-	mb := newTestBuilder(t, cs, pk, 0)
-	srv, err := NewManifestServer(Config{AllowedUpstreams: []string{up.host()}, ChunkDiffParallel: 4}, mb)
+	mb := newTestBuilder(t, cs, pk, 0, up.host())
+	srv, err := NewManifestServer(Config{ChunkDiffParallel: 4}, mb)
 	require.NoError(t, err)
 
 	body, err := json.Marshal(ManifestReq{
@@ -242,8 +242,8 @@ func TestUpstreamRedirectToDisallowedHost(t *testing.T) {
 	allowed := newFakeUpstream(t)
 	other := newFakeUpstream(t)
 	cs := &mockChunkStore{data: make(map[string][]byte)}
-	mb := newTestBuilder(t, cs, pk, 0)
-	srv, err := NewManifestServer(Config{AllowedUpstreams: []string{allowed.host()}, ChunkDiffParallel: 4}, mb)
+	mb := newTestBuilder(t, cs, pk, 0, allowed.host())
+	srv, err := NewManifestServer(Config{ChunkDiffParallel: 4}, mb)
 	require.NoError(t, err)
 
 	request := func(r ManifestReq) *httptest.ResponseRecorder {
@@ -336,12 +336,12 @@ func newShardEnv(t *testing.T, seed string) *shardEnv {
 		DigestAlgo:    cdig.Algo,
 		DigestBits:    int(cdig.Bits),
 	}).CacheKey()
-	e.srv = e.server(newTestBuilder(t, e.cs, pk, 0))
+	e.srv = e.server(newTestBuilder(t, e.cs, pk, 0, e.up.host()))
 	return e
 }
 
 func (e *shardEnv) server(mb *ManifestBuilder) *server {
-	srv, err := NewManifestServer(Config{AllowedUpstreams: []string{e.up.host()}, ChunkDiffParallel: 4}, mb)
+	srv, err := NewManifestServer(Config{ChunkDiffParallel: 4}, mb)
 	require.NoError(e.t, err)
 	return srv
 }
@@ -430,7 +430,7 @@ func TestShardedManifestCachedOnlyWhenEveryShardIsDone(t *testing.T) {
 	assert.False(t, e.cached(), "manifest cached with shard 2 not done")
 
 	// shard 2 fails
-	failing := e.server(newTestBuilder(t, failingStore{e.cs}, e.pk, 0))
+	failing := e.server(newTestBuilder(t, failingStore{e.cs}, e.pk, 0, e.up.host()))
 	rec := e.request(failing, 4, 2)
 	assert.Equal(t, http.StatusInternalServerError, rec.Code, rec.Body.String())
 	assert.Contains(t, rec.Body.String(), "injected chunk put failure")

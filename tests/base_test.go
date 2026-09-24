@@ -197,6 +197,7 @@ func (tb *testBase) startManifester() {
 	mbcfg := manifester.ManifestBuilderConfig{
 		ConcurrentChunkOps: 10,
 		ChunkSizer:         tb.chunkSizer,
+		AllowedUpstreams:   []string{tb.upstreamHost},
 	}
 	mbcfg.PublicKeys, err = common.LoadPubKeys([]string{nixosKeys})
 	require.NoError(tb.t, err)
@@ -209,7 +210,6 @@ func (tb *testBase) startManifester() {
 	tb.manifesterAddr = fmt.Sprintf("http://%s/", hostport)
 	cfg := manifester.Config{
 		Bind:               hostport,
-		AllowedUpstreams:   []string{tb.upstreamHost},
 		ChunkDiffZstdLevel: 3,
 		ChunkDiffParallel:  60,
 	}
