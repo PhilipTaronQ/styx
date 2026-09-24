@@ -213,21 +213,20 @@ func (s *Server) getNewManifest(ctx context.Context, req manifester.ManifestReq,
 			if err != nil {
 				return err
 			}
-			res, err := common.RetryHttpRequest(egCtx, http.MethodPost, url, common.CTJson, reqBytes)
+			// no attempt timeout: building a manifest can take a while
+			maxBody := int64(zstd.CompressBound(manifester.MaxEnvelopeBytes))
+			b, _, err := common.RetryHttpRequestBody(egCtx, http.MethodPost, url, common.CTJson, reqBytes, maxBody, 0)
 			if err != nil {
 				return fmt.Errorf("manifester http error: %w", err)
 			}
-			defer res.Body.Close()
 			if i == 0 {
-				zr := zstd.NewReader(res.Body)
+				zr := zstd.NewReader(bytes.NewReader(b))
 				defer zr.Close() // frees the C decompression stream
 				if b, err := io.ReadAll(zr); err != nil {
 					return err
 				} else {
 					shard0 = b
 				}
-			} else {
-				io.Copy(io.Discard, res.Body)
 			}
 			return nil
 		})
