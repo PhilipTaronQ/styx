@@ -594,6 +594,14 @@ func (s *Server) handleMountReq(ctx context.Context, r *MountReq) (*Status, erro
 
 	common.NormalizeUpstream(&r.Upstream)
 
+	// Claim the mount before touching the record, so that a request rejected because
+	// another mount is in progress can't overwrite that mount's record.
+	ctx, done, err := s.startMount(ctx, sphStr)
+	if err != nil {
+		return nil, err
+	}
+	defer done()
+
 	var haveImageSize int64
 	var haveIsBare bool
 	err = s.imageTx(sphStr, func(img *pb.DbImage) error {
@@ -625,16 +633,24 @@ func (s *Server) handleMountReq(ctx context.Context, r *MountReq) (*Status, erro
 	return nil, s.tryMount(ctx, r, haveImageSize, haveIsBare)
 }
 
+// startMount claims the in-progress mount of sphStr. The returned context carries the
+// mountContext that handleOpenImage reads; pass it to tryMount, and call done when finished.
+func (s *Server) startMount(ctx context.Context, sphStr string) (context.Context, func(), error) {
+	ctx = withMountContext(ctx, &mountContext{})
+	if _, ok := s.mountCtxMap.GetOrPut(sphStr, ctx); ok {
+		return nil, nil, errors.New("another mount is in progress for this store path")
+	}
+	return ctx, func() { s.mountCtxMap.Delete(sphStr) }, nil
+}
+
+// tryMount mounts req's image and records the result. ctx must come from startMount.
 func (s *Server) tryMount(ctx context.Context, req *MountReq, haveImageSize int64, haveIsBare bool) (retErr error) {
 	_, sphStr, _ := ParseSph(req.StorePath)
 
-	mountCtx := &mountContext{}
-	ctx = withMountContext(ctx, mountCtx)
-
-	if _, ok := s.mountCtxMap.GetOrPut(sphStr, ctx); ok {
-		return errors.New("another mount is in progress for this store path")
+	mountCtx, _ := fromMountCtx(ctx)
+	if mountCtx == nil {
+		return errors.New("tryMount without a mount context")
 	}
-	defer s.mountCtxMap.Delete(sphStr)
 
 	// Record the result however we return. A failure before mount(2), like a manifest the
 	// manifester can't build, must not leave the image Requested: gc keeps Requested images
@@ -794,17 +810,29 @@ func (s *Server) restoreMounts() {
 			// log.Print("restoring: ", img.StorePath, " already mounted on ", img.MountPoint)
 			continue
 		}
-		err := s.tryMount(context.Background(), &MountReq{
-			StorePath:  img.StorePath,
-			MountPoint: img.MountPoint,
-			// the image has been written so we don't need upstream/narsize
-		}, img.ImageSize, img.IsBare)
-		if err == nil {
+		if err := s.restoreMount(img); err == nil {
 			log.Print("restoring: ", img.StorePath, " restored to ", img.MountPoint)
 		} else {
 			log.Print("restoring: ", img.StorePath, " error: ", err)
 		}
 	}
+}
+
+func (s *Server) restoreMount(img *pb.DbImage) error {
+	_, sphStr, err := ParseSph(img.StorePath)
+	if err != nil {
+		return err
+	}
+	ctx, done, err := s.startMount(context.Background(), sphStr)
+	if err != nil {
+		return err
+	}
+	defer done()
+	return s.tryMount(ctx, &MountReq{
+		StorePath:  img.StorePath,
+		MountPoint: img.MountPoint,
+		// the image has been written so we don't need upstream/narsize
+	}, img.ImageSize, img.IsBare)
 }
 
 // cachefiles server

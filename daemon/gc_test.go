@@ -10,7 +10,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"go.etcd.io/bbolt"
@@ -116,4 +118,66 @@ func TestGcAfterFailedMount(t *testing.T) {
 	// the request "styx gc" sends with default flags
 	_, err = s.handleGcReq(context.Background(), &GcReq{DryRunFast: true, GcByState: gcDefault})
 	require.NoError(t, err, "default gc must not be wedged by an earlier failed mount")
+}
+
+// Serves 404 for everything, but holds each request until release is called, so a mount
+// can be caught while it fetches its manifest.
+func gcTestBlockingServer(t *testing.T) (url string, entered <-chan struct{}, release func()) {
+	t.Helper()
+	ent := make(chan struct{}, 16)
+	rel := make(chan struct{})
+	var once sync.Once
+	release = func() { once.Do(func() { close(rel) }) }
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ent <- struct{}{}
+		select {
+		case <-rel:
+		case <-r.Context().Done():
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(release)
+	return srv.URL, ent, release
+}
+
+func gcTestWaitEntered(t *testing.T, entered <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("mount never reached the manifester")
+	}
+}
+
+// handleMountReq used to write the request into the image record before checking for a
+// mount in progress, so a rejected second request replaced the first one's mount point,
+// and a later umount would detach the wrong path.
+func TestRejectedConcurrentMountKeepsRecord(t *testing.T) {
+	url, entered, release := gcTestBlockingServer(t)
+	s := newGcTestServer(t)
+	initGcTestServer(t, s, url)
+	gcTestDevnode(t, s)
+
+	sp := gcTestStorePath('1', "pkg-1.0")
+	mp1 := filepath.Join(t.TempDir(), "first")
+	mp2 := filepath.Join(t.TempDir(), "second")
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := s.handleMountReq(context.Background(), &MountReq{Upstream: url, StorePath: sp, MountPoint: mp1})
+		firstDone <- err
+	}()
+	gcTestWaitEntered(t, entered)
+
+	_, err := s.handleMountReq(context.Background(), &MountReq{Upstream: url, StorePath: sp, MountPoint: mp2})
+	require.ErrorContains(t, err, "another mount is in progress")
+
+	img := gcTestGetImage(t, s, gcTestSph('1'))
+	release()
+	<-firstDone
+
+	require.NotNil(t, img)
+	require.Equal(t, mp1, img.MountPoint, "a rejected concurrent mount replaced the mount point of the one in progress")
+	require.Equal(t, pb.MountState_Requested, img.MountState)
 }
