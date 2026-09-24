@@ -675,3 +675,51 @@ func TestGcRecoversDamagedManifestChunk(t *testing.T) {
 	}))
 	require.Equal(t, dataDigs, cdig.FromSliceAlias(m.Entries[0].Digests))
 }
+
+// Whether [off, off+n) of fd is all hole.
+func gcTestIsHole(fd int, off, n int64) bool {
+	data, err := unix.Seek(fd, off, unix.SEEK_DATA)
+	return err == unix.ENXIO || err == nil && data >= off+n
+}
+
+// A chunk write that landed after gc deleted the chunk and punched its space left the data
+// there: gc never punches a range twice, so the space leaked.
+func TestChunkWriteAfterGcPunchIsFreed(t *testing.T) {
+	s := newGcTestServer(t)
+	initGcTestServer(t, s, "http://localhost:1")
+	fd := gcTestFakeSlab(t, s)
+	data := gcTestChunkData(30)
+	d := cdig.Sum(data)
+	loc := gcTestImage(t, s, 'g', "pkg-1.0", pb.MountState_Unmounted, d)[0]
+	gcTestImage(t, s, 'h', "pkg-2.0", pb.MountState_Mounted, gcTestDigest(31))
+
+	// a fetch of the chunk that writes it after gc
+	entered, release := make(chan struct{}), make(chan struct{})
+	testHookBeforeChunkWrite = func(l erofs.SlabLoc) {
+		if l == loc {
+			close(entered)
+			<-release
+		}
+	}
+	t.Cleanup(func() { testHookBeforeChunkWrite = nil })
+	wrote := make(chan error, 1)
+	go func() { wrote <- s.gotNewChunk(loc, d, slices.Clone(data)) }()
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("write never started")
+	}
+
+	res, err := s.handleGcReq(context.Background(), &GcReq{GcByState: gcDefault})
+	require.NoError(t, err)
+	require.Equal(t, 1, res.DeleteChunks)
+	require.Equal(t, 1, res.PunchLocs)
+	off := int64(loc.Addr) << s.blockShift
+	require.True(t, gcTestIsHole(fd, off, int64(len(data))), "gc didn't punch the chunk")
+
+	close(release)
+	require.NoError(t, <-wrote)
+	require.Eventually(t, func() bool { return gcTestIsHole(fd, off, int64(len(data))) }, 10*time.Second, 10*time.Millisecond,
+		"data written after gc punched the chunk's space is still there")
+	require.False(t, gcTestPresentInDb(s, loc))
+}

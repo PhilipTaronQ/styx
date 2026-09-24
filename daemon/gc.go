@@ -631,6 +631,19 @@ func (s *Server) gcReserved() []slabRange {
 	return slices.Collect(maps.Keys(g.reserved))
 }
 
+// inReservedSpace reports whether loc is in space reserved with reserveForGc.
+func (s *Server) inReservedSpace(loc erofs.SlabLoc) bool {
+	g := &s.gcGuard
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for r := range g.reserved {
+		if r.slabId == loc.SlabId && r.start <= loc.Addr && loc.Addr < r.end {
+			return true
+		}
+	}
+	return false
+}
+
 // A punch runs from a deleted chunk to the next slab key, or the end of the slab. Reserved
 // space has no keys yet, so stop at it.
 func clampToReserved(reserved []slabRange, l erofs.SlabLoc, end uint32) uint32 {

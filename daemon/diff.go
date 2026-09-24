@@ -621,6 +621,9 @@ func (s *Server) getReadFdForSlab(slabId uint16) (int, error) {
 	return 0, errors.New("slab not loaded or missing read fd")
 }
 
+// for tests: called just before gotNewChunk writes a chunk
+var testHookBeforeChunkWrite func(erofs.SlabLoc)
+
 // gotNewChunk may reslice b up to block size and zero up to the new size!
 func (s *Server) gotNewChunk(loc erofs.SlabLoc, digest cdig.CDig, b []byte) error {
 	if err := digest.Check(b); err != nil {
@@ -665,6 +668,9 @@ func (s *Server) gotNewChunk(loc erofs.SlabLoc, digest cdig.CDig, b []byte) erro
 	}
 
 	off := int64(loc.Addr) << s.blockShift
+	if testHookBeforeChunkWrite != nil {
+		testHookBeforeChunkWrite(loc)
+	}
 	if n, err := unix.Pwrite(writeFd, b, off); err != nil {
 		return fmt.Errorf("pwrite error: %w", err)
 	} else if n != len(b) {
@@ -673,21 +679,40 @@ func (s *Server) gotNewChunk(loc erofs.SlabLoc, digest cdig.CDig, b []byte) erro
 
 	// record async
 	s.presentMap.Put(loc, struct{}{})
-	go s.cleanPresentMap(loc, digest)
+	go s.cleanPresentMap(loc, digest, int64(len(b)))
 
 	return nil
 }
 
-func (s *Server) cleanPresentMap(loc erofs.SlabLoc, digest cdig.CDig) {
-	if err := s.syncSlab(loc.SlabId); err != nil {
-		log.Println("present map sync error:", err)
-		return
+// cleanPresentMap records the chunk that gotNewChunk wrote n bytes of at loc present, once
+// its data is durable.
+func (s *Server) cleanPresentMap(loc erofs.SlabLoc, digest cdig.CDig, n int64) {
+	syncErr := s.syncSlab(loc.SlabId)
+	if syncErr != nil {
+		log.Println("present map sync error:", syncErr)
 	}
+	var gone bool
 	err := s.db.Batch(func(tx *bbolt.Tx) error {
+		if gone = s.chunkGone(tx, loc, digest); gone || syncErr != nil {
+			return nil
+		}
 		return s.recordPresent(tx, loc, digest)
 	})
 	if err != nil {
 		log.Println("present map record error:", err)
+		return
+	}
+	if gone {
+		// gc deleted the chunk, and may have punched its space before our write landed. It
+		// never punches the same space again, so punch what we wrote. If our write landed
+		// after gc's punch, this punch is later still; if before, gc's punch cleared it. No
+		// lock needed: we saw gc's commit, which it makes before punching.
+		s.presentMap.Delete(loc)
+		if err := s.punchSlab(loc, n); err != nil {
+			log.Printf("punching chunk %s that gc deleted at %d:%d: %v", digest, loc.SlabId, loc.Addr, err)
+		}
+		return
+	} else if syncErr != nil {
 		return
 	}
 	// we can't clean up presentMap immediately, we need to wait until all read
@@ -696,6 +721,36 @@ func (s *Server) cleanPresentMap(loc erofs.SlabLoc, digest cdig.CDig) {
 	// bookkeeping, though. for now just wait a while. TODO: make this correct
 	time.Sleep(time.Minute)
 	s.presentMap.Delete(loc)
+}
+
+// chunkGone reports whether gc deleted the chunk digest at loc, so its slab key is gone
+// (addresses are never reused). Space that vaporize reserved has no slab keys until it links
+// its chunks, but isn't gone.
+func (s *Server) chunkGone(tx *bbolt.Tx, loc erofs.SlabLoc, digest cdig.CDig) bool {
+	sb := tx.Bucket(slabBucket).Bucket(slabKey(loc.SlabId))
+	if sb == nil || bytes.Equal(sb.Get(addrKey(loc.Addr)), digest[:]) {
+		return false
+	}
+	return !s.inReservedSpace(loc)
+}
+
+// punchSlab punches n bytes at loc out of its slab's backing file.
+func (s *Server) punchSlab(loc erofs.SlabLoc, n int64) error {
+	// dup under the lock so a concurrent CLOSE can't close the fd, or reuse its number
+	s.stateLock.Lock()
+	fd := s.readfdBySlab[loc.SlabId].cacheFd
+	var err error
+	if fd > 0 {
+		fd, err = unix.Dup(fd)
+	}
+	s.stateLock.Unlock()
+	if err != nil {
+		return err
+	} else if fd <= 0 {
+		return errCachefdNotFound
+	}
+	defer unix.Close(fd)
+	return unix.Fallocate(fd, unix.FALLOC_FL_PUNCH_HOLE|unix.FALLOC_FL_KEEP_SIZE, int64(loc.Addr)<<s.blockShift, n)
 }
 
 // recordPresent marks loc present, unless it no longer holds digest: gc may have deleted
