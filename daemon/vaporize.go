@@ -136,6 +136,9 @@ func (s *Server) handleVaporizeReq(ctx context.Context, r *VaporizeReq) (*Status
 	mbcfg := manifester.ManifestBuilderConfig{}
 	memcs := memChunkStore{m: make(map[cdig.CDig][]byte), blkshift: s.blockShift}
 	mb, err := manifester.NewManifestBuilder(mbcfg, &memcs)
+	if err != nil {
+		return nil, err
+	}
 	args := manifester.BuildArgs{SmallFileCutoff: manifester.SmallManifestCutoff}
 	path := common.ManifestContext + "/" + storePath
 	entry, err := mb.ManifestAsEntry(ctx, &args, path, m)
