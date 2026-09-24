@@ -822,7 +822,7 @@ func (s *Server) tryMount(ctx context.Context, req *MountReq, haveImageSize int6
 		}
 	}
 
-	if mountErr == nil && mountCtx.imageData != nil {
+	if mountErr == nil && newImage {
 		s.syncImageFile(sphStr)
 	}
 	return mountErr
