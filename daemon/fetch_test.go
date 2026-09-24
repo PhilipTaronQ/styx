@@ -12,6 +12,7 @@ import (
 
 	"github.com/dnr/styx/common"
 	"github.com/dnr/styx/common/cdig"
+	"github.com/dnr/styx/manifester"
 	"github.com/dnr/styx/pb"
 )
 
@@ -265,4 +266,10 @@ func TestRequestForKnownChunkDoesNotWaitOnDiffOp(t *testing.T) {
 		require.True(t, e.s.locPresent(tx, locs[0]))
 		return nil
 	}))
+}
+
+// A kernel read's deadline is the outer bound on fetching its chunk (see common.RetryBudget):
+// it must leave a single chunk read all of its retrying.
+func TestSlabReadTimeoutCoversChunkReadRetries(t *testing.T) {
+	require.GreaterOrEqual(t, slabReadTimeout, common.RetryBudget+manifester.ReadAttemptTimeout)
 }

@@ -1617,7 +1617,13 @@ func (s *Server) openSlabBackingFile(slabId uint16) (int, error) {
 const (
 	slabBytes = 1 << 40
 
-	// how long a kernel read of a slab may wait for its chunk
+	// How long a kernel read of a slab may wait for its chunk: the outer bound in the
+	// layers described at common.RetryBudget. A single chunk read gives up by itself within
+	// common.RetryBudget + manifester.ReadAttemptTimeout (3 minutes), and this leaves room
+	// for more, so it never cuts that short. What it does bound is everything the read waits
+	// on that has no bound of its own short of this: chunk diffs (streamed, so no attempt
+	// timeout) and remanifests (a shared request that gets remanifestTimeout, but a read
+	// stops waiting on it here). A read that hits it fails with EIO.
 	slabReadTimeout = 5 * time.Minute
 )
 

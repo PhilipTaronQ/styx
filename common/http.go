@@ -13,20 +13,39 @@ import (
 	"github.com/avast/retry-go/v4"
 )
 
+// Timeouts for requests to the chunk store, chunk differ and manifester come in three
+// layers, each bounded separately:
+//
+//  1. An attempt. Requests for small, bounded bodies (chunks, manifest cache entries) give
+//     each attempt a timeout (manifester.ReadAttemptTimeout), so a server that stalls is
+//     retried. Streaming requests (chunk diffs, manifest builds, nar and tarball downloads)
+//     have none, since how long they take depends on the data; their caller bounds them.
+//  2. Retrying. RetryHttpRequest and RetryHttpRequestBody retry transient failures for
+//     RetryBudget and don't start an attempt after that, so a request with an attempt
+//     timeout of T returns within RetryBudget + T, however the server fails.
+//  3. The operation, set by the caller's ctx. The daemon's kernel reads have a deadline
+//     (daemon's slabReadTimeout) that is at least RetryBudget + ReadAttemptTimeout, so it
+//     never cuts a chunk read's retrying short; it's what bounds the chunk diffs and the
+//     remanifests those reads wait on.
 const (
+	// About two minutes of retrying rides out a restart or a short outage of the chunk
+	// store; a longer one fails reads rather than hanging them.
+	RetryBudget = 2 * time.Minute
+
 	// Retries back off from retryDelay to retryMaxDelay, so a request succeeds within about
-	// retryMaxDelay of the server coming back. retryAttempts at retryMaxDelay is about a
-	// minute of retrying.
+	// retryMaxDelay of the server coming back.
 	retryDelay    = time.Second
 	retryMaxDelay = 2 * time.Second
-	retryAttempts = 30
 )
+
+// retryBudget is RetryBudget, shortened by tests.
+var retryBudget = RetryBudget
 
 var ErrTooLarge = errors.New("response too large")
 
 // RetryHttpRequest makes an http request, retrying network errors and 502, 503 and 504
-// responses up to retryAttempts times, or until ctx is done. Other non-200 responses are
-// returned as an HttpError. The caller must close the response body.
+// responses for RetryBudget, or until ctx is done. Other non-200 responses are returned as
+// an HttpError. The caller must close the response body.
 func RetryHttpRequest(ctx context.Context, method, url, cType string, body []byte) (*http.Response, error) {
 	return retry.DoWithData(
 		func() (*http.Response, error) {
@@ -102,16 +121,20 @@ func doHttpRequest(ctx context.Context, method, url, cType string, body []byte) 
 }
 
 func retryOpts(ctx context.Context) []retry.Option {
+	deadline := time.Now().Add(retryBudget)
 	return []retry.Option{
 		retry.Context(ctx),
-		retry.Attempts(retryAttempts),
+		// the budget runs out first: attempts are at least retryDelay apart
+		retry.Attempts(uint(retryBudget/retryDelay) + 1),
 		retry.Delay(retryDelay),
 		retry.MaxDelay(retryMaxDelay),
 		// return the last error itself, as UntilSucceeded did, not a retry.Error
 		retry.LastErrorOnly(true),
 		retry.RetryIf(func(err error) bool {
 			// retry on err or some 50x codes
-			if !retry.IsRecoverable(err) {
+			if time.Now().After(deadline) {
+				return false
+			} else if !retry.IsRecoverable(err) {
 				return false
 			} else if status, ok := err.(HttpError); ok {
 				switch status.Code() {

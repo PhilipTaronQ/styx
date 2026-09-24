@@ -29,8 +29,9 @@ const (
 	// so the envelope holds only their digests and metadata. This is a generous limit.
 	MaxEnvelopeBytes = 16 << 20
 
-	// Each attempt at reading a chunk or manifest envelope gets this long.
-	readAttemptTimeout = time.Minute
+	// Each attempt at reading a chunk or manifest envelope gets this long, so a read that
+	// keeps stalling gives up within common.RetryBudget + ReadAttemptTimeout.
+	ReadAttemptTimeout = time.Minute
 )
 
 // RefreshAge is how old an existing object must be for PutIfNotExists to refresh its
@@ -242,7 +243,7 @@ func NewChunkStoreReadUrl(url, path string) ChunkStoreRead {
 }
 
 func (s *urlChunkStoreRead) Get(ctx context.Context, key string, dst []byte) ([]byte, error) {
-	b, hdr, err := common.RetryHttpRequestBody(ctx, http.MethodGet, s.url+key, "", nil, s.maxBody, readAttemptTimeout)
+	b, hdr, err := common.RetryHttpRequestBody(ctx, http.MethodGet, s.url+key, "", nil, s.maxBody, ReadAttemptTimeout)
 	if err != nil {
 		return nil, err
 	}

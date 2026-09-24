@@ -105,3 +105,52 @@ func TestRetryHttpRequestBodyLimit(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, b, 1000)
 }
+
+// Retrying stops once the budget is spent, whatever the attempt count: a server that
+// always fails fast gets many attempts, but the request still returns in about the budget.
+func TestRetryHttpRequestGivesUpAfterBudget(t *testing.T) {
+	defer func(b time.Duration) { retryBudget = b }(retryBudget)
+	retryBudget = 3 * time.Second
+
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	start := time.Now()
+	_, err := RetryHttpRequest(context.Background(), http.MethodGet, srv.URL, "", nil)
+	el := time.Since(start)
+	require.Error(t, err)
+	herr, ok := err.(HttpError)
+	require.True(t, ok, "got %T %v", err, err)
+	require.Equal(t, http.StatusServiceUnavailable, herr.Code())
+	require.GreaterOrEqual(t, el, retryBudget)
+	require.Less(t, el, retryBudget+retryMaxDelay+time.Second)
+	require.Greater(t, calls.Load(), int32(1))
+}
+
+// With an attempt timeout, a server that keeps stalling fails the request within the
+// budget plus one attempt.
+func TestRetryHttpRequestBodyStalledServerIsBounded(t *testing.T) {
+	defer func(b time.Duration) { retryBudget = b }(retryBudget)
+	retryBudget = 2 * time.Second
+	const attempt = 500 * time.Millisecond
+
+	done := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-done:
+		}
+	}))
+	defer srv.Close()
+	defer close(done) // before srv.Close, which waits for handlers
+
+	start := time.Now()
+	_, _, err := RetryHttpRequestBody(context.Background(), http.MethodGet, srv.URL, "", nil, 100, attempt)
+	el := time.Since(start)
+	require.ErrorContains(t, err, "attempt timed out")
+	require.Less(t, el, retryBudget+attempt+retryMaxDelay+time.Second)
+}

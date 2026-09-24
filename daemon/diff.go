@@ -37,7 +37,10 @@ import (
 const (
 	recentReadExpiry      = 30 * time.Second
 	remanifestCacheExpiry = time.Minute
-	remanifestTimeout     = 15 * time.Minute
+	// A remanifest builds a whole manifest, which takes minutes for a big store path. The
+	// shared request gets this long; each caller also stops waiting at its own deadline (a
+	// kernel read at slabReadTimeout), and the request is cancelled once no one waits.
+	remanifestTimeout = 15 * time.Minute
 
 	// only public so they can be referenced by tests
 	InitOpSize = 8
