@@ -638,17 +638,21 @@ func (s *Server) tryMount(ctx context.Context, req *MountReq, haveImageSize int6
 
 	if haveImageSize > 0 {
 		// if we have an image we can proceed right to mounting
+		mountCtx.lock.Lock()
 		mountCtx.imageSize = haveImageSize
 		mountCtx.isBare = haveIsBare
+		mountCtx.lock.Unlock()
 	} else {
 		// if no image yet, get the manifest and build it
 		_, image, err := s.getManifestAndBuildImage(ctx, req)
 		if err != nil {
 			return err
 		}
+		mountCtx.lock.Lock()
 		mountCtx.imageSize = int64(len(image))
 		mountCtx.isBare = erofs.IsBare(image)
 		mountCtx.imageData = image
+		mountCtx.lock.Unlock()
 	}
 
 	var mountErr error
@@ -1082,15 +1086,19 @@ func (s *Server) handleOpenImage(msgId, objectId, fd, flags uint32, cookie strin
 		return 0, fmt.Errorf("missing context in handleOpenImage for %s", cookie)
 	}
 
+	mountCtx.lock.Lock()
+	imageData, imageSize := mountCtx.imageData, mountCtx.imageSize
+	mountCtx.lock.Unlock()
+
 	s.stateLock.Lock()
 	defer s.stateLock.Unlock()
 	state := &openFileState{
 		writeFd:   fd,
 		tp:        typeImage,
-		imageData: mountCtx.imageData,
+		imageData: imageData,
 	}
 	s.cacheState[objectId] = state
-	return mountCtx.imageSize, nil
+	return imageSize, nil
 }
 
 func (s *Server) handleClose(msgId, objectId uint32) error {
