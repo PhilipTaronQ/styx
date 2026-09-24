@@ -110,8 +110,9 @@ func (s *Server) handleMaterializeReq(ctx context.Context, r *MaterializeReq) (*
 		}
 	}
 
-	// copy to dest
-	err = s.materialize(r.DestPath, m)
+	// copy to dest. stop if the client gives up: it may fall back to writing
+	// the same destination itself.
+	err = s.materialize(ctx, r.DestPath, m)
 	if err != nil {
 		return nil, err
 	}
@@ -128,7 +129,7 @@ func (s *Server) handleMaterializeReq(ctx context.Context, r *MaterializeReq) (*
 	return nil, nil
 }
 
-func (s *Server) materialize(dest string, m *pb.Manifest) error {
+func (s *Server) materialize(ctx context.Context, dest string, m *pb.Manifest) error {
 	ents := m.Entries
 	locs := make(map[cdig.CDig]erofs.SlabLoc)
 	err := s.db.View(func(tx *bbolt.Tx) error {
@@ -182,6 +183,9 @@ func (s *Server) materialize(dest string, m *pb.Manifest) error {
 		}
 
 		eg.Go(func() error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			switch ent.Type {
 			case pb.EntryType_DIRECTORY:
 				return nil // done above
