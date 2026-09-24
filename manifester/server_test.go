@@ -206,6 +206,39 @@ func TestUpstreamRedirectToDisallowedHost(t *testing.T) {
 	assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 }
 
+// ChunkDiffParallel = 0 made errgroup Go block forever, and nil PublicKeys failed every nar
+// build (after fetching the narinfo) although the comment said it disabled verification.
+func TestConfigZeroValues(t *testing.T) {
+	cs := &mockChunkStore{data: make(map[string][]byte)}
+	mb, err := NewManifestBuilder(ManifestBuilderConfig{}, cs)
+	require.NoError(t, err)
+	srv, err := NewManifestServer(Config{}, mb)
+	require.NoError(t, err)
+
+	reqs := putChunks(t, cs, []byte("chunk"))
+	done := make(chan int, 1)
+	go func() {
+		done <- doChunkDiff(t, context.Background(), srv, &pb.ManifesterChunkDiffReq_Req{Reqs: reqs}).Code
+	}()
+	select {
+	case code := <-done:
+		assert.Equal(t, http.StatusOK, code)
+	case <-time.After(10 * time.Second):
+		t.Fatal("chunk diff with a zero-value config hung")
+	}
+
+	_, err = NewManifestServer(Config{ChunkDiffParallel: -1}, mb)
+	assert.Error(t, err)
+
+	// without keys, nar builds fail clearly before fetching anything
+	sk, _ := upstreamKeys(t)
+	up := newFakeUpstream(t)
+	sph := up.addPath(t, sk, "nokeys", []narFile{{"/f", 10}}, narinfoOpts{})
+	_, err = mb.BuildFromNar(context.Background(), up.url(), sph, 0, 0, "", false)
+	assert.ErrorContains(t, err, "no public keys")
+	assert.Zero(t, up.requestCount())
+}
+
 // An unauthenticated caller can send only shard 0 of N. Shard 0 used to write the manifest to
 // the shared cache after uploading only its own 1/N of the chunks. Clients then got the
 // cached manifest and 404 on the rest (and remanifesting hit the same cache entry). The same

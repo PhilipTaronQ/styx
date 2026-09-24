@@ -95,7 +95,8 @@ type (
 		ConcurrentChunkOps int
 		ChunkSizer         func(int64) shift.Shift
 
-		// Verify loaded narinfo against these keys. Nil means don't verify.
+		// Verify loaded narinfo against these keys. Required to build from nars (there's no
+		// way to turn verification off); tarball builds don't use them.
 		PublicKeys []signature.PublicKey
 		// Sign manifests with these keys.
 		SigningKeys []signature.SecretKey
@@ -184,7 +185,9 @@ func (b *ManifestBuilder) BuildFromNar(
 ) (*ManifestBuildRes, error) {
 	// get narinfo
 
-	if len(storePathHash) != nixbase32.EncodedLen(storepath.PathHashSize) || nixbase32.ValidateString(storePathHash) != nil {
+	if len(b.pubKeys) == 0 {
+		return nil, fmt.Errorf("%w: no public keys configured to verify narinfo", ErrInternal)
+	} else if len(storePathHash) != nixbase32.EncodedLen(storepath.PathHashSize) || nixbase32.ValidateString(storePathHash) != nil {
 		return nil, fmt.Errorf("%w: invalid store path hash %q", ErrReq, storePathHash)
 	}
 	upstreamUrl, err := url.Parse(upstream)

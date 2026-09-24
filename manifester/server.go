@@ -38,6 +38,8 @@ const (
 
 	SmallManifestCutoff = 32 * 1024
 
+	defaultChunkDiffParallel = 60
+
 	// max size of json-encoded stats. if we add more stats, may need to increase this
 	statsSpace = 256
 )
@@ -60,6 +62,12 @@ type (
 )
 
 func NewManifestServer(cfg Config, mb *ManifestBuilder) (*server, error) {
+	if cfg.ChunkDiffParallel < 0 {
+		return nil, fmt.Errorf("ChunkDiffParallel must be positive, not %d", cfg.ChunkDiffParallel)
+	} else if cfg.ChunkDiffParallel == 0 {
+		// a limit of 0 would make every chunk fetch block forever
+		cfg.ChunkDiffParallel = defaultChunkDiffParallel
+	}
 	return &server{
 		cfg: &cfg,
 		mb:  mb,
