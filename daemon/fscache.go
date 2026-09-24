@@ -1,8 +1,8 @@
 package daemon
 
 import (
+	"fmt"
 	"math/bits"
-	"strconv"
 
 	"github.com/dnr/styx/common"
 )
@@ -142,5 +142,5 @@ func fscachePath(domainid, fsid string) string {
 		hash = _fscache_hash(seed, padded)
 	}
 
-	return "cache/I" + volume + "/@" + strconv.FormatUint(uint64(hash&0xff), 16) + "/D" + fsid
+	return "cache/I" + volume + "/@" + fmt.Sprintf("%02x", hash&0xff) + "/D" + fsid
 }

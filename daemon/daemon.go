@@ -1267,7 +1267,7 @@ func (s *Server) handleReadSlab(state *openFileState, ln, off uint64) (retErr er
 	}
 
 	ctx := context.Background()
-	return s.requestChunk(ctx, erofs.SlabLoc{slabId, addr}, digest, sphps)
+	return s.requestChunk(ctx, erofs.SlabLoc{SlabId: slabId, Addr: addr}, digest, sphps)
 }
 
 func (s *Server) mountSlabImage(slabId uint16) error {
@@ -1395,7 +1395,7 @@ func locValue(id uint16, addr uint32, sph Sph) []byte {
 }
 
 func loadLoc(b []byte) erofs.SlabLoc {
-	return erofs.SlabLoc{binary.LittleEndian.Uint16(b), binary.LittleEndian.Uint32(b[2:])}
+	return erofs.SlabLoc{SlabId: binary.LittleEndian.Uint16(b), Addr: binary.LittleEndian.Uint32(b[2:])}
 }
 
 func appendSph(loc []byte, sph Sph) []byte {
@@ -1462,7 +1462,7 @@ func (s *Server) AllocateBatch(ctx context.Context, blocks []uint16, digests []c
 				} else if err = sb.Put(addrKey(addr), digest); err != nil {
 					return err
 				}
-				out[i] = erofs.SlabLoc{slabId, addr}
+				out[i] = erofs.SlabLoc{SlabId: slabId, Addr: addr}
 			} else {
 				if newLoc := appendSph(loc, sph); newLoc != nil {
 					if err := cb.Put(digest, newLoc); err != nil {

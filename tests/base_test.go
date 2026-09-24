@@ -197,23 +197,21 @@ func (tb *testBase) startDaemon() {
 func (tb *testBase) initDaemon() {
 	pk, err := os.ReadFile("../keys/testsuite.public")
 	require.NoError(tb.t, err)
-	params := pb.DaemonParams{
-		Params: &pb.GlobalParams{
-			DigestAlgo: cdig.Algo,
-			DigestBits: cdig.Bits,
-		},
-		ManifesterUrl:    tb.manifesterAddr,
-		ManifestCacheUrl: tb.manifesterAddr,
-		ChunkReadUrl:     tb.manifesterAddr,
-		ChunkDiffUrl:     tb.manifesterAddr,
-	}
-
 	sock := filepath.Join(tb.cachedir, "styx.sock")
 	c := client.NewClient(sock)
 	var res daemon.Status
 	code, err := c.Call(daemon.InitPath, &daemon.InitReq{
 		PubKeys: []string{string(pk)},
-		Params:  params,
+		Params: pb.DaemonParams{
+			Params: &pb.GlobalParams{
+				DigestAlgo: cdig.Algo,
+				DigestBits: cdig.Bits,
+			},
+			ManifesterUrl:    tb.manifesterAddr,
+			ManifestCacheUrl: tb.manifesterAddr,
+			ChunkReadUrl:     tb.manifesterAddr,
+			ChunkDiffUrl:     tb.manifesterAddr,
+		},
 	}, &res)
 	require.NoError(tb.t, err)
 	require.Equal(tb.t, code, http.StatusOK)
