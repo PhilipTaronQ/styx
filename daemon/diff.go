@@ -796,6 +796,29 @@ func (s *Server) getManifestLocal(tx *bbolt.Tx, sphStr string) (*pb.Manifest, []
 	return &m, mdigs, nil
 }
 
+// errMissingChunk means a chunk's data isn't in its slab: it isn't recorded present, or it is
+// but the data is gone or doesn't match its digest.
+var errMissingChunk = errors.New("missing chunk")
+
+// refetchChunk fetches a chunk again that is recorded present but whose data we found missing.
+// Call it outside any transaction.
+func (s *Server) refetchChunk(ctx context.Context, loc erofs.SlabLoc, digest cdig.CDig) error {
+	if err := s.db.Update(func(tx *bbolt.Tx) error { return s.dropPresent(tx, loc) }); err != nil {
+		return err
+	}
+	return s.requestChunk(ctx, loc, digest, nil)
+}
+
+// dropPresent forgets that loc is present.
+func (s *Server) dropPresent(tx *bbolt.Tx, loc erofs.SlabLoc) error {
+	s.presentMap.Delete(loc)
+	sb := tx.Bucket(slabBucket).Bucket(slabKey(loc.SlabId))
+	if sb == nil {
+		return errors.New("missing slab bucket")
+	}
+	return sb.Delete(addrKey(loc.Addr | presentMask))
+}
+
 func (s *Server) getKnownChunk(loc erofs.SlabLoc, buf []byte) error {
 	readFd, err := s.getReadFdForSlab(loc.SlabId)
 	if err != nil {

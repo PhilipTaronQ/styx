@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -23,6 +24,7 @@ import (
 
 	"github.com/dnr/styx/common/cdig"
 	"github.com/dnr/styx/erofs"
+	"github.com/dnr/styx/manifester"
 	"github.com/dnr/styx/pb"
 )
 
@@ -471,4 +473,137 @@ func TestGcDuringVaporizeKeepsItsSpace(t *testing.T) {
 	}))
 	require.Equal(t, []locWithEnd{{SlabLoc: erofs.SlabLoc{SlabId: 0, Addr: 4}, end: 20}}, punches,
 		"gc must punch the garbage chunk only, not the space reserved after it")
+}
+
+// Sets up slab 0 as a plain file, as the daemon does without cachefiles, and returns its fd.
+func gcTestFakeSlab(t *testing.T, s *Server) int {
+	t.Helper()
+	require.NoError(t, s.setupFakeSlabImage(0))
+	fd := s.readfdBySlab[0].readFd
+	t.Cleanup(func() { unix.Close(fd) })
+	return fd
+}
+
+// 64 KiB of data, the size of one chunk of the files gcTestImage records.
+func gcTestChunkData(seed byte) []byte {
+	b := make([]byte, 1<<16)
+	for i := range b {
+		b[i] = byte(i*7) ^ seed
+	}
+	return b
+}
+
+// Serves chunks from m by digest at the chunk read path, 404 for anything else, and records
+// which chunks it served.
+func gcTestChunkServer(t *testing.T, m map[cdig.CDig][]byte) (url string, served func() []cdig.CDig) {
+	t.Helper()
+	var mu sync.Mutex
+	var got []cdig.CDig
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if key, ok := strings.CutPrefix(r.URL.Path, manifester.ChunkReadPath); ok {
+			if d, err := cdig.FromBase64(key); err == nil && m[d] != nil {
+				mu.Lock()
+				got = append(got, d)
+				mu.Unlock()
+				w.Write(m[d])
+				return
+			}
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL, func() []cdig.CDig {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Clone(got)
+	}
+}
+
+// Whether the db records loc present (ignoring presentMap).
+func gcTestPresentInDb(s *Server, loc erofs.SlabLoc) bool {
+	var present bool
+	_ = s.db.View(func(tx *bbolt.Tx) error {
+		sb := tx.Bucket(slabBucket).Bucket(slabKey(loc.SlabId))
+		present = sb != nil && sb.Get(addrKey(loc.Addr|presentMask)) != nil
+		return nil
+	})
+	return present
+}
+
+// Writes a chunk as a fetch does, and waits for its present record.
+func gcTestWriteChunk(t *testing.T, s *Server, loc erofs.SlabLoc, data []byte) {
+	t.Helper()
+	require.NoError(t, s.gotNewChunk(loc, cdig.Sum(data), slices.Clone(data)))
+	require.Eventually(t, func() bool { return gcTestPresentInDb(s, loc) }, 10*time.Second, 5*time.Millisecond)
+}
+
+// Punches a hole as gc does. Safe to call from any goroutine.
+func gcTestPunch(t *testing.T, fd int, off, n int64) {
+	if err := unix.Fallocate(fd, unix.FALLOC_FL_PUNCH_HOLE|unix.FALLOC_FL_KEEP_SIZE, off, n); err != nil {
+		t.Errorf("punch %d+%d: %v", off, n, err)
+	}
+}
+
+// materialize copies chunks straight from the slab's backing file, where a hole reads as
+// zeros. A chunk whose data went missing after materialize looked it up (punched by gc, or
+// lost in a crash) was copied as zeros, and the request succeeded.
+func TestMaterializeChunkMissingAtCopy(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		clone, fetchable bool
+	}{
+		{"clone", true, true},
+		{"clone-unfetchable", true, false},
+		{"plain", false, true},
+		{"plain-unfetchable", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			data := [][]byte{gcTestChunkData(1), gcTestChunkData(2), gcTestChunkData(3)}
+			digs := make([]cdig.CDig, len(data))
+			serve := make(map[cdig.CDig][]byte)
+			for i, b := range data {
+				digs[i] = cdig.Sum(b)
+				if tc.fetchable {
+					serve[digs[i]] = b
+				}
+			}
+			url, served := gcTestChunkServer(t, serve)
+			s := newGcTestServer(t)
+			initGcTestServer(t, s, url)
+			fd := gcTestFakeSlab(t, s)
+			if !tc.clone {
+				s.readfdBySlab[0] = slabFds{readFd: fd} // no backing fd to clone from
+			}
+			sp := gcTestStorePath('m', "pkg-1.0")
+			locs := gcTestImage(t, s, 'm', "pkg-1.0", pb.MountState_Unmounted, digs...)
+			for i, loc := range locs {
+				gcTestWriteChunk(t, s, loc, data[i])
+			}
+
+			victim := locs[1]
+			var once sync.Once
+			testHookMaterializeChunk = func(loc erofs.SlabLoc) {
+				if loc == victim {
+					once.Do(func() { gcTestPunch(t, fd, int64(loc.Addr)<<s.blockShift, int64(len(data[1]))) })
+				}
+			}
+			t.Cleanup(func() { testHookMaterializeChunk = nil })
+
+			dest := filepath.Join(t.TempDir(), "out")
+			_, err := s.handleMaterializeReq(context.Background(), &MaterializeReq{
+				Upstream:  url,
+				StorePath: sp,
+				DestPath:  dest,
+			})
+			if !tc.fetchable {
+				require.Error(t, err, "materialize succeeded although a chunk's data was gone and couldn't be fetched")
+				return
+			}
+			require.NoError(t, err)
+			got, err := os.ReadFile(dest)
+			require.NoError(t, err)
+			require.True(t, bytes.Equal(bytes.Join(data, nil), got), "materialized file doesn't match its chunks")
+			require.Contains(t, served(), digs[1], "the missing chunk wasn't fetched again")
+		})
+	}
 }
