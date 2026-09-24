@@ -72,10 +72,7 @@ with lib;
       system.nixos.tags = [ "styx" ];
 
       # expose cli
-      environment.systemPackages = [
-        cfg.package
-        styx.StyxInitTest1
-      ];
+      environment.systemPackages = [ cfg.package ];
 
       # main service
       systemd.services.styx = {

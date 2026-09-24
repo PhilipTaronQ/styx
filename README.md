@@ -518,12 +518,14 @@ testlocal
 
 #### Start a VM with Styx running and available
 
-*This will use services in my AWS account. I may turn it off or break it at any time.*
+The VM needs a manifester and chunk store to talk to: run your own (see
+"Initializing the daemon" below) and initialize the daemon in the VM with your
+params and key.
 
 ```sh
 runvm
 # log in with test/test
-# then run "sudo StyxInitTest1" to set up parameters
+# then run "sudo styx init --params=<your params url> --styx_pubkey=<name>:<key>"
 ```
 
 The VM will be set up with the pinned nixpkgs shared on `/tmp/nixpkgs` and set on
@@ -552,14 +554,28 @@ with `nix-shell -p ...` and see what happens.
    nix.settings.styx-materialize = [ ".*" ];
 ```
 
-After the daemon is running, you have to initialize it by running:
+#### Initializing the daemon
+
+After the daemon is running, you have to initialize it with the parameters of
+the manifester and chunk store it should use. There's no public one: run your
+own manifester and chunk store, and sign their parameters with your own key:
 
 ```sh
-StyxInitTest1
-
-# or manually, run a command line:
-styx init --params=https://styx-1.s3.amazonaws.com/params/test-1 --styx_pubkey=styx-test-1:bmMrKgN5yF3dGgOI67TZSfLts5IQHwdrOCZ7XHcaN+w=
+nix key generate-secret --key-name <name> > <name>.secret
+nix key convert-secret-to-public < <name>.secret   # prints <name>:<key>
+# write params.json for your manifester and chunk store (see params/dev-1.json)
+styx internal signdaemonparams --styx_signkey=<name>.secret params.json params.signed
 ```
+
+Run the manifester with the same key (`--styx_signkey`), publish `params.signed`
+somewhere the daemon can fetch it, and then run:
+
+```sh
+styx init --params=<your params url> --styx_pubkey=<name>:<key>
+```
+
+where `<name>:<key>` is the public half of the key that signed the params (and
+that the manifester signs manifests with).
 
 
 ## Roadmap and future work
