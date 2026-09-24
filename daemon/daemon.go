@@ -451,7 +451,7 @@ func (s *Server) startSocketServer() error {
 
 	if s.cfg.PublicSock != "" {
 		mux := http.NewServeMux()
-		mux.HandleFunc(TarballPath, jsonmw(s.handleTarballReq))
+		mux.HandleFunc(TarballPath, jsonmw(s.handlePublicTarballReq))
 		mux.HandleFunc(DebugPath, jsonmw(s.handleDebugReq))
 		err := s.runSocketServer(s.cfg.PublicSock, mux, 0o777)
 		if err != nil {
@@ -884,6 +884,8 @@ func (s *Server) Start() error {
 	if err := s.startFakeCacheServer(); err != nil {
 		return err
 	}
+	s.shutdownWait.Add(1)
+	go s.pruneFakeCacheLoop()
 	go s.pruneRecentCaches()
 	if s.ondemand() {
 		go s.cachefilesServer()
