@@ -12,6 +12,11 @@ import (
 )
 
 func RetryHttpRequest(ctx context.Context, method, url, cType string, body []byte) (*http.Response, error) {
+	return RetryHttpRequestWithClient(ctx, http.DefaultClient, method, url, cType, body)
+}
+
+// RetryHttpRequestWithClient is RetryHttpRequest using client.
+func RetryHttpRequestWithClient(ctx context.Context, client *http.Client, method, url, cType string, body []byte) (*http.Response, error) {
 	return retry.DoWithData(
 		func() (*http.Response, error) {
 			var bReader io.Reader
@@ -25,7 +30,7 @@ func RetryHttpRequest(ctx context.Context, method, url, cType string, body []byt
 			if cType != "" {
 				req.Header.Set("Content-Type", cType)
 			}
-			res, err := http.DefaultClient.Do(req)
+			res, err := client.Do(req)
 			if err == nil && res.StatusCode != http.StatusOK {
 				err = HttpErrorFromRes(res)
 				res.Body.Close()

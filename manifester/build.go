@@ -66,6 +66,9 @@ type (
 		pubKeys    []signature.PublicKey
 		signKeys   []signature.SecretKey
 		chunkSizer func(int64) shift.Shift
+		// for narinfo, nar and tarball fetches. a manifester server replaces it with one that
+		// follows redirects only to its allowed upstreams.
+		upstreamClient *http.Client
 
 		stats atomicStats
 	}
@@ -127,10 +130,11 @@ func NewManifestBuilder(cfg ManifestBuilderConfig, cs ChunkStoreWrite) (*Manifes
 			DigestAlgo: cdig.Algo,
 			DigestBits: int32(cdig.Bits),
 		},
-		chunkPool:  common.NewChunkPool(),
-		pubKeys:    cfg.PublicKeys,
-		signKeys:   cfg.SigningKeys,
-		chunkSizer: chunkSizer,
+		chunkPool:      common.NewChunkPool(),
+		pubKeys:        cfg.PublicKeys,
+		signKeys:       cfg.SigningKeys,
+		chunkSizer:     chunkSizer,
+		upstreamClient: http.DefaultClient,
 	}, nil
 }
 
@@ -193,7 +197,7 @@ func (b *ManifestBuilder) BuildFromNar(
 		return nil, err
 	}
 	narinfoUrl := upstreamUrl.JoinPath(storePathHash + ".narinfo").String()
-	res, err := common.RetryHttpRequest(ctx, http.MethodGet, narinfoUrl, "", nil)
+	res, err := common.RetryHttpRequestWithClient(ctx, b.upstreamClient, http.MethodGet, narinfoUrl, "", nil)
 	if err != nil {
 		// RetryHttpRequest returns non-200 responses as errors
 		if common.IsNotFound(err) {
@@ -258,7 +262,7 @@ func (b *ManifestBuilder) BuildFromNar(
 	} else {
 		// start := time.Now()
 		narUrl := upstreamUrl.JoinPath(ni.URL).String()
-		res, err = common.RetryHttpRequest(ctx, http.MethodGet, narUrl, "", nil)
+		res, err = common.RetryHttpRequestWithClient(ctx, b.upstreamClient, http.MethodGet, narUrl, "", nil)
 		if err != nil {
 			return nil, fmt.Errorf("%w: nar http error for %s: %w", ErrReq, narUrl, err)
 		}

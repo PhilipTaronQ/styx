@@ -68,6 +68,9 @@ func NewManifestServer(cfg Config, mb *ManifestBuilder) (*server, error) {
 		// a limit of 0 would make every chunk fetch block forever
 		cfg.ChunkDiffParallel = defaultChunkDiffParallel
 	}
+	// the server takes requests from anyone, so its builds may follow upstream redirects only
+	// to allowed hosts
+	mb.upstreamClient = newUpstreamClient(cfg.AllowedUpstreams)
 	return &server{
 		cfg: &cfg,
 		mb:  mb,
@@ -113,7 +116,7 @@ func (s *server) handleManifest(w http.ResponseWriter, req *http.Request) {
 
 	log.Println("req", r.StorePathHash, "from", r.Upstream)
 
-	ctx := withAllowedHosts(req.Context(), s.cfg.AllowedUpstreams)
+	ctx := req.Context()
 	mres, err := s.mb.Build(ctx, r.BuildMode, r.Upstream, r.StorePathHash, r.ShardTotal, r.ShardIndex, "", true)
 
 	if err != nil {

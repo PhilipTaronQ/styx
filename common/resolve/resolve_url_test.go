@@ -2,6 +2,7 @@ package resolve
 
 import (
 	"context"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -31,7 +32,7 @@ func TestSpNameFromSignedRedirectUrl(t *testing.T) {
 func TestResolveUrlKeepsHandlerError(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // make resolveGitRef fail without touching the network
-	_, err := ResolveUrl(ctx, "https://github.com/NixOS/nixpkgs/archive/nixos-unstable.tar.gz")
+	_, err := ResolveUrl(ctx, http.DefaultClient, "https://github.com/NixOS/nixpkgs/archive/nixos-unstable.tar.gz")
 	require.Error(t, err)
 	assert.True(t, strings.Contains(err.Error(), "context canceled"),
 		"handler error was replaced: %v", err)

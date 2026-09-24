@@ -138,7 +138,9 @@ func resolveWithHander(ctx context.Context, h handler, input string, mustBeCommi
 	}, nil
 }
 
-func ResolveUrl(ctx context.Context, input string) (Result, error) {
+// ResolveUrl resolves input to a url that hopefully won't change. For urls that don't match a
+// forge pattern, that means following redirects, with client.
+func ResolveUrl(ctx context.Context, client *http.Client, input string) (Result, error) {
 	log.Println("resolving url", input)
 
 	// try forges
@@ -165,7 +167,7 @@ func ResolveUrl(ctx context.Context, input string) (Result, error) {
 	// follow http redirects (for nix channels, releases, etc.)
 	// TODO: actually do lockable tarball protocol here
 	log.Println("doing head request on", input)
-	res, err := common.RetryHttpRequest(ctx, http.MethodHead, input, "", nil)
+	res, err := common.RetryHttpRequestWithClient(ctx, client, http.MethodHead, input, "", nil)
 	if err != nil {
 		return Result{}, err
 	}

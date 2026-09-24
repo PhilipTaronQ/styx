@@ -51,7 +51,7 @@ func (b *ManifestBuilder) BuildFromTarball(
 	log.Println("manifest tarball", upstream)
 
 	// resolve the url to a hopefully-immutable url and get an etag for constructing a cache key
-	rr, err := resolve.ResolveUrl(ctx, upstream)
+	rr, err := resolve.ResolveUrl(ctx, b.upstreamClient, upstream)
 	if err != nil {
 		return nil, err
 	}
@@ -79,7 +79,7 @@ func (b *ManifestBuilder) BuildFromTarball(
 		var tarOut io.Reader
 		var decompress *exec.Cmd
 
-		res, err := common.RetryHttpRequest(ctx, http.MethodGet, rr.Url, "", nil)
+		res, err := common.RetryHttpRequestWithClient(ctx, b.upstreamClient, http.MethodGet, rr.Url, "", nil)
 		if err != nil {
 			return nil, fmt.Errorf("%w: tar http error for %s: %w", ErrReq, upstream, err)
 		}
