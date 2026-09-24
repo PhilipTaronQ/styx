@@ -16,8 +16,7 @@ func TestRestart(t *testing.T) {
 	mp1 := tb.mount("qa22bifihaxyvn6q2a6w9m0nklqrk9wh-opusfile-0.12")
 
 	// stop it. cachefiles fd will be saved in test fdstore
-	tb.daemon.Stop(false)
-	tb.daemon = nil
+	tb.stopDaemon(false)
 
 	// start again
 	tb.startDaemon()
@@ -42,8 +41,7 @@ func TestReboot(t *testing.T) {
 	require.Equal(t, "13jlq14n974nn919530hnx4l46d0p2zyhx4lrd9b1k122dn7w9z5", tb.nixHash(mp2))
 
 	// stop and close devnode
-	tb.daemon.Stop(true)
-	tb.daemon = nil
+	tb.stopDaemon(true)
 
 	// unmount filesystems directly to simulate clean state after reboot
 	// note that Stop unmounts the slab image

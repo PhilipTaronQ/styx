@@ -9,8 +9,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime/pprof"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/phayes/freeport"
 	"github.com/stretchr/testify/require"
@@ -32,6 +34,10 @@ const (
 	devnode = "/dev/cachefiles"
 
 	blockShift = 12
+
+	// Stop returns within one cachefiles poll (500ms in testing mode) once
+	// the workers are idle.
+	stopTimeout = 2 * time.Minute
 )
 
 type (
@@ -104,6 +110,12 @@ func newTestBase(t *testing.T) *testBase {
 }
 
 func (tb *testBase) cleanup() {
+	// Stop the daemon before the manifester: a fetch still in flight retries
+	// forever against a stopped manifester, and Stop waits for it.
+	if tb.daemon != nil {
+		tb.t.Log("stopping daemon")
+		tb.stopDaemon(true)
+	}
 	if tb.manifester != nil {
 		tb.t.Log("stopping manifester")
 		tb.manifester.Stop()
@@ -112,10 +124,28 @@ func (tb *testBase) cleanup() {
 		tb.t.Log("stopping test data server")
 		tb.tdserver.Close()
 	}
-	if tb.daemon != nil {
-		tb.t.Log("stopping daemon")
-		tb.daemon.Stop(true)
+}
+
+// stopDaemon stops tb.daemon and clears it. If Stop doesn't return within
+// stopTimeout it dumps every goroutine and panics: a wedged Stop would
+// otherwise hold the test until the suite timeout, and every later test would
+// fail anyway because this process still has the devnode open.
+func (tb *testBase) stopDaemon(closeDevnode bool) {
+	d := tb.daemon
+	tb.daemon = nil
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		d.Stop(closeDevnode)
+	}()
+	select {
+	case <-done:
+		return
+	case <-time.After(stopTimeout):
 	}
+	tb.t.Errorf("daemon Stop did not return within %v; dumping goroutines", stopTimeout)
+	_ = pprof.Lookup("goroutine").WriteTo(os.Stderr, 2)
+	panic(fmt.Sprintf("%s: daemon Stop hung", tb.t.Name()))
 }
 
 func (tb *testBase) startTestDataServer() {
