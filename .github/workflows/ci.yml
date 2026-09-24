@@ -163,6 +163,10 @@ jobs:
           for s in styx-substituters styx-min-size styx-ondemand styx-materialize styx-exclude styx-sock-path; do
             printf '%s = ' "$s"; ./patched-nix/bin/nix --extra-experimental-features nix-command config show "$s"
           done
+      - name: styx patch behaviour
+        run: |
+          nix-build -o erofs-utils -E 'with import (import ./Pins.nix).nixpkgs {}; erofs-utils'
+          bash .github/nix-patch-contract.sh ./patched-nix/bin ./erofs-utils/bin/mkfs.erofs
 
   # The full privileged test suite on the host kernel, plain and instrumented.
   # Don't make the race detector halt on error here: the daemon runs in the
