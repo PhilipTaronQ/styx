@@ -367,6 +367,21 @@ func TestGCListConcurrentUnexpectedFiles(t *testing.T) {
 	t.Log(sb.String())
 }
 
+// A chunk key that is valid base64 but shorter than a digest used to panic in
+// cdig.FromBytes, crashing the heavy worker on every GC.
+func TestGCShortChunkKey(t *testing.T) {
+	f := newFakeS3()
+	g, _ := newTestGC(t, f)
+	short := manifester.ChunkReadPath[1:] + "AAAA" // 3 bytes
+	long := manifester.ChunkReadPath[1:] + testDigest(1).String() + "AAAA"
+	f.putOld(short, []byte("x"))
+	f.putOld(long, []byte("x"))
+
+	require.NoError(t, g.run(context.Background()))
+	require.False(t, f.has(short))
+	require.False(t, f.has(long))
+}
+
 // Sanity check of the fake: pagination and a normal collection.
 func TestGCFakeBasics(t *testing.T) {
 	f := newFakeS3()

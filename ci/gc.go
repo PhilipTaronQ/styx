@@ -404,7 +404,7 @@ func (gc *gc) list(ctx context.Context) error {
 				gc.totalCount.Add(1)
 				gc.totalSize.Add(aws.ToInt64(o.Size))
 				b, err := base64.RawURLEncoding.DecodeString(path.Base(key))
-				if err != nil {
+				if err != nil || len(b) != cdig.Bytes {
 					gc.logln("unexpected file in chunk store", key)
 					gc.del(key, aws.ToInt64(o.Size))
 				} else if _, ok := gc.goodChunk.Load(cdig.FromBytes(b)); !ok {
