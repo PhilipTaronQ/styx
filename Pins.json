@@ -6,11 +6,11 @@
   "pins": [
     {
       "name": "nixpkgs",
-      "storePathName": "nixexprs-nixos-25.11.2222",
-      "storePathHash": "49wyl3d655mhj6yb13dam5zjqmq3j7ib",
-      "outputHash": "sha256:bfd9db41ed01830071f8a73145fea2da46d2f04c0a8c11518c06b003dd41fce1",
-      "originalUrl": "https://channels.nixos.org/nixos-25.11/nixexprs.tar.xz",
-      "resolvedUrl": "https://releases.nixos.org/nixos/25.11/nixos-25.11.2222.b3aad468604d/nixexprs.tar.xz"
+      "storePathName": "nixexprs-nixos-26.05.10478",
+      "storePathHash": "37v26iw2gp3vhab27gg7qhr04phl5yck",
+      "outputHash": "sha256:0df905fac11d2970abbe483ba25b7cd90f5c7cfde9ed1a3647ce757dc4dc4b12",
+      "originalUrl": "https://channels.nixos.org/nixos-26.05/nixexprs.tar.xz",
+      "resolvedUrl": "https://releases.nixos.org/nixos/26.05/nixos-26.05.10478.1bc55b9def81/nixexprs.tar.xz"
     },
     {
       "name": "nix-gocacheprog",
