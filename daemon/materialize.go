@@ -30,6 +30,9 @@ var errCachefdNotFound = errors.New("cache fd not found for slab")
 
 var zeroTimeval = []unix.Timeval{{}, {}}
 
+// for tests: called just before materialize copies a chunk
+var testHookMaterializeChunk func(erofs.SlabLoc)
+
 func (s *Server) handleMaterializeReq(ctx context.Context, r *MaterializeReq) (*Status, error) {
 	if s.p() == nil {
 		return nil, mwErr(http.StatusPreconditionFailed, "styx is not initialized, call 'styx init --params=...'")
@@ -43,6 +46,11 @@ func (s *Server) handleMaterializeReq(ctx context.Context, r *MaterializeReq) (*
 	if err != nil {
 		return nil, err
 	}
+
+	// An Unmounted or Materialized image stays in that state while we copy it, so without
+	// this gc could delete its chunks and punch them mid-copy, and we'd copy the holes as
+	// zeros.
+	defer s.holdForGc(sphStr)()
 
 	common.NormalizeUpstream(&r.Upstream)
 
@@ -70,11 +78,7 @@ func (s *Server) handleMaterializeReq(ctx context.Context, r *MaterializeReq) (*
 	var m *pb.Manifest
 	if shouldHaveManifest {
 		// read locally
-		err = s.db.View(func(tx *bbolt.Tx) error {
-			m, _, err = s.getManifestLocal(tx, sphStr)
-			return err
-		})
-		if err != nil {
+		if m, _, err = s.loadManifest(ctx, sphStr); err != nil {
 			// fall back to remote manifest
 			log.Print("error getting manifest locally, trying remote")
 			shouldHaveManifest = false
@@ -110,7 +114,7 @@ func (s *Server) handleMaterializeReq(ctx context.Context, r *MaterializeReq) (*
 	}
 
 	// copy to dest
-	err = s.materialize(r.DestPath, m)
+	err = s.materialize(ctx, r.DestPath, m)
 	if err != nil {
 		return nil, err
 	}
@@ -127,7 +131,7 @@ func (s *Server) handleMaterializeReq(ctx context.Context, r *MaterializeReq) (*
 	return nil, nil
 }
 
-func (s *Server) materialize(dest string, m *pb.Manifest) error {
+func (s *Server) materialize(ctx context.Context, dest string, m *pb.Manifest) error {
 	ents := m.Entries
 	locs := make(map[cdig.CDig]erofs.SlabLoc)
 	err := s.db.View(func(tx *bbolt.Tx) error {
@@ -188,7 +192,7 @@ func (s *Server) materialize(dest string, m *pb.Manifest) error {
 			case pb.EntryType_DIRECTORY:
 				return nil // done above
 			case pb.EntryType_REGULAR:
-				return s.materializeFile(p, ent, locs, readFds, &cloneFailed)
+				return s.materializeFile(ctx, p, ent, locs, readFds, &cloneFailed)
 			case pb.EntryType_SYMLINK:
 				if i == 0 {
 					return errors.New("bare file can't be symlink")
@@ -213,6 +217,7 @@ func (s *Server) materialize(dest string, m *pb.Manifest) error {
 }
 
 func (s *Server) materializeFile(
+	ctx context.Context,
 	path string,
 	ent *pb.Entry,
 	locs map[cdig.CDig]erofs.SlabLoc,
@@ -245,19 +250,13 @@ tryAgain:
 	for i, dig := range digs {
 		loc := locs[dig]
 		size := cshift.FileChunkSize(ent.Size, i == len(digs)-1)
-		if !cloneFailed.Load() {
-			if cfd := readFds[loc.SlabId].cacheFd; cfd > 0 {
+		// The chunk is recorded present, but its data can still be missing: lost in a crash,
+		// or punched under us. A copy wouldn't notice, so check, and fetch it again.
+		for refetched := false; ; refetched = true {
+			if !cloneFailed.Load() {
 				sizeUp := int(s.blockShift.Roundup(size))
 				roundedUp = sizeUp != int(size)
-				roff := int64(loc.Addr) << s.blockShift
-				woff := int64(i) << cshift
-				var rsize int
-				rsize, err = unix.CopyFileRange(cfd, &roff, int(dst.Fd()), &woff, sizeUp, 0)
-				if err == nil && rsize != sizeUp {
-					// we rounded size up to our erofs block size (4k for now), but it's possible
-					// the target fs is using larger blocks. in that case this may fail.
-					err = io.ErrShortWrite
-				}
+				err = s.cloneChunk(readFds[loc.SlabId].cacheFd, loc, dst, int64(i)<<cshift, sizeUp)
 				// err = unix.IoctlFileCloneRange(
 				// 	int(dst.Fd()),
 				// 	&unix.FileCloneRange{
@@ -266,36 +265,85 @@ tryAgain:
 				// 		Src_length:  uint64(sizeUp),
 				// 		Dest_offset: uint64(i) << common.ChunkShift,
 				// 	})
+				switch err {
+				case syscall.EINVAL, syscall.EOPNOTSUPP, syscall.EXDEV, io.ErrShortWrite, errCachefdNotFound:
+					log.Printf("CopyFileRange: %s, using plain copy", err)
+					cloneFailed.Store(true)
+					dst.Close()
+					goto tryAgain
+				}
 			} else {
-				err = errCachefdNotFound
+				if buf == nil {
+					buf = s.chunkPool.Get(int(cshift.Size()))
+					defer s.chunkPool.Put(buf)
+				}
+				b := buf[:size]
+				if testHookMaterializeChunk != nil {
+					testHookMaterializeChunk(loc)
+				}
+				if err = s.getKnownChunk(loc, b); err == nil {
+					if err = dig.Check(b); err != nil {
+						err = fmt.Errorf("%w %d:%d: %w", errMissingChunk, loc.SlabId, loc.Addr, err)
+					} else {
+						_, err = dst.Write(b)
+					}
+				}
 			}
-			switch err {
-			case nil:
-				// nothing
-			case syscall.EINVAL, syscall.EOPNOTSUPP, syscall.EXDEV, io.ErrShortWrite, errCachefdNotFound:
-				log.Printf("CopyFileRange: %s, using plain copy", err)
-				cloneFailed.Store(true)
-				dst.Close()
-				goto tryAgain
-			default:
+			if err == nil {
+				break
+			} else if refetched || !errors.Is(err, errMissingChunk) {
 				return err
 			}
-		} else {
-			if buf == nil {
-				buf = s.chunkPool.Get(int(cshift.Size()))
-				defer s.chunkPool.Put(buf)
-			}
-			b := buf[:size]
-			if err = s.getKnownChunk(loc, b); err != nil {
-				return err
-			} else if _, err := dst.Write(b); err != nil {
-				return err
+			log.Printf("materialize: %v, fetching chunk %s again", err, dig)
+			if err = s.refetchChunk(ctx, loc, dig); err != nil {
+				return fmt.Errorf("fetching chunk %s again: %w", dig, err)
 			}
 		}
 	}
 	if roundedUp {
 		// we have to round up blocks when using CopyFileRange, so truncate the last one
 		return unix.Ftruncate(int(dst.Fd()), ent.Size)
+	}
+	return nil
+}
+
+// cloneChunk copies sizeUp bytes of the chunk at loc from its slab's backing file cfd to dst
+// at woff. The copy reads a hole in the backing file as zeros, so check that the chunk's space
+// has data before and after the copy. A chunk's data only goes away by being punched (or in a
+// crash, which the first check catches), so data at both checks means the copy got it.
+func (s *Server) cloneChunk(cfd int, loc erofs.SlabLoc, dst *os.File, woff int64, sizeUp int) error {
+	if cfd <= 0 {
+		return errCachefdNotFound
+	}
+	roff := int64(loc.Addr) << s.blockShift
+	if err := checkSlabData(cfd, loc, roff, sizeUp); err != nil {
+		return err
+	}
+	if testHookMaterializeChunk != nil {
+		testHookMaterializeChunk(loc)
+	}
+	coff := roff // CopyFileRange advances it
+	rsize, err := unix.CopyFileRange(cfd, &coff, int(dst.Fd()), &woff, sizeUp, 0)
+	if err != nil {
+		return err
+	} else if rsize != sizeUp {
+		// we rounded size up to our erofs block size (4k for now), but it's possible
+		// the target fs is using larger blocks. in that case this may fail.
+		return io.ErrShortWrite
+	}
+	return checkSlabData(cfd, loc, roff, sizeUp)
+}
+
+// checkSlabData returns errMissingChunk if [off, off+n) of fd has a hole.
+func checkSlabData(fd int, loc erofs.SlabLoc, off int64, n int) error {
+	hole, err := unix.Seek(fd, off, unix.SEEK_HOLE)
+	if err == unix.ENXIO {
+		hole = off // at or past the end of the file
+	} else if err != nil {
+		return nil // can't tell: the filesystem may not support SEEK_HOLE
+	}
+	if hole < off+int64(n) {
+		return fmt.Errorf("%w %d:%d: hole in slab", errMissingChunk, loc.SlabId, loc.Addr)
 	}
 	return nil
 }

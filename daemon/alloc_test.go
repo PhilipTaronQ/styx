@@ -96,9 +96,17 @@ func TestPreallocateBatchSlabRollover(t *testing.T) {
 		blocks := []uint16{16, 16}
 		digests := []cdig.CDig{testDigest(n), testDigest(n + 1)}
 		n += 2
-		locs, wasAllocated, err := s.preallocateBatch(ctx, blocks, digests)
+		locs, wasAllocated, release, err := s.preallocateBatch(ctx, blocks, digests)
 		require.NoError(t, err)
+		// gc must not punch the reserved space, in whichever slab it is
+		for i, loc := range locs {
+			require.True(t, s.inReservedSpace(loc), "allocation %d at %v isn't reserved from gc", i, loc)
+		}
 		require.NoError(t, s.commitPreallocated(ctx, blocks, digests, locs, wasAllocated))
+		release()
+		for _, loc := range locs {
+			require.False(t, s.inReservedSpace(loc), "%v still reserved after release", loc)
+		}
 		for i, loc := range locs {
 			allocs = append(allocs, testAlloc{loc, blocks[i]})
 		}
@@ -122,8 +130,9 @@ func TestAllocateBatchRejectsZeroBlocks(t *testing.T) {
 	ctx := withAllocateCtx(context.Background(), slabTestSph(t), false)
 	_, err := s.AllocateBatch(ctx, []uint16{16, 0}, []cdig.CDig{testDigest(1), testDigest(2)})
 	require.ErrorContains(t, err, "zero-block")
-	_, _, err = s.preallocateBatch(ctx, []uint16{0}, []cdig.CDig{testDigest(3)})
+	_, _, _, err = s.preallocateBatch(ctx, []uint16{0}, []cdig.CDig{testDigest(3)})
 	require.ErrorContains(t, err, "zero-block")
+	require.Empty(t, s.gcReserved(), "a failed preallocateBatch left a reservation")
 }
 
 // End to end through the erofs builder, as getManifestAndBuildImage does it: a file whose

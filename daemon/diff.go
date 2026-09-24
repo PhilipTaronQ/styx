@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"encoding/base64"
@@ -352,13 +353,17 @@ func (s *Server) buildAndStartPrefetch(ctx context.Context, reqs []cdig.CDig) ([
 
 // currently this is only used to read manifest chunks
 // all chunks must be the same size
+//
+// Each chunk is checked against its digest. One whose data doesn't match (data lost in a crash
+// can read back as zeros) is missing: its present record is dropped, and it's fetched again if
+// allowMissing, or else it's an errMissingChunk.
 func (s *Server) readChunks(
 	ctx context.Context, // can be nil if allowMissing is false
 	useTx *bbolt.Tx, // optional
 	totalSize int64,
 	chunkShift shift.Shift,
 	locs []erofs.SlabLoc,
-	digests []cdig.CDig, // used if allowMissing is true
+	digests []cdig.CDig,
 	sphps []SphPrefix, // used if allowMissing is true
 	allowMissing bool,
 ) ([]byte, error) {
@@ -374,40 +379,84 @@ func (s *Server) readChunks(
 		return nil
 	}
 
-	for {
-		if useTx != nil {
-			findMissing(useTx)
-		} else {
-			s.db.View(findMissing)
-		}
-		if firstMissing == -1 {
-			break // we have them all
-		}
-		if !allowMissing {
-			// if this happens we probably have a race between fetching and using manifests
-			loc := locs[firstMissing]
-			return nil, fmt.Errorf("missing chunk %d:%d", loc.SlabId, loc.Addr)
-		}
-
-		// request first missing one. the differ will do some readahead.
-		err := s.requestChunk(ctx, locs[firstMissing], digests[firstMissing], sphps)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	// read all from slabs. all but last chunk must be full.
 	out := make([]byte, totalSize)
-	rest := out
-	for _, loc := range locs {
-		toRead := min(int(chunkShift.Size()), len(rest))
-		err := s.getKnownChunk(loc, rest[:toRead])
-		if err != nil {
+	refetched := make(map[int]bool)
+	for {
+		for {
+			if useTx != nil {
+				findMissing(useTx)
+			} else {
+				s.db.View(findMissing)
+			}
+			if firstMissing == -1 {
+				break // we have them all
+			}
+			if !allowMissing {
+				// if this happens we probably have a race between fetching and using manifests
+				loc := locs[firstMissing]
+				return nil, fmt.Errorf("%w %d:%d", errMissingChunk, loc.SlabId, loc.Addr)
+			}
+
+			// request first missing one. the differ will do some readahead.
+			err := s.requestChunk(ctx, locs[firstMissing], digests[firstMissing], sphps)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		// read all from slabs. all but last chunk must be full.
+		bad, badSize := -1, 0
+		rest := out
+		for i, loc := range locs {
+			toRead := min(int(chunkShift.Size()), len(rest))
+			if err := s.getKnownChunk(loc, rest[:toRead]); err != nil {
+				return nil, err
+			} else if digests[i].Check(rest[:toRead]) != nil {
+				bad, badSize = i, toRead
+				break
+			}
+			rest = rest[toRead:]
+		}
+		if bad < 0 {
+			return out, nil
+		}
+
+		loc := locs[bad]
+		err := fmt.Errorf("%w %d:%d: data doesn't match digest %s", errMissingChunk, loc.SlabId, loc.Addr, digests[bad])
+		log.Print(err)
+		s.dropBadPresent(useTx, loc, digests[bad], badSize)
+		if !allowMissing || refetched[bad] {
 			return nil, err
 		}
-		rest = rest[toRead:]
+		refetched[bad] = true
 	}
-	return out, nil
+}
+
+// dropBadPresent forgets that loc is present, since its data doesn't match digest. A
+// read-only transaction can't write, so then it's done in the background, if the data is still
+// bad by then.
+func (s *Server) dropBadPresent(tx *bbolt.Tx, loc erofs.SlabLoc, digest cdig.CDig, size int) {
+	if tx != nil && tx.Writable() {
+		_ = s.dropPresent(tx, loc)
+		return
+	}
+	drop := func() {
+		err := s.db.Update(func(tx *bbolt.Tx) error {
+			buf := make([]byte, size)
+			if s.getKnownChunk(loc, buf) == nil && digest.Check(buf) == nil {
+				return nil // fetched again since
+			}
+			return s.dropPresent(tx, loc)
+		})
+		if err != nil {
+			log.Printf("dropping present record of %d:%d: %v", loc.SlabId, loc.Addr, err)
+		}
+	}
+	if tx != nil {
+		go drop()
+	} else {
+		drop()
+	}
 }
 
 func (s *Server) readSingle(ctx context.Context, loc erofs.SlabLoc, digest cdig.CDig) error {
@@ -696,6 +745,9 @@ func (s *Server) dupReadFdForSlab(slabId uint16) (int, error) {
 	return 0, errors.New("slab not loaded or missing read fd")
 }
 
+// for tests: called just before gotNewChunk writes a chunk
+var testHookBeforeChunkWrite func(erofs.SlabLoc)
+
 // gotNewChunk may reslice b up to block size and zero up to the new size!
 func (s *Server) gotNewChunk(loc erofs.SlabLoc, digest cdig.CDig, b []byte) error {
 	if err := digest.Check(b); err != nil {
@@ -744,6 +796,9 @@ func (s *Server) gotNewChunk(loc erofs.SlabLoc, digest cdig.CDig, b []byte) erro
 	}
 
 	off := int64(loc.Addr) << s.blockShift
+	if testHookBeforeChunkWrite != nil {
+		testHookBeforeChunkWrite(loc)
+	}
 	if n, err := unix.Pwrite(writeFd, b, off); err != nil {
 		return fmt.Errorf("pwrite error: %w", err)
 	} else if n != len(b) {
@@ -752,21 +807,40 @@ func (s *Server) gotNewChunk(loc erofs.SlabLoc, digest cdig.CDig, b []byte) erro
 
 	// record async
 	s.presentMap.Put(loc, struct{}{})
-	go s.cleanPresentMap(loc)
+	go s.cleanPresentMap(loc, digest, int64(len(b)))
 
 	return nil
 }
 
-func (s *Server) cleanPresentMap(loc erofs.SlabLoc) {
+// cleanPresentMap records the chunk that gotNewChunk wrote n bytes of at loc present, once
+// its data is durable.
+func (s *Server) cleanPresentMap(loc erofs.SlabLoc, digest cdig.CDig, n int64) {
+	syncErr := s.syncSlab(loc.SlabId)
+	if syncErr != nil {
+		log.Println("present map sync error:", syncErr)
+	}
+	var gone bool
 	err := s.db.Batch(func(tx *bbolt.Tx) error {
-		sb := tx.Bucket(slabBucket).Bucket(slabKey(loc.SlabId))
-		if sb == nil {
-			return errors.New("missing slab bucket")
+		if gone = s.chunkGone(tx, loc, digest); gone || syncErr != nil {
+			return nil
 		}
-		return sb.Put(addrKey(presentMask|loc.Addr), []byte{})
+		return s.recordPresent(tx, loc, digest)
 	})
 	if err != nil {
 		log.Println("present map record error:", err)
+		return
+	}
+	if gone {
+		// gc deleted the chunk, and may have punched its space before our write landed. It
+		// never punches the same space again, so punch what we wrote. If our write landed
+		// after gc's punch, this punch is later still; if before, gc's punch cleared it. No
+		// lock needed: we saw gc's commit, which it makes before punching.
+		s.presentMap.Delete(loc)
+		if err := s.punchSlab(loc, n); err != nil {
+			log.Printf("punching chunk %s that gc deleted at %d:%d: %v", digest, loc.SlabId, loc.Addr, err)
+		}
+		return
+	} else if syncErr != nil {
 		return
 	}
 	// we can't clean up presentMap immediately, we need to wait until all read
@@ -775,6 +849,40 @@ func (s *Server) cleanPresentMap(loc erofs.SlabLoc) {
 	// bookkeeping, though. for now just wait a while. TODO: make this correct
 	time.Sleep(time.Minute)
 	s.presentMap.Delete(loc)
+}
+
+// chunkGone reports whether gc deleted the chunk digest at loc, so its slab key is gone
+// (addresses are never reused). Space that vaporize reserved has no slab keys until it links
+// its chunks, but isn't gone.
+func (s *Server) chunkGone(tx *bbolt.Tx, loc erofs.SlabLoc, digest cdig.CDig) bool {
+	sb := tx.Bucket(slabBucket).Bucket(slabKey(loc.SlabId))
+	if sb == nil || bytes.Equal(sb.Get(addrKey(loc.Addr)), digest[:]) {
+		return false
+	}
+	return !s.inReservedSpace(loc)
+}
+
+// punchSlab punches n bytes at loc out of its slab's backing file.
+func (s *Server) punchSlab(loc erofs.SlabLoc, n int64) error {
+	fd, err := s.dupCacheFd(loc.SlabId)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(fd)
+	return unix.Fallocate(fd, unix.FALLOC_FL_PUNCH_HOLE|unix.FALLOC_FL_KEEP_SIZE, int64(loc.Addr)<<s.blockShift, n)
+}
+
+// recordPresent marks loc present, unless it no longer holds digest: gc may have deleted
+// the chunk since we wrote it, and a present key for it then would never be cleaned up.
+// (vaporize writes before it links a chunk, and commitPreallocated marks those itself.)
+func (s *Server) recordPresent(tx *bbolt.Tx, loc erofs.SlabLoc, digest cdig.CDig) error {
+	sb := tx.Bucket(slabBucket).Bucket(slabKey(loc.SlabId))
+	if sb == nil {
+		return errors.New("missing slab bucket")
+	} else if !bytes.Equal(sb.Get(addrKey(loc.Addr)), digest[:]) {
+		return nil
+	}
+	return sb.Put(addrKey(presentMask|loc.Addr), []byte{})
 }
 
 func (s *Server) getChunkDiff(
@@ -862,7 +970,7 @@ func (s *Server) getDigestsFromImage(tx *bbolt.Tx, sph Sph, isManifest bool) ([]
 			return nil, err
 		}
 		cshift := entry.ChunkShiftDef()
-		data, err = s.readChunks(context.TODO(), tx, entry.Size, cshift, locs, nil, nil, false)
+		data, err = s.readChunks(context.TODO(), tx, entry.Size, cshift, locs, cdig.FromSliceAlias(entry.Digests), nil, false)
 		if err != nil {
 			return nil, err
 		}
@@ -876,18 +984,12 @@ func (s *Server) getDigestsFromImage(tx *bbolt.Tx, sph Sph, isManifest bool) ([]
 
 // simplified form of getDigestsFromImage (TODO: consolidate)
 func (s *Server) getManifestLocal(tx *bbolt.Tx, sphStr string) (*pb.Manifest, []cdig.CDig, error) {
-	v := tx.Bucket(manifestBucket).Get([]byte(sphStr))
-	if v == nil {
-		return nil, nil, fmt.Errorf("manifest %q not found", sphStr)
-	}
-	var sm pb.SignedMessage
-	err := proto.Unmarshal(v, &sm)
+	entry, err := getManifestEntry(tx, sphStr)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	// read chunks if needed
-	entry := sm.Msg
 	data := entry.InlineData
 	mdigs := cdig.FromSliceAlias(entry.Digests)
 	if len(data) == 0 {
@@ -896,18 +998,90 @@ func (s *Server) getManifestLocal(tx *bbolt.Tx, sphStr string) (*pb.Manifest, []
 			return nil, nil, err
 		}
 		cshift := entry.ChunkShiftDef()
-		data, err = s.readChunks(context.TODO(), tx, entry.Size, cshift, locs, nil, nil, false)
+		data, err = s.readChunks(context.TODO(), tx, entry.Size, cshift, locs, mdigs, nil, false)
 		if err != nil {
 			return nil, nil, err
 		}
 	}
+	return unmarshalManifest(data, mdigs)
+}
 
-	// unmarshal
+// loadManifest is getManifestLocal outside a transaction, so it can fetch manifest chunks that
+// are missing or damaged.
+func (s *Server) loadManifest(ctx context.Context, sphStr string) (*pb.Manifest, []cdig.CDig, error) {
+	sph, _, err := ParseSph(sphStr)
+	if err != nil {
+		return nil, nil, err
+	}
+	var entry *pb.Entry
+	var locs []erofs.SlabLoc
+	err = s.db.View(func(tx *bbolt.Tx) error {
+		var err error
+		if entry, err = getManifestEntry(tx, sphStr); err != nil || len(entry.InlineData) > 0 {
+			return err
+		}
+		locs, err = s.lookupLocs(tx, cdig.FromSliceAlias(entry.Digests), true)
+		return err
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	data := entry.InlineData
+	mdigs := cdig.FromSliceAlias(entry.Digests)
+	if len(data) == 0 {
+		manifestSph := makeManifestSph(sph)
+		sphps := []SphPrefix{SphPrefixFromBytes(manifestSph[:])}
+		data, err = s.readChunks(ctx, nil, entry.Size, entry.ChunkShiftDef(), locs, mdigs, sphps, true)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	return unmarshalManifest(data, mdigs)
+}
+
+// getManifestEntry returns the entry in sphStr's signed manifest message.
+func getManifestEntry(tx *bbolt.Tx, sphStr string) (*pb.Entry, error) {
+	v := tx.Bucket(manifestBucket).Get([]byte(sphStr))
+	if v == nil {
+		return nil, fmt.Errorf("manifest %q not found", sphStr)
+	}
+	var sm pb.SignedMessage
+	if err := proto.Unmarshal(v, &sm); err != nil {
+		return nil, err
+	}
+	return sm.Msg, nil
+}
+
+func unmarshalManifest(data []byte, mdigs []cdig.CDig) (*pb.Manifest, []cdig.CDig, error) {
 	var m pb.Manifest
 	if err := proto.Unmarshal(data, &m); err != nil {
 		return nil, nil, err
 	}
 	return &m, mdigs, nil
+}
+
+// errMissingChunk means a chunk's data isn't in its slab: it isn't recorded present, or it is
+// but the data is gone or doesn't match its digest.
+var errMissingChunk = errors.New("missing chunk")
+
+// refetchChunk fetches a chunk again that is recorded present but whose data we found missing.
+// Call it outside any transaction.
+func (s *Server) refetchChunk(ctx context.Context, loc erofs.SlabLoc, digest cdig.CDig) error {
+	if err := s.db.Update(func(tx *bbolt.Tx) error { return s.dropPresent(tx, loc) }); err != nil {
+		return err
+	}
+	return s.requestChunk(ctx, loc, digest, nil)
+}
+
+// dropPresent forgets that loc is present.
+func (s *Server) dropPresent(tx *bbolt.Tx, loc erofs.SlabLoc) error {
+	s.presentMap.Delete(loc)
+	sb := tx.Bucket(slabBucket).Bucket(slabKey(loc.SlabId))
+	if sb == nil {
+		return errors.New("missing slab bucket")
+	}
+	return sb.Delete(addrKey(loc.Addr | presentMask))
 }
 
 func (s *Server) getKnownChunk(loc erofs.SlabLoc, buf []byte) error {

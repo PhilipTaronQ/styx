@@ -7,9 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"math"
 	"net/http"
+	"path/filepath"
+	"runtime"
 	"slices"
+	"sync"
+	"time"
 
 	"github.com/dnr/styx/common"
 	"github.com/dnr/styx/common/cdig"
@@ -35,6 +40,26 @@ type (
 		keepSphps map[SphPrefix]struct{} // sph prefix
 		keepDig   map[cdig.CDig]struct{} // data chunks
 		keepMDig  map[cdig.CDig]struct{} // manifest chunks
+
+		held map[string]struct{} // sph string with an operation in progress
+		// sph prefixes whose chunks we keep whether a manifest refers to them or not: held
+		// images and their manifests, and images whose manifests we couldn't read
+		tagSphps map[SphPrefix]struct{}
+		// images whose manifest chunks are missing or damaged, to fetch again after committing
+		repairManifests []string
+	}
+
+	// gcGuard tracks what in-progress operations need gc to leave alone.
+	gcGuard struct {
+		mu       sync.Mutex
+		holds    map[string]int         // sph string -> number of operations using it
+		reserved map[slabRange]struct{} // slab space allocated without slab keys yet
+	}
+
+	// blocks [start, end) of a slab
+	slabRange struct {
+		slabId     uint16
+		start, end uint32
 	}
 
 	gcChunk struct {
@@ -53,6 +78,14 @@ func (s *Server) handleGcReq(ctx context.Context, r *GcReq) (*GcResp, error) {
 	if s.p() == nil {
 		return nil, mwErr(http.StatusPreconditionFailed, "styx is not initialized, call 'styx init --params=...'")
 	}
+
+	// Give images that are still in use a moment to be released before we look, without
+	// holding the db: waiting in the write transaction stalled every db writer.
+	settling, err := s.gcCandidates(r)
+	if err != nil {
+		return nil, err
+	}
+	s.waitImagesFree(settling)
 
 	tx, err := s.db.Begin(true)
 	if err != nil {
@@ -75,17 +108,61 @@ func (s *Server) handleGcReq(ctx context.Context, r *GcReq) (*GcResp, error) {
 		keepSphps: make(map[SphPrefix]struct{}, 1000),
 		keepDig:   make(map[cdig.CDig]struct{}, 100000),
 		keepMDig:  make(map[cdig.CDig]struct{}, 1000),
+		held:      make(map[string]struct{}),
+		tagSphps:  make(map[SphPrefix]struct{}),
 	}
 
+	// A mount, materialize or vaporize in progress keeps its image whatever the image's state,
+	// and any chunk allocated for it so far, even one no manifest refers to yet. Read the
+	// holds inside the write transaction: an operation that takes one later does its first
+	// update after we commit.
+	for _, sphStr := range s.gcHolds() {
+		sph, _, err := ParseSph(sphStr)
+		if err != nil {
+			continue
+		}
+		manifestSph := makeManifestSph(sph)
+		g.held[sphStr] = struct{}{}
+		for _, sphp := range []SphPrefix{SphPrefixFromBytes(sph[:]), SphPrefixFromBytes(manifestSph[:])} {
+			g.tagSphps[sphp] = struct{}{}
+			g.keepSphps[sphp] = struct{}{}
+		}
+	}
+	reserved := s.gcReserved()
+
 	// use image bucket as roots
+	var candidates []string
+	candidateImgs := make(map[string]*pb.DbImage)
 	ibcur := g.ib.Cursor()
 	for k, v := ibcur.First(); k != nil; k, v = ibcur.Next() {
-		var img pb.DbImage
-		if proto.Unmarshal(v, &img) == nil {
-			err := s.gcTraceImage(g, string(k), &img)
-			if err != nil {
-				return nil, err
-			}
+		img := &pb.DbImage{}
+		if proto.Unmarshal(v, img) != nil {
+			continue
+		}
+		sphStr := string(k)
+		if _, held := g.held[sphStr]; g.GcByState[img.MountState] && !held {
+			candidates = append(candidates, sphStr)
+			candidateImgs[sphStr] = img
+		} else if err := s.gcTraceImage(g, sphStr, img); err != nil {
+			return nil, err
+		}
+	}
+	// umount detaches lazily, so an Unmounted image can still be in use through open files.
+	// Freeing its chunks would give those readers EIO, or SIGBUS for a running binary. We
+	// waited for them above; check again now, without waiting, since one may have been
+	// mounted and unmounted since. A mount that starts now can't make an image busy before we
+	// commit: handleMountReq records the image Requested first, which waits for us.
+	// (restoreMount doesn't, but only for Mounted images, which "styx gc" never deletes.)
+	busy := s.imagesInUse(candidates)
+	for _, sphStr := range candidates {
+		img := candidateImgs[sphStr]
+		if !busy[sphStr] {
+			g.DeleteImagesByState[img.MountState]++
+			continue
+		}
+		log.Printf("gc: keeping %s, its image is still in use", img.StorePath)
+		if err := s.gcTraceImage(g, sphStr, img); err != nil {
+			return nil, err
 		}
 	}
 
@@ -102,7 +179,7 @@ func (s *Server) handleGcReq(ctx context.Context, r *GcReq) (*GcResp, error) {
 		var spName string
 		if proto.Unmarshal(v, &img) != nil {
 			continue
-		} else if sph, spName, err = ParseSph(img.StorePath); err != nil || spName == "" {
+		} else if sph, _, spName, err = ParseSphAndName(img.StorePath); err != nil {
 			continue
 		}
 		fkey := bytes.Join([][]byte{[]byte(spName), []byte{0}, sph[:]}, nil)
@@ -118,7 +195,8 @@ func (s *Server) handleGcReq(ctx context.Context, r *GcReq) (*GcResp, error) {
 	var delManifests [][]byte
 	mbcur := g.mb.Cursor()
 	for k, _ := mbcur.First(); k != nil; k, _ = mbcur.Next() {
-		if _, ok := g.keepImage[string(k)]; !ok {
+		_, keep := g.keepImage[string(k)]
+		if _, held := g.held[string(k)]; !keep && !held {
 			delManifests = append(delManifests, bytes.Clone(k))
 		}
 	}
@@ -137,13 +215,18 @@ func (s *Server) handleGcReq(ctx context.Context, r *GcReq) (*GcResp, error) {
 		cbcur := chunks.cb.Cursor()
 		for k, v := cbcur.First(); k != nil; k, v = cbcur.Next() {
 			d := cdig.FromBytes(k)
+			sphps := sphpsFromLoc(v)
 			if _, ok := chunks.keep[d]; !ok {
-				delChunks = append(delChunks, gcChunk{cb: chunks.cb, d: d})
-				delLocs = append(delLocs, loadLoc(v))
-				continue
+				if !g.anyTagged(sphps) {
+					delChunks = append(delChunks, gcChunk{cb: chunks.cb, d: d})
+					delLocs = append(delLocs, loadLoc(v))
+					continue
+				}
+				// kept for a held image, or one whose manifest we couldn't read: count it as
+				// referenced, so that RemainRefChunks still matches RemainHaveChunks
+				chunks.keep[d] = struct{}{}
 			}
 			g.RemainHaveChunks++
-			sphps := sphpsFromLoc(v)
 			if g.keepAllSphps(sphps) {
 				continue
 			}
@@ -170,7 +253,7 @@ func (s *Server) handleGcReq(ctx context.Context, r *GcReq) (*GcResp, error) {
 	log.Printf("gc:   %d chunks", len(delChunks))
 	log.Printf("gc: remaining:")
 	log.Printf("gc:   %d images", len(g.keepImage))
-	log.Printf("gc:   %d chunks (%d)", len(g.keepDig), g.RemainHaveChunks)
+	log.Printf("gc:   %d chunks (%d)", g.RemainRefChunks, g.RemainHaveChunks)
 	log.Printf("gc: rewrite %d chunks", len(rewriteChunks))
 
 	// dry run fast: just read
@@ -220,6 +303,7 @@ func (s *Server) handleGcReq(ctx context.Context, r *GcReq) (*GcResp, error) {
 		} else if end = addrFromKey(k); end&presentMask != 0 {
 			end = common.TruncU32(lsb.Sequence()) // also end of slab
 		}
+		end = clampToReserved(reserved, l, end)
 		// we're looking at locs in order, so if we're deleting two consecutive chunks,
 		// the first one should find the largest range to punch. if we found the same end we
 		// can ignore it.
@@ -289,27 +373,25 @@ func (s *Server) handleGcReq(ctx context.Context, r *GcReq) (*GcResp, error) {
 		return nil, err
 	}
 
+	// the images' backing files point at the chunks we're about to punch
+	delImageSphs := make([]string, len(delImages))
+	for i, k := range delImages {
+		delImageSphs[i] = string(k)
+	}
+	s.cullImageFiles(delImageSphs)
+
 	if len(punchLocs) > 0 {
 		// actually punch holes
-		s.stateLock.Lock()
-		readFds := make(map[uint16]int)
-		for id, fds := range s.readfdBySlab {
-			if fds.cacheFd > 0 {
-				if dfd, err := unix.Dup(fds.cacheFd); err == nil {
-					readFds[id] = dfd
-				}
-			}
-		}
-		s.stateLock.Unlock()
-
+		readFds := s.dupCacheFds()
 		defer func() {
-			for _, fd := range readFds {
-				unix.Close(fd)
+			for _, fds := range readFds {
+				unix.Close(fds.cacheFd)
 			}
 		}()
 
 		for i, le := range punchLocs {
-			if cfd, ok := readFds[le.SlabId]; ok {
+			if fds, ok := readFds[le.SlabId]; ok {
+				cfd := fds.cacheFd
 				err := unix.Fallocate(
 					cfd,
 					unix.FALLOC_FL_PUNCH_HOLE|unix.FALLOC_FL_KEEP_SIZE,
@@ -337,6 +419,12 @@ func (s *Server) handleGcReq(ctx context.Context, r *GcReq) (*GcResp, error) {
 		})
 	}
 
+	for _, sphStr := range g.repairManifests {
+		if _, _, err := s.loadManifest(ctx, sphStr); err != nil {
+			log.Printf("gc: fetching manifest chunks of %s again: %v", sphStr, err)
+		}
+	}
+
 	return resp, nil
 }
 
@@ -349,19 +437,32 @@ func (s *Server) gcTraceImage(g *gcCtx, sphStr string, img *pb.DbImage) error {
 	manifestSph := makeManifestSph(sph)
 	manifestSphPrefix := SphPrefixFromBytes(manifestSph[:])
 
-	if g.GcByState[img.MountState] {
-		g.DeleteImagesByState[img.MountState]++
-		return nil
-	}
-
 	g.keepImage[sphStr] = struct{}{}
 	g.keepSphps[sphPrefix] = struct{}{}
 	g.keepSphps[manifestSphPrefix] = struct{}{}
 	g.RemainImagesByState[img.MountState]++
 
 	m, mdigs, err := s.getManifestLocal(g.tx, sphStr)
-	if err != nil {
-		return err
+	if errors.Is(err, errMissingChunk) && gcNeedsManifest(img.MountState) {
+		// A chunk of the manifest is missing, or its data is damaged (readChunks dropped its
+		// present record). We fetch it again after committing. Until then we can't tell which
+		// chunks the image uses, but they're all tagged with it, so keep those.
+		log.Printf("gc: keeping all chunks of %s (%s) until its manifest is fetched again: %v", sphStr, img.MountState, err)
+		g.tagSphps[sphPrefix] = struct{}{}
+		g.tagSphps[manifestSphPrefix] = struct{}{}
+		g.keepManifestChunks(sphStr)
+		g.repairManifests = append(g.repairManifests, sphStr)
+		return nil
+	} else if err != nil {
+		if gcNeedsManifest(img.MountState) {
+			return err
+		}
+		// A mount or materialize that failed, or is still running, before it had the whole
+		// manifest. It has no image chunks yet, so there is nothing more to trace, but keep
+		// any manifest chunks it got so a retry can use them.
+		log.Printf("gc: keeping %s (%s) without its manifest: %v", sphStr, img.MountState, err)
+		g.keepManifestChunks(sphStr)
+		return nil
 	}
 
 	for _, mdig := range mdigs {
@@ -374,6 +475,229 @@ func (s *Server) gcTraceImage(g *gcCtx, sphStr string, img *pb.DbImage) error {
 	}
 
 	return nil
+}
+
+// keepManifestChunks keeps the chunks of sphStr's manifest.
+func (g *gcCtx) keepManifestChunks(sphStr string) {
+	if v := g.mb.Get([]byte(sphStr)); v != nil {
+		var sm pb.SignedMessage
+		if proto.Unmarshal(v, &sm) == nil {
+			for _, mdig := range cdig.FromSliceAlias(sm.Msg.GetDigests()) {
+				g.keepMDig[mdig] = struct{}{}
+			}
+		}
+	}
+}
+
+// Images in these states were mounted or materialized, so they have chunks, and gc must read
+// their manifests to know which. An image in another state may have no manifest yet.
+func gcNeedsManifest(st pb.MountState) bool {
+	switch st {
+	case pb.MountState_Mounted, pb.MountState_UnmountRequested, pb.MountState_Unmounted, pb.MountState_Materialized:
+		return true
+	default:
+		return false
+	}
+}
+
+var errNoDevnode = errors.New("cachefiles device not open")
+
+// cachefilesFileCmds runs the cachefiles command cmd ("inuse" or "cull") on the backing file
+// of each fsid. The kernel looks the name up in the calling thread's working directory, so
+// this runs on a thread with a working directory of its own, which exits afterwards.
+func (s *Server) cachefilesFileCmds(cmd string, fsids []string) []error {
+	errs := make([]error, len(fsids))
+	devfd := int(s.devnode.Load())
+	if devfd == 0 || len(fsids) == 0 {
+		for i := range errs {
+			errs[i] = errNoDevnode
+		}
+		return errs
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		// Never unlocked, so the thread exits with this goroutine rather than run others
+		// in our working directory.
+		runtime.LockOSThread()
+		if err := unix.Unshare(unix.CLONE_FS); err != nil {
+			for i := range errs {
+				errs[i] = fmt.Errorf("unshare: %w", err)
+			}
+			return
+		}
+		for i, fsid := range fsids {
+			p := filepath.Join(s.cfg.CachePath, fscachePath(s.cfg.CacheDomain, fsid))
+			errs[i] = cachefilesFileCmd(devfd, cmd, filepath.Dir(p), filepath.Base(p))
+		}
+	}()
+	<-done
+	return errs
+}
+
+// cachefilesFileCmd runs cmd on the file name in dir. Call it only on a thread with a working
+// directory of its own. A variable for tests.
+var cachefilesFileCmd = func(devfd int, cmd, dir, name string) error {
+	if err := unix.Chdir(dir); err != nil {
+		return err
+	}
+	_, err := unix.Write(devfd, []byte(cmd+" "+name))
+	return err
+}
+
+// gcCandidates returns the images gc would delete if they aren't in use.
+func (s *Server) gcCandidates(r *GcReq) ([]string, error) {
+	held := make(map[string]bool)
+	for _, sphStr := range s.gcHolds() {
+		held[sphStr] = true
+	}
+	var candidates []string
+	err := s.db.View(func(tx *bbolt.Tx) error {
+		cur := tx.Bucket(imageBucket).Cursor()
+		for k, v := cur.First(); k != nil; k, v = cur.Next() {
+			var img pb.DbImage
+			if proto.Unmarshal(v, &img) == nil && r.GcByState[img.MountState] && !held[string(k)] {
+				candidates = append(candidates, string(k))
+			}
+		}
+		return nil
+	})
+	return candidates, err
+}
+
+// imagesInUse returns which of the images cachefiles has open, from the kernel's own record
+// (so it holds across daemon restarts). A file stays open until the last user of a lazily
+// detached mount goes away.
+func (s *Server) imagesInUse(sphs []string) map[string]bool {
+	busy := make(map[string]bool)
+	for i, err := range s.cachefilesFileCmds("inuse", sphs) {
+		switch {
+		case err == nil, errors.Is(err, unix.ENOENT), errors.Is(err, errNoDevnode):
+		case errors.Is(err, unix.EBUSY):
+			busy[sphs[i]] = true
+		default:
+			log.Printf("gc: can't tell if image %s is in use, keeping it: %v", sphs[i], err)
+			busy[sphs[i]] = true
+		}
+	}
+	return busy
+}
+
+// waitImagesFree waits up to a second for those of the images that are in use to be released.
+// The kernel releases an image's file asynchronously after a plain unmount, so it can be busy
+// for a moment after.
+func (s *Server) waitImagesFree(sphs []string) {
+	for deadline := time.Now().Add(time.Second); len(sphs) > 0 && time.Now().Before(deadline); {
+		var busy []string
+		for i, err := range s.cachefilesFileCmds("inuse", sphs) {
+			if errors.Is(err, unix.EBUSY) {
+				busy = append(busy, sphs[i])
+			}
+		}
+		if sphs = busy; len(sphs) > 0 {
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+}
+
+// cullImageFiles removes the cachefiles backing files of images that aren't in use.
+// cachefiles checks only an object's size before reusing its file, so a new image of the
+// same size for the same store path would otherwise be served from the old image.
+func (s *Server) cullImageFiles(sphs []string) {
+	for i, err := range s.cachefilesFileCmds("cull", sphs) {
+		if err != nil && !errors.Is(err, unix.ENOENT) && !errors.Is(err, errNoDevnode) {
+			log.Printf("cull image file for %s: %v", sphs[i], err)
+		}
+	}
+}
+
+// holdForGc makes gc keep sphStr's image, manifest and chunks until the returned function is
+// called. Take it before the operation's first db update.
+func (s *Server) holdForGc(sphStr string) func() {
+	g := &s.gcGuard
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.holds == nil {
+		g.holds = make(map[string]int)
+	}
+	g.holds[sphStr]++
+	return func() {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		g.holds[sphStr]--
+		if g.holds[sphStr] <= 0 {
+			delete(g.holds, sphStr)
+		}
+	}
+}
+
+func (s *Server) gcHolds() []string {
+	g := &s.gcGuard
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return slices.Collect(maps.Keys(g.holds))
+}
+
+// reserveForGc keeps gc from punching the given slab ranges until the returned function is
+// called. Call it inside the transaction that allocates them.
+func (s *Server) reserveForGc(ranges []slabRange) func() {
+	g := &s.gcGuard
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.reserved == nil {
+		g.reserved = make(map[slabRange]struct{})
+	}
+	ranges = slices.DeleteFunc(ranges, func(r slabRange) bool { return r.start >= r.end })
+	for _, r := range ranges {
+		g.reserved[r] = struct{}{}
+	}
+	return func() {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		for _, r := range ranges {
+			delete(g.reserved, r)
+		}
+	}
+}
+
+func (s *Server) gcReserved() []slabRange {
+	g := &s.gcGuard
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return slices.Collect(maps.Keys(g.reserved))
+}
+
+// inReservedSpace reports whether loc is in space reserved with reserveForGc.
+func (s *Server) inReservedSpace(loc erofs.SlabLoc) bool {
+	g := &s.gcGuard
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for r := range g.reserved {
+		if r.slabId == loc.SlabId && r.start <= loc.Addr && loc.Addr < r.end {
+			return true
+		}
+	}
+	return false
+}
+
+// A punch runs from a deleted chunk to the next slab key, or the end of the slab. Reserved
+// space has no keys yet, so stop at it.
+func clampToReserved(reserved []slabRange, l erofs.SlabLoc, end uint32) uint32 {
+	for _, r := range reserved {
+		if r.slabId == l.SlabId && r.start > l.Addr && r.start < end {
+			end = r.start
+		}
+	}
+	return end
+}
+
+func (g *gcCtx) anyTagged(sphps []SphPrefix) bool {
+	for _, sphp := range sphps {
+		if _, ok := g.tagSphps[sphp]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func (g *gcCtx) keepAllSphps(sphps []SphPrefix) bool {

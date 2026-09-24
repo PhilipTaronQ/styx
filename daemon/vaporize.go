@@ -46,6 +46,9 @@ func (s *Server) handleVaporizeReq(ctx context.Context, r *VaporizeReq) (*Status
 	if err != nil {
 		return nil, err
 	}
+	// No image or manifest refers to the chunks we commit until the end, so gc has to keep
+	// them by their store path until then.
+	defer s.holdForGc(sphStr)()
 	manifestSph := makeManifestSph(sph)
 	ctxForChunks := withAllocateCtx(ctx, sph, false)
 	ctxForManifestChunks := withAllocateCtx(ctx, manifestSph, true)
@@ -261,10 +264,11 @@ func (s *Server) vaporizeFile(
 
 	blocks := make([]uint16, 0, len(digests))
 	blocks = common.AppendBlocksList(blocks, size, s.blockShift, cshift)
-	locs, wasAllocated, err := s.preallocateBatch(ctx, blocks, digests)
+	locs, wasAllocated, release, err := s.preallocateBatch(ctx, blocks, digests)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 
 	present := make([]bool, len(locs))
 	s.db.View(func(tx *bbolt.Tx) error {
@@ -291,8 +295,10 @@ func (s *Server) vaporizeFile(
 			if err != nil {
 				return nil, err
 			}
+			// CopyFileRange advances the offsets it's given; keep roff for the fallback below
+			coff := roff
 			woff := int64(loc.Addr) << s.blockShift
-			rsize, err := unix.CopyFileRange(int(f.Fd()), &roff, cfd, &woff, int(size), 0)
+			rsize, err := unix.CopyFileRange(int(f.Fd()), &coff, cfd, &woff, int(size), 0)
 			_ = unix.Close(cfd)
 			if err == nil && rsize != int(size) {
 				err = io.ErrShortWrite
@@ -348,19 +354,22 @@ func (s *Server) vaporizeFile(
 }
 
 // two-phase allocate to support vaporize
-// first reserve space but don't assocate with chunks
-func (s *Server) preallocateBatch(ctx context.Context, blocks []uint16, digests []cdig.CDig) ([]erofs.SlabLoc, []bool, error) {
-	_, forManifest, ok := fromAllocateCtx(ctx)
+// first reserve space but don't assocate with chunks.
+// the reserved space has no slab keys until commitPreallocated, so gc is told to leave it
+// alone until the caller calls release.
+func (s *Server) preallocateBatch(ctx context.Context, blocks []uint16, digests []cdig.CDig) (_ []erofs.SlabLoc, _ []bool, release func(), _ error) {
+	sph, forManifest, ok := fromAllocateCtx(ctx)
 	if !ok {
-		return nil, nil, errors.New("missing allocate context")
+		return nil, nil, nil, errors.New("missing allocate context")
 	}
 
 	n := len(blocks)
 	if n != len(digests) {
-		return nil, nil, errors.New("mismatched lengths")
+		return nil, nil, nil, errors.New("mismatched lengths")
 	}
 	out := make([]erofs.SlabLoc, n)
 	wasAllocated := make([]bool, n)
+	release = func() {}
 	err := s.db.Update(func(tx *bbolt.Tx) error {
 		cb := chunkBucketFor(tx, forManifest)
 		a, err := s.newSlabAllocator(tx.Bucket(slabBucket), firstSlab(forManifest))
@@ -378,15 +387,24 @@ func (s *Server) preallocateBatch(ctx context.Context, blocks []uint16, digests 
 			} else {
 				out[i] = loadLoc(loc)
 				wasAllocated[i] = true
+				// tag it with our store path now, so gc keeps it while we work (see holdForGc)
+				if newLoc := appendSph(loc, sph); newLoc != nil {
+					if err := cb.Put(digest, newLoc); err != nil {
+						return err
+					}
+				}
 			}
 		}
 
+		// gc can't run until this commits, so it sees the reservation
+		release = s.reserveForGc(a.allocated())
 		return a.finish()
 	})
 	if err != nil {
-		return nil, nil, err
+		release()
+		return nil, nil, nil, err
 	}
-	return out, wasAllocated, nil
+	return out, wasAllocated, release, nil
 }
 
 // next (after caller has written/cloned), associate with chunks
@@ -398,6 +416,16 @@ func (s *Server) commitPreallocated(ctx context.Context, blocks []uint16, digest
 
 	if len(blocks) != len(digests) || len(blocks) != len(locs) || len(blocks) != len(wasAllocated) {
 		return errors.New("mismatched lengths")
+	}
+	// the data we copied in must be durable before we mark it present
+	synced := make(map[uint16]bool)
+	for i, loc := range locs {
+		if !wasAllocated[i] && !synced[loc.SlabId] {
+			if err := s.syncSlab(loc.SlabId); err != nil {
+				return err
+			}
+			synced[loc.SlabId] = true
+		}
 	}
 	return s.db.Update(func(tx *bbolt.Tx) error {
 		cb, slabroot := chunkBucketFor(tx, forManifest), tx.Bucket(slabBucket)

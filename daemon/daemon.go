@@ -82,11 +82,18 @@ type (
 		// keeps track of locs that we know are present before we persist them
 		presentMap common.SimpleSyncMap[erofs.SlabLoc, struct{}]
 
+		// syncs slab data before we persist presence
+		slabSyncLock sync.Mutex
+		slabSyncers  map[uint16]*slabSyncer
+
 		// tracks reads for chunks that we should have, to detect bugs
 		readKnownMap common.SimpleSyncMap[erofs.SlabLoc, int]
 
 		// connect context for mount request to cachefiles request
 		mountCtxMap common.SimpleSyncMap[string, context.Context]
+
+		// what gc must leave alone for operations in progress
+		gcGuard gcGuard
 
 		// keeps track of pending diff/fetch state
 		// note: we open a read-only transaction inside of diffLock.
@@ -207,6 +214,9 @@ func (s *Server) postInit(params *pb.DaemonParams, keys []signature.PublicKey) e
 	return nil
 }
 
+// for tests
+var renameFile = os.Rename
+
 func (s *Server) openDb() (err error) {
 	opts := bbolt.Options{
 		NoFreelistSync: true,
@@ -225,9 +235,17 @@ func (s *Server) openDb() (err error) {
 				if err := bbolt.Compact(newDb, oldDb, 4<<20); err == nil {
 					oldDb.Close()
 					newDb.Close()
-					if os.Rename(dbPath, cmpPath) == nil {
-						os.Rename(newPath, dbPath)
-						log.Println("compacted db, old file in", cmpPath)
+					if renameFile(dbPath, cmpPath) == nil {
+						if err := renameFile(newPath, dbPath); err != nil {
+							// put the old db back, or bbolt would create an empty one below
+							log.Println("compacted db rename error:", err)
+							if err := renameFile(cmpPath, dbPath); err != nil {
+								return fmt.Errorf("db compaction left no db; restore it from %s: %w", cmpPath, err)
+							}
+							_ = os.Remove(newPath)
+						} else {
+							log.Println("compacted db, old file in", cmpPath)
+						}
 					}
 				} else {
 					log.Println("bolt compact error:", err)
@@ -649,6 +667,14 @@ func (s *Server) handleMountReq(ctx context.Context, r *MountReq) (*Status, erro
 
 	common.NormalizeUpstream(&r.Upstream)
 
+	// Claim the mount before touching the record, so that a request rejected because
+	// another mount is in progress can't overwrite that mount's record.
+	ctx, done, err := s.startMount(ctx, sphStr)
+	if err != nil {
+		return nil, err
+	}
+	defer done()
+
 	var haveImageSize int64
 	var haveIsBare bool
 	err = s.imageTx(sphStr, func(img *pb.DbImage) error {
@@ -680,16 +706,50 @@ func (s *Server) handleMountReq(ctx context.Context, r *MountReq) (*Status, erro
 	return nil, s.tryMount(ctx, r, haveImageSize, haveIsBare)
 }
 
-func (s *Server) tryMount(ctx context.Context, req *MountReq, haveImageSize int64, haveIsBare bool) error {
+// startMount claims the in-progress mount of sphStr and keeps gc away from it. The returned
+// context carries the mountContext that handleOpenImage reads; pass it to tryMount, and call
+// done when finished.
+func (s *Server) startMount(ctx context.Context, sphStr string) (context.Context, func(), error) {
+	ctx = withMountContext(ctx, &mountContext{})
+	if _, ok := s.mountCtxMap.GetOrPut(sphStr, ctx); ok {
+		return nil, nil, errors.New("another mount is in progress for this store path")
+	}
+	release := s.holdForGc(sphStr)
+	return ctx, func() {
+		release()
+		s.mountCtxMap.Delete(sphStr)
+	}, nil
+}
+
+// tryMount mounts req's image and records the result. ctx must come from startMount.
+func (s *Server) tryMount(ctx context.Context, req *MountReq, haveImageSize int64, haveIsBare bool) (retErr error) {
 	_, sphStr, _ := ParseSph(req.StorePath)
 
-	mountCtx := &mountContext{}
-	ctx = withMountContext(ctx, mountCtx)
-
-	if _, ok := s.mountCtxMap.GetOrPut(sphStr, ctx); ok {
-		return errors.New("another mount is in progress for this store path")
+	mountCtx, _ := fromMountCtx(ctx)
+	if mountCtx == nil {
+		return errors.New("tryMount without a mount context")
 	}
-	defer s.mountCtxMap.Delete(sphStr)
+
+	// Record the result however we return. A failure before mount(2), like a manifest the
+	// manifester can't build, must not leave the image Requested: gc keeps Requested images
+	// by default, and nothing else moves them on.
+	defer func() {
+		_ = s.imageTx(sphStr, func(img *pb.DbImage) error {
+			if retErr == nil {
+				img.MountState = pb.MountState_Mounted
+				img.LastMountError = ""
+				// if the mount succeeded then we must have written the image.
+				// record size here so we skip it next time.
+				img.ImageSize = mountCtx.imageSize
+				img.IsBare = mountCtx.isBare
+			} else {
+				img.MountState = pb.MountState_MountError
+				img.LastMountError = retErr.Error()
+				img.ImageSize = 0 // force refetch/rebuild
+			}
+			return nil
+		})
+	}()
 
 	if haveImageSize > 0 {
 		// if we have an image we can proceed right to mounting
@@ -717,6 +777,10 @@ func (s *Server) tryMount(ctx context.Context, req *MountReq, haveImageSize int6
 	newImage := mountCtx.imageData != nil
 	mountCtx.lock.Unlock()
 	if newImage {
+		// A backing file left from an earlier image of this store path (gc'd, or failed to
+		// mount) would be reused if it has the same size, and the kernel would serve the old
+		// image. It's normally gone already; make sure.
+		s.cullImageFiles([]string{sphStr})
 		// first mount somewhere private, then unmount to force cachefiles to flush the image to disk.
 		// this is gross, there should be a better way to control cachefiles flushing.
 		firstMp := filepath.Join(s.cfg.CachePath, "initial", sphStr)
@@ -758,22 +822,9 @@ func (s *Server) tryMount(ctx context.Context, req *MountReq, haveImageSize int6
 		}
 	}
 
-	_ = s.imageTx(sphStr, func(img *pb.DbImage) error {
-		if mountErr == nil {
-			img.MountState = pb.MountState_Mounted
-			img.LastMountError = ""
-			// if the mount succeeded then we must have written the image.
-			// record size here so we skip it next time.
-			img.ImageSize = mountCtx.imageSize
-			img.IsBare = mountCtx.isBare
-		} else {
-			img.MountState = pb.MountState_MountError
-			img.LastMountError = mountErr.Error()
-			img.ImageSize = 0 // force refetch/rebuild
-		}
-		return nil
-	})
-
+	if mountErr == nil && mountCtx.imageData != nil {
+		s.syncImageFile(sphStr)
+	}
 	return mountErr
 }
 
@@ -806,6 +857,14 @@ func (s *Server) handleUmountReq(ctx context.Context, r *UmountReq) (*Status, er
 	}
 
 	umountErr := unix.Unmount(mp, unix.MNT_DETACH)
+	if umountErr == unix.EINVAL || umountErr == unix.ENOENT {
+		// Not a mount point (EINVAL) or gone (ENOENT): someone else unmounted it. If no
+		// erofs is there, the unmount we wanted has happened.
+		if mounted, err := isErofsMount(mp); err != nil || !mounted {
+			log.Printf("umount %s: %v, already unmounted", mp, umountErr)
+			umountErr = nil
+		}
+	}
 
 	if umountErr == nil {
 		_ = s.imageTx(sphStr, func(img *pb.DbImage) error {
@@ -851,16 +910,55 @@ func (s *Server) restoreMounts() {
 			// log.Print("restoring: ", img.StorePath, " already mounted on ", img.MountPoint)
 			continue
 		}
-		err := s.tryMount(context.Background(), &MountReq{
-			StorePath:  img.StorePath,
-			MountPoint: img.MountPoint,
-			// the image has been written so we don't need upstream/narsize
-		}, img.ImageSize, img.IsBare)
-		if err == nil {
+		if err := s.restoreMount(img); err == nil {
 			log.Print("restoring: ", img.StorePath, " restored to ", img.MountPoint)
 		} else {
 			log.Print("restoring: ", img.StorePath, " error: ", err)
 		}
+	}
+}
+
+func (s *Server) restoreMount(img *pb.DbImage) error {
+	_, sphStr, err := ParseSph(img.StorePath)
+	if err != nil {
+		return err
+	}
+	ctx, done, err := s.startMount(context.Background(), sphStr)
+	if err != nil {
+		return err
+	}
+	defer done()
+	req := &MountReq{
+		StorePath:  img.StorePath,
+		MountPoint: img.MountPoint,
+		Upstream:   img.Upstream,
+		NarSize:    img.NarSize,
+	}
+	err = s.tryMount(ctx, req, img.ImageSize, img.IsBare)
+	if err != nil && img.Upstream != "" {
+		// ImageSize says the image was written, but its backing file can still be lost:
+		// cachefiles may cull it, or a crash may lose it before syncImageFile. Build it again.
+		log.Print("restoring: ", img.StorePath, " error: ", err, ", rebuilding image")
+		err = s.tryMount(ctx, req, 0, false)
+	}
+	return err
+}
+
+// syncImageFile makes the image just written to sphStr's backing file durable. tryMount
+// records ImageSize once mounted, and after that trusts the file to hold the image.
+// cachefiles creates a new object's file unlinked and links it into the cache when the
+// object is released, so only call this after the real mount: by then the first mount's
+// object is released, and the real mount opened the linked file. (The object's own fd
+// can't be synced.)
+func (s *Server) syncImageFile(sphStr string) {
+	p := filepath.Join(s.cfg.CachePath, fscachePath(s.cfg.CacheDomain, sphStr))
+	fd, err := unix.Open(p, unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	if err == nil {
+		err = unix.Fdatasync(fd)
+		_ = unix.Close(fd)
+	}
+	if err != nil {
+		log.Printf("sync image file for %s: %v", sphStr, err)
 	}
 }
 
@@ -1686,6 +1784,9 @@ type slabAllocator struct {
 	slabId   uint16
 	seq      uint64
 	limit    uint64
+
+	start uint64      // sequence of the current slab when the allocator got to it
+	left  []slabRange // what it allocated in the slabs it moved on from
 }
 
 func (s *Server) newSlabAllocator(slabroot *bbolt.Bucket, slabId uint16) (*slabAllocator, error) {
@@ -1706,6 +1807,7 @@ func (a *slabAllocator) open() (err error) {
 	}
 	// reserve some blocks for future purposes
 	a.seq = max(a.sb.Sequence(), reservedBlocks)
+	a.start = a.seq
 	return nil
 }
 
@@ -1718,6 +1820,7 @@ func (a *slabAllocator) alloc(blocks uint16) (erofs.SlabLoc, *bbolt.Bucket, erro
 		if err := a.sb.SetSequence(a.seq); err != nil {
 			return erofs.SlabLoc{}, nil, err
 		}
+		a.left = append(a.left, a.current())
 		a.slabId++
 		if err := a.open(); err != nil {
 			return erofs.SlabLoc{}, nil, err
@@ -1731,6 +1834,15 @@ func (a *slabAllocator) alloc(blocks uint16) (erofs.SlabLoc, *bbolt.Bucket, erro
 // finish saves the sequence of the slab the allocator is in.
 func (a *slabAllocator) finish() error {
 	return a.sb.SetSequence(a.seq)
+}
+
+func (a *slabAllocator) current() slabRange {
+	return slabRange{a.slabId, common.TruncU32(a.start), common.TruncU32(a.seq)}
+}
+
+// allocated returns the space the allocator has handed out, one range per slab.
+func (a *slabAllocator) allocated() []slabRange {
+	return append(slices.Clip(a.left), a.current())
 }
 
 func (s *Server) AllocateBatch(ctx context.Context, blocks []uint16, digests []cdig.CDig) ([]erofs.SlabLoc, error) {
