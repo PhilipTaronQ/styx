@@ -12,6 +12,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -469,6 +470,7 @@ func (s *Server) commitPreallocated(ctx context.Context, blocks []uint16, digest
 }
 
 type memChunkStore struct {
+	mu       sync.Mutex // PutIfNotExists is called concurrently by the manifest builder
 	m        map[cdig.CDig][]byte
 	blkshift shift.Shift
 }
@@ -483,7 +485,9 @@ func (m *memChunkStore) PutIfNotExists(ctx context.Context, path string, key str
 		// room so we don't have to copy again when we write.
 		d := make([]byte, len(data), m.blkshift.Roundup(int64(len(data))))
 		copy(d, data)
+		m.mu.Lock()
 		m.m[dig] = d
+		m.mu.Unlock()
 	}
 	return nil, nil
 }
