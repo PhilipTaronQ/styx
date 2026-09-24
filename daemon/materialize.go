@@ -190,7 +190,7 @@ func (s *Server) materialize(ctx context.Context, dest string, m *pb.Manifest) e
 			case pb.EntryType_DIRECTORY:
 				return nil // done above
 			case pb.EntryType_REGULAR:
-				return s.materializeFile(p, ent, locs, readFds, &cloneFailed)
+				return s.materializeFile(ctx, p, ent, locs, readFds, &cloneFailed)
 			case pb.EntryType_SYMLINK:
 				if i == 0 {
 					return errors.New("bare file can't be symlink")
@@ -215,6 +215,7 @@ func (s *Server) materialize(ctx context.Context, dest string, m *pb.Manifest) e
 }
 
 func (s *Server) materializeFile(
+	ctx context.Context,
 	path string,
 	ent *pb.Entry,
 	locs map[cdig.CDig]erofs.SlabLoc,
@@ -245,6 +246,11 @@ tryAgain:
 	cshift := ent.ChunkShiftDef()
 	roundedUp := false
 	for i, dig := range digs {
+		// check between chunks too, so a large file stops within one chunk
+		// (at most 1<<shift.MaxChunkShift bytes) of the client giving up.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		loc := locs[dig]
 		size := cshift.FileChunkSize(ent.Size, i == len(digs)-1)
 		if !cloneFailed.Load() {

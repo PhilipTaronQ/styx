@@ -153,3 +153,24 @@ func TestMaterializeStopsWhenCancelled(t *testing.T) {
 			len(ents), len(sizes), allowed)
 	})
 }
+
+// A single large file must stop too, within a chunk or so of the context
+// being cancelled, not only between files.
+func TestMaterializeStopsMidFileWhenCancelled(t *testing.T) {
+	copyModes(t, func(t *testing.T, copyFileRange bool) {
+		const chunks = 64
+		cshift := shift.DefaultChunkShift
+		f := newMaterializeFixture(t, []int64{chunks << cshift}, copyFileRange)
+		dest := filepath.Join(t.TempDir(), "out")
+
+		// one check per entry, then one per chunk
+		const allowed = 4
+		err := f.s.materialize(newCancelAfter(allowed), dest, f.m)
+		require.ErrorIs(t, err, context.Canceled)
+		st, err := os.Stat(filepath.Join(dest, "file0"))
+		require.NoError(t, err)
+		require.LessOrEqual(t, st.Size(), int64(allowed)<<cshift,
+			"materialize wrote %d of %d bytes of a file after being cancelled once it had checked its context %d times",
+			st.Size(), int64(chunks)<<cshift, allowed)
+	})
+}
