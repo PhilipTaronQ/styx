@@ -99,6 +99,11 @@ type (
 
 		shutdownChan chan struct{}
 		shutdownWait sync.WaitGroup
+		// canceled by Stop, to end work (like kernel reads) that would outlive the daemon
+		lifeCtx    context.Context
+		lifeCancel context.CancelFunc
+		// eventfd that Stop writes to wake cachefilesServer's poll, or -1
+		wakeFd int32
 	}
 
 	// fields that are only known after init
@@ -148,6 +153,12 @@ var errAlreadyMountedElsewhere = errors.New("already mounted on another mountpoi
 // init stuff
 
 func NewServer(cfg Config) *Server {
+	lifeCtx, lifeCancel := context.WithCancel(context.Background())
+	wakeFd, err := unix.Eventfd(0, unix.EFD_CLOEXEC|unix.EFD_NONBLOCK)
+	if err != nil {
+		log.Println("eventfd error, Stop will wait for the cachefiles poll timeout:", err)
+		wakeFd = -1 // poll ignores negative fds
+	}
 	return &Server{
 		cfg:             &cfg,
 		blockShift:      shift.Shift(cfg.ErofsBlockShift),
@@ -165,6 +176,9 @@ func NewServer(cfg Config) *Server {
 		diffSem:         semaphore.NewWeighted(int64(cfg.Workers)),
 		remanifestCache: *common.NewSimpleSyncMap[string, *remanifestCacheEntry](),
 		shutdownChan:    make(chan struct{}),
+		lifeCtx:         lifeCtx,
+		lifeCancel:      lifeCancel,
+		wakeFd:          int32(wakeFd),
 	}
 }
 
@@ -853,8 +867,19 @@ func (s *Server) Stop(closeDevnode bool) {
 
 	// signal to cachefiles server and workers to stop
 	fd := s.devnode.Swap(0)
+	// end reads waiting on the network, and wake the cachefiles server's poll
+	s.lifeCancel()
+	if s.wakeFd >= 0 {
+		var one [8]byte
+		binary.NativeEndian.PutUint64(one[:], 1)
+		_, _ = unix.Write(int(s.wakeFd), one[:])
+	}
 	// wait for workers to stop
 	s.shutdownWait.Wait()
+	if s.wakeFd >= 0 {
+		_ = unix.Close(int(s.wakeFd))
+		s.wakeFd = -1
+	}
 	// close fds of open objects
 	s.closeAllFds()
 	// maybe close devnode too
@@ -896,7 +921,7 @@ func (s *Server) cachefilesServer() {
 		}()
 	}
 
-	fds := make([]unix.PollFd, 1)
+	fds := make([]unix.PollFd, 2)
 	errors := 0
 	for {
 		if errors > 10 {
@@ -908,9 +933,11 @@ func (s *Server) cachefilesServer() {
 			break
 		}
 		fds[0] = unix.PollFd{Fd: fd, Events: unix.POLLIN}
+		// closing the devnode doesn't interrupt the poll, so Stop writes to wakeFd
+		fds[1] = unix.PollFd{Fd: s.wakeFd, Events: unix.POLLIN}
 		timeout := 3600 * 1000
 		if s.cfg.IsTesting {
-			// use smaller timeout since we can't interrupt this poll (even by closing the fd)
+			// in case wakeFd couldn't be created
 			timeout = 500
 		}
 		n, err := unix.Poll(fds, timeout)
@@ -919,7 +946,8 @@ func (s *Server) cachefilesServer() {
 			errors++
 			continue
 		}
-		if n != 1 {
+		if n == 0 || fds[1].Revents != 0 {
+			// timed out, or woken by Stop (which cleared devnode first)
 			continue
 		}
 		if fds[0].Revents&unix.POLLNVAL != 0 {
@@ -1153,6 +1181,11 @@ func (s *Server) handleRead(msgId, objectId uint32, ln, off uint64) (retErr erro
 	}
 
 	defer func() {
+		if retErr != nil && s.lifeCtx.Err() != nil {
+			// Stopping: leave the request with the kernel. A daemon that restores the
+			// devnode gets it again, and closing the devnode fails it.
+			return
+		}
 		_, _, e1 := unix.Syscall(unix.SYS_IOCTL, uintptr(state.writeFd), CACHEFILES_IOC_READ_COMPLETE, uintptr(msgId))
 		if e1 != 0 && retErr == nil {
 			retErr = fmt.Errorf("ioctl error %d", e1)
@@ -1274,7 +1307,10 @@ func (s *Server) handleReadSlab(state *openFileState, ln, off uint64) (retErr er
 		log.Println("missing sph references for", slabId, addr, digest.String())
 	}
 
-	ctx := context.Background()
+	// The read ends at a deadline or when the daemon stops. ctx isn't canceled when this
+	// returns: requestChunk may start diff ops for other chunks too, and they use it.
+	ctx, cancel := context.WithTimeout(s.lifeCtx, slabReadTimeout)
+	_ = cancel // released at the deadline
 	return s.requestChunk(ctx, erofs.SlabLoc{SlabId: slabId, Addr: addr}, digest, sphps)
 }
 
@@ -1376,6 +1412,9 @@ func (s *Server) openSlabBackingFile(slabId uint16) (int, error) {
 
 const (
 	slabBytes = 1 << 40
+
+	// how long a kernel read of a slab may wait for its chunk
+	slabReadTimeout = 5 * time.Minute
 )
 
 func slabKey(id uint16) []byte {
