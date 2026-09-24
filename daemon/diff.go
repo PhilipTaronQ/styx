@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"encoding/base64"
@@ -624,22 +625,18 @@ func (s *Server) gotNewChunk(loc erofs.SlabLoc, digest cdig.CDig, b []byte) erro
 
 	// record async
 	s.presentMap.Put(loc, struct{}{})
-	go s.cleanPresentMap(loc)
+	go s.cleanPresentMap(loc, digest)
 
 	return nil
 }
 
-func (s *Server) cleanPresentMap(loc erofs.SlabLoc) {
+func (s *Server) cleanPresentMap(loc erofs.SlabLoc, digest cdig.CDig) {
 	if err := s.syncSlab(loc.SlabId); err != nil {
 		log.Println("present map sync error:", err)
 		return
 	}
 	err := s.db.Batch(func(tx *bbolt.Tx) error {
-		sb := tx.Bucket(slabBucket).Bucket(slabKey(loc.SlabId))
-		if sb == nil {
-			return errors.New("missing slab bucket")
-		}
-		return sb.Put(addrKey(presentMask|loc.Addr), []byte{})
+		return s.recordPresent(tx, loc, digest)
 	})
 	if err != nil {
 		log.Println("present map record error:", err)
@@ -651,6 +648,19 @@ func (s *Server) cleanPresentMap(loc erofs.SlabLoc) {
 	// bookkeeping, though. for now just wait a while. TODO: make this correct
 	time.Sleep(time.Minute)
 	s.presentMap.Delete(loc)
+}
+
+// recordPresent marks loc present, unless it no longer holds digest: gc may have deleted
+// the chunk since we wrote it, and a present key for it then would never be cleaned up.
+// (vaporize writes before it links a chunk, and commitPreallocated marks those itself.)
+func (s *Server) recordPresent(tx *bbolt.Tx, loc erofs.SlabLoc, digest cdig.CDig) error {
+	sb := tx.Bucket(slabBucket).Bucket(slabKey(loc.SlabId))
+	if sb == nil {
+		return errors.New("missing slab bucket")
+	} else if !bytes.Equal(sb.Get(addrKey(loc.Addr)), digest[:]) {
+		return nil
+	}
+	return sb.Put(addrKey(presentMask|loc.Addr), []byte{})
 }
 
 func (s *Server) getChunkDiff(

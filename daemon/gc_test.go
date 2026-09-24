@@ -290,6 +290,30 @@ func TestGcKeepsHeldImage(t *testing.T) {
 	require.False(t, gcTestHasChunk(t, s, d))
 }
 
+// gotNewChunk records a chunk present in a later batch. When gc deleted the chunk in
+// between, that batch used to add a present key for an address no chunk uses.
+func TestPresentNotRecordedAfterGc(t *testing.T) {
+	s := newGcTestServer(t)
+	initGcTestServer(t, s, "http://localhost:1")
+	dLive, dGone := gcTestDigest(10), gcTestDigest(11)
+	liveLoc := gcTestImage(t, s, 'a', "pkg-1.0", pb.MountState_Mounted, dLive)[0]
+	goneLoc := gcTestImage(t, s, 'b', "pkg-2.0", pb.MountState_Unmounted, dGone)[0]
+
+	res, err := s.handleGcReq(context.Background(), &GcReq{GcByState: gcDefault})
+	require.NoError(t, err)
+	require.Equal(t, 1, res.DeleteChunks)
+
+	// the batched present writes for both land after gc
+	require.NoError(t, s.db.Update(func(tx *bbolt.Tx) error {
+		return errors.Join(s.recordPresent(tx, liveLoc, dLive), s.recordPresent(tx, goneLoc, dGone))
+	}))
+	require.NoError(t, s.db.View(func(tx *bbolt.Tx) error {
+		require.True(t, s.locPresent(tx, liveLoc))
+		require.False(t, s.locPresent(tx, goneLoc), "present key for a chunk gc deleted")
+		return nil
+	}))
+}
+
 func TestSyncSlab(t *testing.T) {
 	s := newGcTestServer(t)
 	fd, err := unix.Open(filepath.Join(t.TempDir(), "slab"), unix.O_RDWR|unix.O_CREAT, 0o600)
