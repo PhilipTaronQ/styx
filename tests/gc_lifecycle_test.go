@@ -8,7 +8,9 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -57,6 +59,35 @@ func TestGcAfterFailedMount(t *testing.T) {
 	// what `styx gc` sends with no flags
 	code, body = tb.lcCall(daemon.GcPath, daemon.GcReq{DryRunFast: true, GcByState: gcUnmounted})
 	require.Equal(t, http.StatusOK, code, "default gc failed after an unrelated failed mount: %s", body)
+}
+
+// gc deletes an unmounted image's record, chunks and slab data, and used to leave its
+// cachefiles backing file. Mounting the same store path again builds a new image of the same
+// size with new chunk addresses; cachefiles' coherency check only compares the size, so the
+// kernel kept the old image, whose chunk addresses were just freed.
+func TestGcThenRemount(t *testing.T) {
+	tb := newTestBase(t)
+	tb.startAll()
+
+	mp1 := tb.mount(lcOpusfile)
+	require.Equal(t, lcOpusfileHash, tb.nixHash(mp1))
+	tb.umount(lcOpusfile)
+
+	gc := tb.gc(daemon.GcReq{GcByState: gcUnmounted})
+	t.Logf("gc: %+v", gc)
+	require.Equal(t, 1, gc.DeleteImages)
+	require.NotZero(t, gc.DeleteChunks)
+	require.NotZero(t, gc.PunchLocs)
+
+	unix.Sync()
+	tb.dropCaches()
+
+	d1 := tb.debug()
+	mp2 := tb.mount(lcOpusfile)
+	out, err := exec.Command("nix-hash", "--type", "sha256", "--base32", mp2).CombinedOutput()
+	t.Logf("stats during re-read: %+v", tb.debug().Stats.Sub(d1.Stats))
+	require.NoError(t, err, "nix-hash of remounted image: %s", out)
+	require.Equal(t, lcOpusfileHash, strings.TrimSpace(string(out)))
 }
 
 // umount detaches lazily and records Unmounted right away, so gc used to free the image

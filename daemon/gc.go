@@ -342,6 +342,13 @@ func (s *Server) handleGcReq(ctx context.Context, r *GcReq) (*GcResp, error) {
 		return nil, err
 	}
 
+	// the images' backing files point at the chunks we're about to punch
+	delImageSphs := make([]string, len(delImages))
+	for i, k := range delImages {
+		delImageSphs[i] = string(k)
+	}
+	s.cullImageFiles(delImageSphs)
+
 	if len(punchLocs) > 0 {
 		// actually punch holes
 		s.stateLock.Lock()
@@ -515,6 +522,17 @@ func (s *Server) imagesInUse(sphs []string) map[string]bool {
 		time.Sleep(20 * time.Millisecond)
 	}
 	return busy
+}
+
+// cullImageFiles removes the cachefiles backing files of images that aren't in use.
+// cachefiles checks only an object's size before reusing its file, so a new image of the
+// same size for the same store path would otherwise be served from the old image.
+func (s *Server) cullImageFiles(sphs []string) {
+	for i, err := range s.cachefilesFileCmds("cull", sphs) {
+		if err != nil && !errors.Is(err, unix.ENOENT) && !errors.Is(err, errNoDevnode) {
+			log.Printf("cull image file for %s: %v", sphs[i], err)
+		}
+	}
 }
 
 // holdForGc makes gc keep sphStr's image, manifest and chunks until the returned function is

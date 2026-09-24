@@ -704,6 +704,10 @@ func (s *Server) tryMount(ctx context.Context, req *MountReq, haveImageSize int6
 	opts := fmt.Sprintf("domain_id=%s,fsid=%s", s.cfg.CacheDomain, sphStr)
 
 	if mountCtx.imageData != nil {
+		// A backing file left from an earlier image of this store path (gc'd, or failed to
+		// mount) would be reused if it has the same size, and the kernel would serve the old
+		// image. It's normally gone already; make sure.
+		s.cullImageFiles([]string{sphStr})
 		// first mount somewhere private, then unmount to force cachefiles to flush the image to disk.
 		// this is gross, there should be a better way to control cachefiles flushing.
 		firstMp := filepath.Join(s.cfg.CachePath, "initial", sphStr)
