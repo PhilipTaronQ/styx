@@ -32,18 +32,6 @@ func sphpsFromLoc(b []byte) []SphPrefix {
 	return out
 }
 
-func writeToTempFile(b []byte) (string, error) {
-	f, err := os.CreateTemp("", "styx-diff")
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-	if _, err = f.Write(b); err != nil {
-		return "", err
-	}
-	return f.Name(), nil
-}
-
 func makeManifestSph(sph Sph) Sph {
 	// the "manifest sph" for a sph is the same with one bit flipped (will affect _end_ of base32
 	// string form). note that this is its own inverse.
