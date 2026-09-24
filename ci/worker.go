@@ -183,6 +183,12 @@ func ci(ctx workflow.Context, args *CiArgs) error {
 	l := workflow.GetLogger(ctx)
 	forceCh := workflow.GetSignalChannel(ctx, "buildnow")
 	for !workflow.GetInfo(ctx).GetContinueAsNewSuggested() {
+		// Once the workflow is cancelled, activities and timers return right away, so the
+		// loop would spin until the deadlock detector panics.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
 		// poll nixos channels
 		cctx, cancel := workflow.WithCancel(ctx)
 		actx := withPollActivity(cctx, releasePollInterval, time.Minute)
