@@ -342,10 +342,10 @@ index c266f05..1456916 100644
    'worker-protocol.cc',
 diff --git a/src/libstore/styx.cc b/src/libstore/styx.cc
 new file mode 100644
-index 0000000..bd33a11
+index 0000000..27fd5e0
 --- /dev/null
 +++ b/src/libstore/styx.cc
-@@ -0,0 +1,192 @@
+@@ -0,0 +1,197 @@
 +
 +#include "nix/util/error.hh"
 +#include "nix/util/file-system.hh"
@@ -443,6 +443,11 @@ index 0000000..bd33a11
 +        {"NarSize", narSize},
 +    };
 +    styxRequest("/mount", req);
++
++    // Check that the mount is really there before the caller registers
++    // the path as valid.
++    if (!isStyxMount(mountPoint))
++        throw Error("styx reported mounting '%s', but it is not mounted", mountPoint);
 +}
 +
 +
