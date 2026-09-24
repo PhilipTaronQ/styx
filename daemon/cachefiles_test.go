@@ -12,7 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 
-	"github.com/dnr/styx/common/cdig"
+	"github.com/PhilipTaronQ/styx/common/cdig"
 )
 
 // main() calls Stop(false) on SIGTERM. Outside tests the cachefiles poll timeout is an

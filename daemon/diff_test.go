@@ -3,9 +3,9 @@ package daemon
 import (
 	"testing"
 
-	"github.com/dnr/styx/common/cdig"
-	"github.com/dnr/styx/common/shift"
-	"github.com/dnr/styx/pb"
+	"github.com/PhilipTaronQ/styx/common/cdig"
+	"github.com/PhilipTaronQ/styx/common/shift"
+	"github.com/PhilipTaronQ/styx/pb"
 	"github.com/stretchr/testify/require"
 )
 

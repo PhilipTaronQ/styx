@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/dnr/styx/common/cdig"
+	"github.com/PhilipTaronQ/styx/common/cdig"
 	"github.com/nix-community/go-nix/pkg/storepath"
 	"go.etcd.io/bbolt"
 )

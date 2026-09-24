@@ -15,8 +15,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 
-	"github.com/dnr/styx/daemon"
-	"github.com/dnr/styx/erofs"
+	"github.com/PhilipTaronQ/styx/daemon"
+	"github.com/PhilipTaronQ/styx/erofs"
 )
 
 func statfsIsErofs(t *testing.T, p string) bool {

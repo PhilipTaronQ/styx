@@ -11,7 +11,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/dnr/styx/common/nar"
+	"github.com/PhilipTaronQ/styx/common/nar"
 )
 
 // parserGoroutines counts Reader parser goroutines that are still running.

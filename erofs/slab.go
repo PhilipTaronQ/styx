@@ -3,8 +3,8 @@ package erofs
 import (
 	"context"
 
-	"github.com/dnr/styx/common/cdig"
-	"github.com/dnr/styx/common/shift"
+	"github.com/PhilipTaronQ/styx/common/cdig"
+	"github.com/PhilipTaronQ/styx/common/shift"
 )
 
 type (

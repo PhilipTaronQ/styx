@@ -1,6 +1,6 @@
 package common
 
-import "github.com/dnr/styx/common/shift"
+import "github.com/PhilipTaronQ/styx/common/shift"
 
 func DefaultChunkShift(fileSize int64) shift.Shift {
 	// aim for 64-256 chunks/file

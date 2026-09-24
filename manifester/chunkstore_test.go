@@ -9,8 +9,8 @@ import (
 	"github.com/DataDog/zstd"
 	"github.com/stretchr/testify/require"
 
-	"github.com/dnr/styx/common"
-	"github.com/dnr/styx/common/shift"
+	"github.com/PhilipTaronQ/styx/common"
+	"github.com/PhilipTaronQ/styx/common/shift"
 )
 
 // urlChunkStoreRead.Get used to read the whole body and zstd-decompress it with no limit

@@ -6,7 +6,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"github.com/dnr/styx/daemon"
+	"github.com/PhilipTaronQ/styx/daemon"
 )
 
 // collect checks that a default gc at the end of the test frees nothing a

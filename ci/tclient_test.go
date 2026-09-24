@@ -9,7 +9,7 @@ import (
 	commonpb "go.temporal.io/api/common/v1"
 	"go.temporal.io/sdk/converter"
 
-	"github.com/dnr/styx/common"
+	"github.com/PhilipTaronQ/styx/common"
 )
 
 // zstdcodec.Encode used to write the compressed payloads into its input slice and return the

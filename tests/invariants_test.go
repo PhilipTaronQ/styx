@@ -13,9 +13,9 @@ import (
 	"go.etcd.io/bbolt"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/dnr/styx/common/cdig"
-	"github.com/dnr/styx/daemon"
-	"github.com/dnr/styx/pb"
+	"github.com/PhilipTaronQ/styx/common/cdig"
+	"github.com/PhilipTaronQ/styx/daemon"
+	"github.com/PhilipTaronQ/styx/pb"
 )
 
 // End-of-test checks, run from cleanup after the daemon has stopped.

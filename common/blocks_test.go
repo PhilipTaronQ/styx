@@ -6,7 +6,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	"github.com/dnr/styx/common/shift"
+	"github.com/PhilipTaronQ/styx/common/shift"
 )
 
 // blocksFromFileChunkSize is what AppendBlocksList has to agree with: the slab allocator

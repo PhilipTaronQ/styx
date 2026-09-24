@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dnr/styx/daemon"
-	"github.com/dnr/styx/pb"
+	"github.com/PhilipTaronQ/styx/daemon"
+	"github.com/PhilipTaronQ/styx/pb"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 )

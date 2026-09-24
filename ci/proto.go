@@ -3,7 +3,7 @@ package ci
 import (
 	"time"
 
-	"github.com/dnr/styx/manifester"
+	"github.com/PhilipTaronQ/styx/manifester"
 )
 
 const (

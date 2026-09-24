@@ -1,6 +1,6 @@
 package common
 
-import "github.com/dnr/styx/common/shift"
+import "github.com/PhilipTaronQ/styx/common/shift"
 
 // AppendBlocksList appends the number of blocks each chunk of a file of the given size takes
 // in a slab. Every chunk but the last is a full chunk. The last one holds what's left, which is

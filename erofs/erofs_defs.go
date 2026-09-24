@@ -3,7 +3,7 @@ package erofs
 import (
 	"fmt"
 
-	"github.com/dnr/styx/common/shift"
+	"github.com/PhilipTaronQ/styx/common/shift"
 	"github.com/lunixbochs/struc"
 )
 

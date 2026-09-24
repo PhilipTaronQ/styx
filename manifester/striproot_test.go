@@ -5,7 +5,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	"github.com/dnr/styx/common/nar"
+	"github.com/PhilipTaronQ/styx/common/nar"
 )
 
 func TestStripRoot(t *testing.T) {

@@ -1,4 +1,4 @@
-module github.com/dnr/styx
+module github.com/PhilipTaronQ/styx
 
 go 1.26.0
 

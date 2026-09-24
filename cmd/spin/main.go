@@ -12,7 +12,7 @@ import (
 	"path/filepath"
 	"slices"
 
-	"github.com/dnr/styx/common/cobrautil"
+	"github.com/PhilipTaronQ/styx/common/cobrautil"
 	"github.com/nix-community/go-nix/pkg/storepath"
 	"github.com/spf13/cobra"
 )

@@ -16,7 +16,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/dnr/styx/manifester"
+	"github.com/PhilipTaronQ/styx/manifester"
 )
 
 // On SIGTERM the daemon calls Stop(false). Stop waits for the cachefiles

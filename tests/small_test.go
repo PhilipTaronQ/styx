@@ -6,7 +6,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/dnr/styx/daemon"
+	"github.com/PhilipTaronQ/styx/daemon"
 )
 
 func TestSmallImage(t *testing.T) {

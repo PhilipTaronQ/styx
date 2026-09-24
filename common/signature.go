@@ -13,7 +13,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
 
-	"github.com/dnr/styx/pb"
+	"github.com/PhilipTaronQ/styx/pb"
 )
 
 // fingerprintPrefix starts every signed-message fingerprint, so that a styx signature can't be

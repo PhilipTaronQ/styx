@@ -186,7 +186,7 @@ const file_buildroot_proto_rawDesc = "" +
 	"styxCommit\x12!\n" +
 	"\fcharon_build\x18\x04 \x01(\tR\vcharonBuild\x12+\n" +
 	"\x11manifest_upstream\x18\x05 \x01(\tR\x10manifestUpstream\x12!\n" +
-	"\fmanifest_sph\x18\x06 \x01(\tR\vmanifestSphB\x18Z\x16github.com/dnr/styx/pbb\x06proto3"
+	"\fmanifest_sph\x18\x06 \x01(\tR\vmanifestSphB!Z\x1fgithub.com/PhilipTaronQ/styx/pbb\x06proto3"
 
 var (
 	file_buildroot_proto_rawDescOnce sync.Once

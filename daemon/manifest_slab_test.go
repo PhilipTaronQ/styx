@@ -10,10 +10,10 @@ import (
 	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/dnr/styx/common"
-	"github.com/dnr/styx/common/cdig"
-	"github.com/dnr/styx/erofs"
-	"github.com/dnr/styx/pb"
+	"github.com/PhilipTaronQ/styx/common"
+	"github.com/PhilipTaronQ/styx/common/cdig"
+	"github.com/PhilipTaronQ/styx/erofs"
+	"github.com/PhilipTaronQ/styx/pb"
 )
 
 // withManifestSlab sets up the manifest slab file, as the daemon does at startup.

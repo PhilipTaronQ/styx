@@ -354,7 +354,7 @@ const file_db_proto_rawDesc = "" +
 	"\x10UnmountRequested\x10\x04\x12\r\n" +
 	"\tUnmounted\x10\x05\x12\v\n" +
 	"\aDeleted\x10\x06\x12\x10\n" +
-	"\fMaterialized\x10\aB\x18Z\x16github.com/dnr/styx/pbb\x06proto3"
+	"\fMaterialized\x10\aB!Z\x1fgithub.com/PhilipTaronQ/styx/pbb\x06proto3"
 
 var (
 	file_db_proto_rawDescOnce sync.Once

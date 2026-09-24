@@ -5,8 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/dnr/styx/common/client"
-	"github.com/dnr/styx/daemon"
+	"github.com/PhilipTaronQ/styx/common/client"
+	"github.com/PhilipTaronQ/styx/daemon"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

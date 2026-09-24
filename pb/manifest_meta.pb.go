@@ -119,7 +119,7 @@ const file_manifest_meta_proto_rawDesc = "" +
 	"\x18generic_tarball_resolved\x18\x04 \x01(\tR\x16genericTarballResolved\x12\x1c\n" +
 	"\tgenerator\x18\n" +
 	" \x01(\tR\tgenerator\x12%\n" +
-	"\x0egenerated_time\x18\v \x01(\x03R\rgeneratedTimeB\x18Z\x16github.com/dnr/styx/pbb\x06proto3"
+	"\x0egenerated_time\x18\v \x01(\x03R\rgeneratedTimeB!Z\x1fgithub.com/PhilipTaronQ/styx/pbb\x06proto3"
 
 var (
 	file_manifest_meta_proto_rawDescOnce sync.Once

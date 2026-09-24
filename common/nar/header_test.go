@@ -7,7 +7,7 @@ package nar_test
 import (
 	"testing"
 
-	"github.com/dnr/styx/common/nar"
+	"github.com/PhilipTaronQ/styx/common/nar"
 	"github.com/stretchr/testify/assert"
 )
 

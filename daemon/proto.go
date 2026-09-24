@@ -3,7 +3,7 @@ package daemon
 import (
 	"go.etcd.io/bbolt"
 
-	"github.com/dnr/styx/pb"
+	"github.com/PhilipTaronQ/styx/pb"
 )
 
 var (

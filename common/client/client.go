@@ -10,7 +10,7 @@ import (
 	"net/url"
 	"os"
 
-	"github.com/dnr/styx/common"
+	"github.com/PhilipTaronQ/styx/common"
 )
 
 // simple client for json requests/responses over http over unix socket

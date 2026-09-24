@@ -9,8 +9,8 @@ import (
 	axiom_slog_adapter "github.com/axiomhq/axiom-go/adapters/slog"
 	"github.com/spf13/cobra"
 
-	"github.com/dnr/styx/ci"
-	"github.com/dnr/styx/common/cobrautil"
+	"github.com/PhilipTaronQ/styx/ci"
+	"github.com/PhilipTaronQ/styx/common/cobrautil"
 )
 
 func withAxiomLogs(c *cobra.Command) cobrautil.RunEC {

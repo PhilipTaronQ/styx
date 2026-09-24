@@ -18,8 +18,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	s3 "github.com/aws/aws-sdk-go-v2/service/s3"
 
-	"github.com/dnr/styx/common/errgroup"
-	"github.com/dnr/styx/pb"
+	"github.com/PhilipTaronQ/styx/common/errgroup"
+	"github.com/PhilipTaronQ/styx/pb"
 )
 
 // Sharded builds

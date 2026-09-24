@@ -64,7 +64,7 @@ rec {
     consts: args:
     let
       # note: putting "-s -w" in ldflags only saves 3.6% of image size
-      ldflags = pkgs.lib.mapAttrsToList (k: v: "-X github.com/dnr/styx/${k}=${v}") consts;
+      ldflags = pkgs.lib.mapAttrsToList (k: v: "-X github.com/PhilipTaronQ/styx/${k}=${v}") consts;
     in
     buildGoModule (
       baseArgs

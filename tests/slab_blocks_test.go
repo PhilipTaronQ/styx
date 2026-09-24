@@ -17,7 +17,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 
-	"github.com/dnr/styx/daemon"
+	"github.com/PhilipTaronQ/styx/daemon"
 )
 
 // valid nixbase32, not in the test data

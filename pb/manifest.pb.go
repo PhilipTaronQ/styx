@@ -101,7 +101,7 @@ const file_manifest_proto_rawDesc = "" +
 	"\aentries\x18\x03 \x03(\v2\t.pb.EntryR\aentries\x12*\n" +
 	"\x11small_file_cutoff\x18\x02 \x01(\x05R\x0fsmallFileCutoff\x12$\n" +
 	"\x04meta\x18\n" +
-	" \x01(\v2\x10.pb.ManifestMetaR\x04metaB\x18Z\x16github.com/dnr/styx/pbb\x06proto3"
+	" \x01(\v2\x10.pb.ManifestMetaR\x04metaB!Z\x1fgithub.com/PhilipTaronQ/styx/pbb\x06proto3"
 
 var (
 	file_manifest_proto_rawDescOnce sync.Once

@@ -25,8 +25,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/dnr/styx/common/nar"
-	"github.com/dnr/styx/pb"
+	"github.com/PhilipTaronQ/styx/common/nar"
+	"github.com/PhilipTaronQ/styx/pb"
 )
 
 type narFile struct {

@@ -14,7 +14,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
 
-	"github.com/dnr/styx/pb"
+	"github.com/PhilipTaronQ/styx/pb"
 )
 
 // The daemon uses the envelope's chunk_shift to allocate and slice chunked manifests (a bad
