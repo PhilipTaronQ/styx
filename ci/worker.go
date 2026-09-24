@@ -110,6 +110,7 @@ const (
 	// gc
 	gcInterval = 7 * 24 * time.Hour
 	gcMaxAge   = 210 * 24 * time.Hour
+	gcTimeout  = 6 * time.Hour
 
 	memoKeyBuildFailed = "buildFailed"
 )
@@ -236,12 +237,16 @@ func ci(ctx workflow.Context, args *CiArgs) error {
 			continue
 		}
 
+		// Version 1 runs GC in its own activity after the build, instead of in HeavyBuild.
+		gcSeparate := workflow.GetVersion(ctx, "gc-activity", workflow.DefaultVersion, 1) == 1
+
 		buildStart := workflow.Now(ctx)
 		l.Info("building", "relid", args.LastRelID, "styx", args.LastStyxCommit)
 		bres, err := ciBuild(ctx, &buildReq{
 			Args:       args,
 			RelID:      args.LastRelID,
 			StyxCommit: args.LastStyxCommit,
+			SkipGC:     gcSeparate,
 		})
 		workflow.UpsertMemo(ctx, map[string]any{
 			memoKeyBuildFailed: err != nil || bres.FakeError != "",
@@ -265,10 +270,25 @@ func ci(ctx workflow.Context, args *CiArgs) error {
 			continue
 		}
 		l.Info("build succeeded", "relid", args.LastRelID, "styx", args.LastStyxCommit)
+		buildElapsed := workflow.Now(ctx).Sub(buildStart).Round(time.Second)
 		prevNames := args.PrevNames
 		args.PrevNames = bres.Names
 		if bres.NewLastGC > 0 {
 			args.LastGC = bres.NewLastGC
+		}
+		gcSummary := bres.GCSummary
+		if gcSeparate && workflow.Now(ctx).Unix()-args.LastGC > int64(gcInterval.Seconds()) {
+			if gres, err := ciGC(ctx); err != nil {
+				l.Error("gc error", "error", err)
+				gcSummary = "gc error: " + err.Error()
+			} else {
+				gcSummary = gres.Summary
+				if gres.Error == "" {
+					args.LastGC = gres.Time
+				} else {
+					l.Error("gc error", "error", gres.Error)
+				}
+			}
 		}
 
 		// notify
@@ -276,11 +296,11 @@ func ci(ctx workflow.Context, args *CiArgs) error {
 			Args:          args,
 			RelID:         args.LastRelID,
 			StyxCommit:    args.LastStyxCommit,
-			BuildElapsed:  workflow.Now(ctx).Sub(buildStart).Round(time.Second),
+			BuildElapsed:  buildElapsed,
 			PrevNames:     prevNames,
 			NewNames:      bres.Names,
 			ManifestStats: bres.ManifestStats,
-			GCSummary:     bres.GCSummary,
+			GCSummary:     gcSummary,
 		})
 	}
 	return workflow.NewContinueAsNewError(ctx, ci, args)
@@ -311,6 +331,22 @@ func ciBuild(ctx workflow.Context, req *buildReq) (*buildRes, error) {
 	var res buildRes
 	var a *heavyActivities
 	return &res, workflow.ExecuteActivity(actx, a.HeavyBuild, req).Get(ctx, &res)
+}
+
+func ciGC(ctx workflow.Context) (*gcRes, error) {
+	pokeScaler(ctx)
+	actx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+		TaskQueue:           heavyTaskQueue,
+		HeartbeatTimeout:    buildHeartbeat,
+		StartToCloseTimeout: gcTimeout,
+		RetryPolicy: &temporal.RetryPolicy{
+			// GC runs again after the next build if this fails
+			MaximumAttempts: 1,
+		},
+	})
+	var res gcRes
+	var a *heavyActivities
+	return &res, workflow.ExecuteActivity(actx, a.HeavyGC, &gcReq{}).Get(ctx, &res)
 }
 
 func ciNotify(ctx workflow.Context, req *notifyReq) error {
@@ -545,6 +581,7 @@ func getLatestCommit(ctx context.Context, repo, branch string) (*ghLatestCommit,
 func (a *heavyActivities) HeavyBuild(ctx context.Context, req *buildReq) (retBuildRes *buildRes, retErr error) {
 	l := activity.GetLogger(ctx)
 	info := activity.GetInfo(ctx)
+	stage := heartbeatStages(ctx)
 
 	defer func() {
 		if retErr == nil {
@@ -559,19 +596,7 @@ func (a *heavyActivities) HeavyBuild(ctx context.Context, req *buildReq) (retBui
 		retErr = temporal.NewApplicationError(retErr.Error(), errType, details)
 	}()
 
-	var stageName atomic.Value
-	stage := func(s string) {
-		l.Info("====================== STAGE " + s)
-		stageName.Store(s)
-	}
 	stage("INIT")
-
-	go func() {
-		for ctx.Err() == nil {
-			time.Sleep(5 * time.Second)
-			activity.RecordHeartbeat(ctx, stageName.Load())
-		}
-	}()
 
 	// fetch nixexprs
 
@@ -772,16 +797,7 @@ func (a *heavyActivities) HeavyBuild(ctx context.Context, req *buildReq) (retBui
 
 	btime := time.Now()
 	var gcSummary strings.Builder
-	gc := gc{
-		now:     btime,
-		stage:   stage,
-		summary: &gcSummary,
-		zp:      a.zp,
-		s3:      a.s3cli,
-		bucket:  a.cfg.CSWCfg.ChunkBucket,
-		age:     gcMaxAge,
-		grace:   gcGrace,
-	}
+	gc := a.newGC(btime, &gcSummary, stage)
 
 	stage("WRITE ROOT")
 	root := &pb.BuildRoot{
@@ -805,12 +821,13 @@ func (a *heavyActivities) HeavyBuild(ctx context.Context, req *buildReq) (retBui
 		return nil, err
 	}
 
-	// gc
+	// gc (only for workflows started before HeavyGC existed)
 
 	newLastGC := req.Args.LastGC
-	if btime.Unix()-req.Args.LastGC > int64(gcInterval.Seconds()) {
-		newLastGC = btime.Unix()
-		gc.run(ctx)
+	if !req.SkipGC && btime.Unix()-req.Args.LastGC > int64(gcInterval.Seconds()) {
+		if err := gc.run(ctx); err == nil {
+			newLastGC = btime.Unix()
+		}
 	}
 
 	slices.Sort(names)
@@ -823,6 +840,52 @@ func (a *heavyActivities) HeavyBuild(ctx context.Context, req *buildReq) (retBui
 		NewLastGC:     newLastGC,
 		GCSummary:     gcSummary.String(),
 	}, nil
+}
+
+// HeavyGC runs bucket GC. It reports GC errors in the result, so that the summary still gets
+// to the notification.
+func (a *heavyActivities) HeavyGC(ctx context.Context, req *gcReq) (*gcRes, error) {
+	stage := heartbeatStages(ctx)
+	stage("INIT")
+	var summary strings.Builder
+	gc := a.newGC(time.Now(), &summary, stage)
+	res := &gcRes{Time: gc.now.Unix()}
+	if err := gc.run(ctx); err != nil {
+		res.Error = err.Error()
+	}
+	res.Summary = summary.String()
+	stage("DONE")
+	return res, nil
+}
+
+func (a *heavyActivities) newGC(now time.Time, summary *strings.Builder, stage func(string)) *gc {
+	return &gc{
+		now:     now,
+		stage:   stage,
+		summary: summary,
+		zp:      a.zp,
+		s3:      a.s3cli,
+		bucket:  a.cfg.CSWCfg.ChunkBucket,
+		age:     gcMaxAge,
+		grace:   gcGrace,
+	}
+}
+
+// heartbeatStages returns a function that logs a stage name and records it as the activity's
+// heartbeat details. It heartbeats until ctx is done.
+func heartbeatStages(ctx context.Context) func(string) {
+	l := activity.GetLogger(ctx)
+	var stageName atomic.Value
+	go func() {
+		for ctx.Err() == nil {
+			time.Sleep(5 * time.Second)
+			activity.RecordHeartbeat(ctx, stageName.Load())
+		}
+	}()
+	return func(s string) {
+		l.Info("====================== STAGE " + s)
+		stageName.Store(s)
+	}
 }
 
 func makeNixexprsUrl(channel, relid string) string {
