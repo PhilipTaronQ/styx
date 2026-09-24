@@ -254,7 +254,7 @@ index 0000000..1362f45
 +
 +}  // namespace nix
 diff --git a/src/libstore/local-store.cc b/src/libstore/local-store.cc
-index 909f223..80283db 100644
+index 909f223..b0bcbae 100644
 --- a/src/libstore/local-store.cc
 +++ b/src/libstore/local-store.cc
 @@ -17,6 +17,7 @@
@@ -265,7 +265,7 @@ index 909f223..80283db 100644
  
  #include <algorithm>
  #include <cstring>
-@@ -1313,6 +1314,97 @@ StorePath LocalStore::addToStoreFromDump(
+@@ -1313,6 +1314,101 @@ StorePath LocalStore::addToStoreFromDump(
      return dstPath;
  }
  
@@ -291,7 +291,9 @@ index 909f223..80283db 100644
 +        if (!isValidPathUncached(info.path)) {
 +            makeStyxMount(sourceUri, std::string(info.path.to_string()), realPath.string(), info.narSize);
 +            registerValidPath(info);
-+        }
++        } else
++            // We may have a negative cache entry for this path, so get rid of it.
++            invalidatePathInfoCacheFor(info.path);
 +
 +        outputLock.setDeletion(true);
 +    }
@@ -354,7 +356,9 @@ index 909f223..80283db 100644
 +            }
 +
 +            registerValidPath(info);
-+        }
++        } else
++            // We may have a negative cache entry for this path, so get rid of it.
++            invalidatePathInfoCacheFor(info.path);
 +
 +        outputLock.setDeletion(true);
 +    }
