@@ -23,6 +23,7 @@ import (
 
 const (
 	lcOpusfile     = "qa22bifihaxyvn6q2a6w9m0nklqrk9wh-opusfile-0.12"
+	lcOpusfileSph  = "qa22bifihaxyvn6q2a6w9m0nklqrk9wh"
 	lcOpusfileHash = "1rswindywkyq2jmfpxd6n772jii3z5xz6ypfbb63c17k5il39hfm"
 	// valid nixbase32, not in the test data
 	lcFakeSph = "1b9p07z77phvv2hf6gm9f28syp39f1ag"
@@ -88,6 +89,35 @@ func TestGcThenRemount(t *testing.T) {
 	t.Logf("stats during re-read: %+v", tb.debug().Stats.Sub(d1.Stats))
 	require.NoError(t, err, "nix-hash of remounted image: %s", out)
 	require.Equal(t, lcOpusfileHash, strings.TrimSpace(string(out)))
+}
+
+// restoreMounts trusted DbImage.ImageSize > 0 to mean the image is in its cachefiles backing
+// file and never rebuilt it. If the backing file was lost (it wasn't synced before bbolt
+// committed ImageSize), the store path came back empty after a restart.
+func TestRestoreAfterLostImageFile(t *testing.T) {
+	tb := newTestBase(t)
+	tb.startAll()
+
+	mp := tb.mount(lcOpusfile)
+	require.Equal(t, lcOpusfileHash, tb.nixHash(mp))
+
+	tb.daemon.Stop(true)
+	tb.daemon = nil
+	require.NoError(t, unix.Unmount(mp, 0))
+
+	files, err := filepath.Glob(filepath.Join(tb.cachedir, "cache", "Ierofs,"+tb.tag, "@*", "D"+lcOpusfileSph))
+	require.NoError(t, err)
+	require.Len(t, files, 1, "image backing file")
+	require.NoError(t, os.Remove(files[0]))
+
+	tb.startDaemon()
+
+	d := tb.debug(daemon.DebugReq{IncludeImages: []string{lcOpusfileSph}})
+	if img, ok := d.Images[lcOpusfile]; ok {
+		t.Logf("after restore: state=%v lastErr=%q imageSize=%d",
+			img.Image.GetMountState(), img.Image.GetLastMountError(), img.Image.GetImageSize())
+	}
+	require.Equal(t, lcOpusfileHash, tb.nixHash(mp), "store path after restart with a lost image file")
 }
 
 // umount detaches lazily and records Unmounted right away, so gc used to free the image

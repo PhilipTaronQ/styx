@@ -745,6 +745,9 @@ func (s *Server) tryMount(ctx context.Context, req *MountReq, haveImageSize int6
 		}
 	}
 
+	if mountErr == nil && mountCtx.imageData != nil {
+		s.syncImageFile(sphStr)
+	}
 	return mountErr
 }
 
@@ -840,11 +843,38 @@ func (s *Server) restoreMount(img *pb.DbImage) error {
 		return err
 	}
 	defer done()
-	return s.tryMount(ctx, &MountReq{
+	req := &MountReq{
 		StorePath:  img.StorePath,
 		MountPoint: img.MountPoint,
-		// the image has been written so we don't need upstream/narsize
-	}, img.ImageSize, img.IsBare)
+		Upstream:   img.Upstream,
+		NarSize:    img.NarSize,
+	}
+	err = s.tryMount(ctx, req, img.ImageSize, img.IsBare)
+	if err != nil && img.Upstream != "" {
+		// ImageSize says the image was written, but its backing file can still be lost:
+		// older daemons didn't sync it, and cachefiles may cull it. Build it again.
+		log.Print("restoring: ", img.StorePath, " error: ", err, ", rebuilding image")
+		err = s.tryMount(ctx, req, 0, false)
+	}
+	return err
+}
+
+// syncImageFile makes the image just written to sphStr's backing file durable. tryMount
+// records ImageSize once mounted, and after that trusts the file to hold the image.
+// cachefiles creates a new object's file unlinked and links it into the cache when the
+// object is released, so only call this after the real mount: by then the first mount's
+// object is released, and the real mount opened the linked file. (The object's own fd
+// can't be synced.)
+func (s *Server) syncImageFile(sphStr string) {
+	p := filepath.Join(s.cfg.CachePath, fscachePath(s.cfg.CacheDomain, sphStr))
+	fd, err := unix.Open(p, unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	if err == nil {
+		err = unix.Fdatasync(fd)
+		_ = unix.Close(fd)
+	}
+	if err != nil {
+		log.Printf("sync image file for %s: %v", sphStr, err)
+	}
 }
 
 // cachefiles server
