@@ -290,6 +290,63 @@ func TestGcKeepsHeldImage(t *testing.T) {
 	require.False(t, gcTestHasChunk(t, s, d))
 }
 
+func gcTestCatalogF(t *testing.T, s *Server) []string {
+	t.Helper()
+	var names []string
+	require.NoError(t, s.db.View(func(tx *bbolt.Tx) error {
+		cur := tx.Bucket(catalogFBucket).Cursor()
+		for k, _ := cur.First(); k != nil; k, _ = cur.Next() {
+			name, _, _ := bytes.Cut(k, []byte{0})
+			names = append(names, string(name))
+		}
+		return nil
+	}))
+	return names
+}
+
+func gcTestPutStaleCatalogF(t *testing.T, s *Server, c byte, name string) {
+	t.Helper()
+	sph, _, err := ParseSph(gcTestSph(c))
+	require.NoError(t, err)
+	require.NoError(t, s.db.Update(func(tx *bbolt.Tx) error {
+		return tx.Bucket(catalogFBucket).Put(bytes.Join([][]byte{[]byte(name), {0}, sph[:]}, nil), []byte{})
+	}))
+}
+
+// gc built the catalogf keys to delete from ParseSph's second result, which is the hash, not
+// the name, so it never deleted any, and the stale entries were then picked as diff bases.
+func TestGcPrunesCatalog(t *testing.T) {
+	s := newGcTestServer(t)
+	initGcTestServer(t, s, "http://localhost:1")
+	gcTestImage(t, s, '6', "pkg-1.0", pb.MountState_Unmounted, gcTestDigest(6))
+	gcTestImage(t, s, '7', "pkg-1.1", pb.MountState_Mounted, gcTestDigest(7))
+	gcTestPutStaleCatalogF(t, s, '8', "pkg-0.9") // left behind by an older gc
+	require.Equal(t, []string{"pkg-0.9", "pkg-1.0", "pkg-1.1"}, gcTestCatalogF(t, s))
+
+	res, err := s.handleGcReq(context.Background(), &GcReq{GcByState: gcDefault})
+	require.NoError(t, err)
+	require.Equal(t, 1, res.DeleteImages)
+	require.Equal(t, []string{"pkg-1.1"}, gcTestCatalogF(t, s))
+}
+
+// Stale catalogf entries in existing databases must not be picked as diff bases.
+func TestCatalogSkipsStaleBase(t *testing.T) {
+	s := newGcTestServer(t)
+	initGcTestServer(t, s, "http://localhost:1")
+	gcTestImage(t, s, '7', "pkg-1.0", pb.MountState_Mounted, gcTestDigest(7))
+	// sorts after the live entry, and the last best match wins
+	gcTestPutStaleCatalogF(t, s, '8', "pkg-1.1")
+
+	reqSph, _, err := ParseSph(gcTestSph('9'))
+	require.NoError(t, err)
+	var res catalogResult
+	require.NoError(t, s.db.View(func(tx *bbolt.Tx) error {
+		res, err = s.catalogFindBaseFromHashAndName(tx, reqSph, "pkg-1.2")
+		return err
+	}))
+	require.Equal(t, "pkg-1.0", res.baseName)
+}
+
 // vaporize reserves slab space in one transaction and links chunks to it in a later one,
 // and writes its image and manifest only at the end. gc used to punch the reservation as
 // part of the garbage chunk before it, and delete the chunks vaporize had committed.

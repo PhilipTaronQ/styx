@@ -91,6 +91,37 @@ func TestGcThenRemount(t *testing.T) {
 	require.Equal(t, lcOpusfileHash, strings.TrimSpace(string(out)))
 }
 
+// gc used to leave catalogf entries of deleted images behind (it built their keys from the
+// hash instead of the name). Base selection scans catalogf by name and takes the last best
+// match, so a stale entry could win over a live base; its manifest was gone, so the read got
+// no base at all.
+//
+// catalogf orders same-name entries by raw hash bytes: kcyrz < 53qwc < qa22.
+func TestGcStaleCatalogBase(t *testing.T) {
+	tb := newTestBase(t)
+	tb.startAll()
+
+	// live base, lowest in catalog order
+	mpL := tb.mount("kcyrz2y8si9ry5p8qkmj0gp41n01sa1y-opusfile-0.12")
+	require.Equal(t, "0im7spp48afrbfv672bmrvrs0lg4md0qhyic8zkcgyc8xqwz1s5b", tb.nixHash(mpL))
+	// will be gc'd, highest in catalog order
+	mpG := tb.mount(lcOpusfile)
+	require.Equal(t, lcOpusfileHash, tb.nixHash(mpG))
+	tb.umount(lcOpusfile)
+
+	gc := tb.gc(daemon.GcReq{GcByState: gcUnmounted})
+	require.Equal(t, 1, gc.DeleteImages)
+
+	d1 := tb.debug()
+	mpN := tb.mount("53qwclnym7a6vzs937jjmsfqxlxlsf2y-opusfile-0.12")
+	require.Equal(t, "0dm2277wfknq81wfwzxrasc9rif30fm03vxahndbqnn4gb9swqpq", tb.nixHash(mpN))
+	st := tb.debug().Stats.Sub(d1.Stats)
+	t.Logf("stats for new image: %+v", st)
+	// with kcyrz still mounted this should diff against it, as in TestDiffChunks
+	require.Zero(t, st.BatchReqs, "fetched without a base although a live base exists")
+	require.NotZero(t, st.DiffReqs)
+}
+
 // restoreMounts trusted DbImage.ImageSize > 0 to mean the image is in its cachefiles backing
 // file and never rebuilt it. If the backing file was lost (it wasn't synced before bbolt
 // committed ImageSize), the store path came back empty after a restart.

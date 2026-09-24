@@ -161,7 +161,7 @@ func (s *Server) handleGcReq(ctx context.Context, r *GcReq) (*GcResp, error) {
 		var spName string
 		if proto.Unmarshal(v, &img) != nil {
 			continue
-		} else if sph, spName, err = ParseSph(img.StorePath); err != nil || spName == "" {
+		} else if sph, _, spName, err = ParseSphAndName(img.StorePath); err != nil {
 			continue
 		}
 		fkey := bytes.Join([][]byte{[]byte(spName), []byte{0}, sph[:]}, nil)
@@ -335,6 +335,21 @@ func (s *Server) handleGcReq(ctx context.Context, r *GcReq) (*GcResp, error) {
 	crb := tx.Bucket(catalogRBucket)
 	for _, dcr := range delCatalogR {
 		crb.Delete(dcr)
+	}
+	// Older versions deleted only the reverse entries, so drop forward entries that have
+	// none. They'd otherwise be picked as diff bases whose manifests are gone.
+	var staleCatalogF [][]byte
+	cfcur := cfb.Cursor()
+	for k, _ := cfcur.First(); k != nil; k, _ = cfcur.Next() {
+		if _, hash, ok := bytes.Cut(k, []byte{0}); ok && crb.Get(hash) == nil {
+			staleCatalogF = append(staleCatalogF, bytes.Clone(k))
+		}
+	}
+	for _, k := range staleCatalogF {
+		cfb.Delete(k)
+	}
+	if len(staleCatalogF) > 0 {
+		log.Printf("gc: removed %d stale catalog entries", len(staleCatalogF))
 	}
 
 	// end first transaction here
