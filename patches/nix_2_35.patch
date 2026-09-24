@@ -367,10 +367,10 @@ index fa19b08..8c32232 100644
          }
 diff --git a/src/libstore/styx.cc b/src/libstore/styx.cc
 new file mode 100644
-index 0000000..27fd5e0
+index 0000000..ffe8aac
 --- /dev/null
 +++ b/src/libstore/styx.cc
-@@ -0,0 +1,197 @@
+@@ -0,0 +1,220 @@
 +
 +#include "nix/util/error.hh"
 +#include "nix/util/file-system.hh"
@@ -382,6 +382,8 @@ index 0000000..27fd5e0
 +#include <cstring>
 +#include <regex>
 +#include <map>
++#include <memory>
++#include <mutex>
 +#include <sys/mount.h>
 +#include <sys/stat.h>
 +#include <sys/vfs.h>
@@ -429,6 +431,25 @@ index 0000000..27fd5e0
 +    }
 +}
 +
++// Compiles each styx-* pattern once. An invalid pattern is reported once and
++// gives null, so a bad setting can't break substitution.
++static const std::regex * styxRegex(const std::string & pattern) {
++    static std::mutex lock;
++    static std::map<std::string, std::unique_ptr<std::regex>> cache;
++    std::lock_guard<std::mutex> guard(lock);
++    auto i = cache.find(pattern);
++    if (i == cache.end()) {
++        std::unique_ptr<std::regex> re;
++        try {
++            re = std::make_unique<std::regex>(pattern);
++        } catch (std::regex_error & e) {
++            warn("ignoring invalid styx pattern '%s': %s", pattern, e.what());
++        }
++        i = cache.emplace(pattern, std::move(re)).first;
++    }
++    return i->second.get();
++}
++
 +StyxMode canUseStyx(const std::string storeUri, uint64_t narSize, std::string name) {
 +    auto trim = [](std::string_view s) {
 +        return s.back() == '/' ? s.substr(0, s.size() - 1) : s;
@@ -443,15 +464,17 @@ index 0000000..27fd5e0
 +        if (!useStyx || narSize < settings.styxMinSize)
 +            return StyxDisable;
 +    }
-+    // TODO: compile these only once
-+    for (auto & exc : settings.styxExclude.get())
-+        if (std::regex_match(name, std::regex(exc)))
++    for (auto & exc : settings.styxExclude.get()) {
++        auto re = styxRegex(exc);
++        // an exclusion we can't evaluate excludes everything
++        if (!re || std::regex_match(name, *re))
 +            return StyxDisable;
++    }
 +    for (auto & inc : settings.styxOndemand.get())
-+        if (std::regex_match(name, std::regex(inc)))
++        if (auto re = styxRegex(inc); re && std::regex_match(name, *re))
 +            return StyxMount;
 +    for (auto & inc : settings.styxMaterialize.get())
-+        if (std::regex_match(name, std::regex(inc)))
++        if (auto re = styxRegex(inc); re && std::regex_match(name, *re))
 +            return StyxMaterialize;
 +    return StyxDisable;
 +}
