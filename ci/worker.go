@@ -113,6 +113,9 @@ const (
 	gcMaxAge   = 210 * 24 * time.Hour
 	gcTimeout  = 6 * time.Hour
 
+	// notify
+	notifyAttempts = 5
+
 	memoKeyBuildFailed = "buildFailed"
 )
 
@@ -356,12 +359,22 @@ func ciGC(ctx workflow.Context) (*gcRes, error) {
 	return &res, workflow.ExecuteActivity(actx, a.HeavyGC, &gcReq{}).Get(ctx, &res)
 }
 
-func ciNotify(ctx workflow.Context, req *notifyReq) error {
+// ciNotify sends a notification. It's best-effort: without a retry limit, a notification
+// that can't be sent (say, the SMTP server rejects our credentials) would block the ci loop
+// forever.
+func ciNotify(ctx workflow.Context, req *notifyReq) {
 	actx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
 		StartToCloseTimeout: time.Minute,
+		RetryPolicy: &temporal.RetryPolicy{
+			InitialInterval:    time.Minute,
+			BackoffCoefficient: 2,
+			MaximumAttempts:    notifyAttempts,
+		},
 	})
 	var a *activities
-	return workflow.ExecuteActivity(actx, a.Notify, req).Get(ctx, nil)
+	if err := workflow.ExecuteActivity(actx, a.Notify, req).Get(ctx, nil); err != nil {
+		workflow.GetLogger(ctx).Error("notify error", "error", err)
+	}
 }
 
 func pokeScaler(ctx workflow.Context) {
