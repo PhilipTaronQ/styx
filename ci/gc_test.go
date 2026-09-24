@@ -339,6 +339,19 @@ func testManifestObj(t *testing.T, digs ...cdig.CDig) []byte {
 	return b
 }
 
+// testChunkedManifestObj returns a manifest cache object whose manifest is stored in the
+// chunk store, in one chunk with digest body.
+func testChunkedManifestObj(t *testing.T, body cdig.CDig) []byte {
+	b, err := proto.Marshal(&pb.SignedMessage{Msg: &pb.Entry{
+		Path:    "manifest",
+		Type:    pb.EntryType_REGULAR,
+		Size:    100,
+		Digests: body[:],
+	}})
+	require.NoError(t, err)
+	return b
+}
+
 func testRootObj(t *testing.T, cacheKeys ...string) []byte {
 	b, err := proto.Marshal(&pb.BuildRoot{
 		Meta:     &pb.BuildRootMeta{BuildTime: time.Now().Unix()},
@@ -525,6 +538,30 @@ func TestGCLostDeleteResponseKeepsChunks(t *testing.T) {
 	t.Log(sb.String())
 	require.False(t, f.has(man))
 	require.True(t, f.has(chunk), "GC deleted chunks after a failed manifest delete")
+}
+
+// A chunked manifest whose body chunk is missing used to fail the trace and abort GC, every
+// week until its root expired 210 days later. Now GC deletes that manifest and carries on.
+func TestGCSkipsUnreadableChunkedManifest(t *testing.T) {
+	f := newFakeS3()
+	g, sb := newTestGC(t, f)
+
+	okDig := testDigest(1)
+	f.putOld(testChunkKey(okDig), []byte("chunk"))
+	f.putOld(testManifestKey("v1-ok"), testManifestObj(t, okDig))
+	broken := testManifestKey("v1-broken")
+	f.putOld(broken, testChunkedManifestObj(t, testDigest(2))) // body chunk is missing
+	garbage := testChunkKey(testDigest(3))
+	f.putOld(garbage, []byte("chunk"))
+	f.put(testRootKey("build", g.now.Add(-time.Hour)), testRootObj(t, "v1-broken", "v1-ok"))
+
+	require.NoError(t, g.run(context.Background()))
+	t.Log(sb.String())
+	require.Contains(t, sb.String(), "unreadable manifest")
+	require.False(t, f.has(broken), "unreadable manifest was kept")
+	require.False(t, f.has(garbage), "GC did not collect")
+	require.True(t, f.has(testManifestKey("v1-ok")))
+	require.True(t, f.has(testChunkKey(okDig)))
 }
 
 // remove() runs DeleteObjects batches concurrently and counts the per-key errors of each.

@@ -385,12 +385,13 @@ func (gc *gc) traceManifest(eg *errgroup.Group, mc string) error {
 		}
 		return err
 	}
-	gc.goodManifest.Store(mc, struct{}{})
 	// don't verify signature, assume it's good
 	var sm pb.SignedMessage
 	err = proto.Unmarshal(b, &sm)
 	if err != nil {
 		return err
+	} else if sm.Msg == nil {
+		return fmt.Errorf("manifest %s has no message", key)
 	}
 
 	var chunks, mchunks int
@@ -411,7 +412,13 @@ func (gc *gc) traceManifest(eg *errgroup.Group, mc string) error {
 				return err
 			})
 		}
-		if err := subeg.Wait(); err != nil {
+		if err := subeg.Wait(); manifester.IsS3NotFound(err) {
+			// Nobody can read this manifest, so don't keep it: that would fail every GC
+			// until its root expired. Once it's deleted, clients get it rebuilt. Its data
+			// chunks aren't known, so those that nothing else reaches are deleted too.
+			gc.logln("unreadable manifest", key, err)
+			return nil
+		} else if err != nil {
 			return err
 		}
 	}
@@ -421,14 +428,18 @@ func (gc *gc) traceManifest(eg *errgroup.Group, mc string) error {
 	if err != nil {
 		return err
 	}
+	gc.goodManifest.Store(mc, struct{}{})
 	for _, ent := range m.Entries {
 		for _, dig := range cdig.FromSliceAlias(ent.Digests) {
 			gc.goodChunk.Store(dig, struct{}{})
 			chunks++
 		}
 	}
-	log.Printf("traced %s = %s, %d chunks, %d manifest chunks",
-		key, path.Base(m.Meta.Narinfo.StorePath)[33:], chunks, mchunks)
+	name := path.Base(m.GetMeta().GetNarinfo().GetStorePath())
+	if len(name) > 33 {
+		name = name[33:]
+	}
+	log.Printf("traced %s = %s, %d chunks, %d manifest chunks", key, name, chunks, mchunks)
 	return nil
 }
 
