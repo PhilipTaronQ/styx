@@ -833,7 +833,7 @@ func (s *Server) restoreMounts() {
 			// 	continue
 			// }
 			if img.MountState == pb.MountState_Mounted {
-				if img.ImageSize == 0 && img.Upstream == "" {
+				if img.ImageSize == 0 {
 					log.Print("found mounted image without size", img.StorePath)
 					continue
 				}
@@ -847,19 +847,11 @@ func (s *Server) restoreMounts() {
 			// log.Print("restoring: ", img.StorePath, " already mounted on ", img.MountPoint)
 			continue
 		}
-		req := &MountReq{
+		err := s.tryMount(context.Background(), &MountReq{
 			StorePath:  img.StorePath,
 			MountPoint: img.MountPoint,
 			// the image has been written so we don't need upstream/narsize
-		}
-		if img.ImageSize == 0 {
-			// the image has to be rebuilt (see repairSlabOverlaps). drop the old one so
-			// cachefiles doesn't keep it.
-			_, sphStr, _ := ParseSph(img.StorePath)
-			s.removeImageCacheFile(sphStr)
-			req.Upstream, req.NarSize = img.Upstream, img.NarSize
-		}
-		err := s.tryMount(context.Background(), req, img.ImageSize, img.IsBare)
+		}, img.ImageSize, img.IsBare)
 		if err == nil {
 			log.Print("restoring: ", img.StorePath, " restored to ", img.MountPoint)
 		} else {
@@ -879,10 +871,6 @@ func (s *Server) Start() error {
 	}
 	if err := s.setupManifestSlab(); err != nil {
 		return fmt.Errorf("error setting up manifest slab: %w", err)
-	}
-	if err := s.repairSlabOverlaps(); err != nil {
-		// nothing was changed, try again next time
-		log.Print(err)
 	}
 	if err := s.setupDevNode(); errors.Is(err, errRestoreFailed) {
 		// exit so that systemd restarts us, without the saved devnode
