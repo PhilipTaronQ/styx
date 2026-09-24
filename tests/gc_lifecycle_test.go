@@ -2,12 +2,10 @@ package tests
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"io"
 	"io/fs"
 	"math/rand/v2"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,7 +17,6 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/dnr/styx/common"
-	"github.com/dnr/styx/common/client"
 	"github.com/dnr/styx/daemon"
 	"github.com/dnr/styx/pb"
 )
@@ -51,17 +48,6 @@ func lcLargestFile(t *testing.T, root string) string {
 	return big
 }
 
-// lcCall makes a request and returns the status and raw body, without asserting success.
-func (tb *testBase) lcCall(path string, req any) (int, string) {
-	var raw json.RawMessage
-	c := client.NewClient(filepath.Join(tb.cachedir, "styx.sock"))
-	code, err := c.Call(path, req, &raw)
-	if err != nil && code == 0 {
-		tb.t.Fatalf("call %s: %v", path, err)
-	}
-	return code, string(raw)
-}
-
 // A mount that fails before its manifest is stored used to leave its image Requested with
 // no manifest, and gc, which keeps Requested images by default, failed tracing it.
 func TestGcAfterFailedMount(t *testing.T) {
@@ -72,16 +58,18 @@ func TestGcAfterFailedMount(t *testing.T) {
 	require.Equal(t, lcOpusfileHash, tb.nixHash(mp))
 
 	// the upstream has no narinfo for this, so the manifester fails and so does the mount
-	code, body := tb.lcCall(daemon.MountPath, daemon.MountReq{
+	var st daemon.Status
+	err := tb.tryCall(daemon.MountPath, daemon.MountReq{
 		Upstream:   tb.upstreamUrl,
 		StorePath:  lcFakeSph + "-not-in-upstream",
 		MountPoint: t.TempDir(),
-	})
-	require.NotEqual(t, http.StatusOK, code, "mount of a path the upstream doesn't have should fail: %s", body)
+	}, &st)
+	require.Error(t, err, "mount of a path the upstream doesn't have should fail")
 
 	// what `styx gc` sends with no flags
-	code, body = tb.lcCall(daemon.GcPath, daemon.GcReq{DryRunFast: true, GcByState: gcUnmounted})
-	require.Equal(t, http.StatusOK, code, "default gc failed after an unrelated failed mount: %s", body)
+	var gc daemon.GcResp
+	require.NoError(t, tb.tryCall(daemon.GcPath, daemon.GcReq{DryRunFast: true, GcByState: gcUnmounted}, &gc),
+		"default gc failed after an unrelated failed mount")
 }
 
 // A completed vaporize leaves nothing for gc. Mounting a vaporized store path replaces its
@@ -290,25 +278,18 @@ func TestGcDuringVaporize(t *testing.T) {
 	}
 	before := slab0()
 
-	type result struct {
-		code int
-		body string
-		err  error
-	}
-	done := make(chan result, 1)
+	done := make(chan error, 1)
 	go func() {
-		var raw json.RawMessage
-		c := client.NewClient(filepath.Join(tb.cachedir, "styx.sock"))
-		code, err := c.Call(daemon.VaporizePath, daemon.VaporizeReq{Path: src}, &raw)
-		done <- result{code, string(raw), err}
+		var st daemon.Status
+		done <- tb.tryCall(daemon.VaporizePath, daemon.VaporizeReq{Path: src}, &st)
 	}()
 
 	// Wait until vaporize has reserved space for "big" (Sequence moved, so the last chunk's
 	// computed size grew) but not yet linked any chunk to it.
 	for {
 		select {
-		case res := <-done:
-			t.Skipf("inconclusive: vaporize finished (%d %s) before gc could run inside its reservation window", res.code, res.body)
+		case err := <-done:
+			t.Skipf("inconclusive: vaporize finished (%v) before gc could run inside its reservation window", err)
 		default:
 		}
 		st := slab0()
@@ -321,8 +302,7 @@ func TestGcDuringVaporize(t *testing.T) {
 	}
 
 	res := <-done
-	require.NoError(t, res.err)
-	require.Equal(t, http.StatusOK, res.code, "vaporize with a gc in the middle: %s", res.body)
+	require.NoError(t, res, "vaporize with a gc in the middle")
 
 	dst := tb.materialize(name)
 	got, err := os.ReadFile(filepath.Join(dst, "big"))
@@ -385,12 +365,7 @@ func TestRepairPresenceKeepsChunksWrittenDuringCheck(t *testing.T) {
 	repaired := make(chan error, 1)
 	go func() {
 		var res daemon.Status
-		c := client.NewClient(filepath.Join(tb.cachedir, "styx.sock"))
-		code, err := c.Call(daemon.RepairPath, daemon.RepairReq{Presence: true}, &res)
-		if err == nil && code != http.StatusOK {
-			err = fmt.Errorf("repair: status %d: %s", code, res.Error)
-		}
-		repaired <- err
+		repaired <- tb.tryCall(daemon.RepairPath, daemon.RepairReq{Presence: true}, &res)
 	}()
 	ran := make(chan error, 1)
 	go func() {
